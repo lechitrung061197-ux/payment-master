@@ -593,6 +593,8 @@ const DEFAULT_SETTINGS = Object.freeze([
   ['default_currency', APP.DEFAULT_CURRENCY, 'STRING', 'Default currency for amounts.'],
   ['default_timezone', APP.TIMEZONE, 'STRING', 'Spreadsheet and script timezone.'],
   ['seller_fee_rate', 0.08, 'RATE', 'Default seller fee rate on net amount. Overridable per seller in Sellers.'],
+  // LEGACY - NOT USED FOR KH001 MIRROR-HOLD ACCOUNTING. KH001 seller hold = the frozen provider
+  // hold of the same transaction (1:1, policy MIRROR_PROVIDER). Kept until an explicit cleanup.
   ['default_seller_hold_rate', 0.10, 'RATE',
     'Default seller hold rate on net amount (we hold from the seller). Overridable per seller in Sellers.'],
   ['provider_fee_model.KH001', 'PERCENT_OF_NET', 'STRING', 'Fee model for provider KH001.'],

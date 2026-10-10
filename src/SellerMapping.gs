@@ -10,12 +10,15 @@
  * - A publish compares the desired mapping with the OPEN history rows. Changed endpoints are
  *   closed (effective_to = new effective_from - 1 day) and replacements opened; all changes of
  *   one publish share one effective date and one version (SMV-######). After the initial
- *   (backfill) publish, changes must be strictly after every published effective_from.
+ *   (backfill) publish, changes must be strictly after the latest published mapping VERSION
+ *   BOUNDARY, where opened_version boundary = effective_from and closed_version boundary =
+ *   effective_to + 1 day (so a publish that only closed rows still sets a boundary).
  *   CLOSED rows never change; an OPEN row only ever gets its closure fields set.
  * - Resolver helpers answer "who owned endpoint X on date D" for later phases.
  *
- * Seller hold is NOT configured here. Locked invariant for the next phase:
- * seller_hold_amount = provider_hold_amount of the same transaction (1:1).
+ * Seller hold is NOT configured here. Locked KH001 invariant for the next phase:
+ * seller_hold_amount = the frozen provider_hold_amount of the same transaction (1:1, policy
+ * MIRROR_PROVIDER); Settings default_seller_hold_rate is legacy and not used for KH001.
  *
  * The first part of this file is pure (unit-tested in Node); the I/O part follows.
  */

@@ -75,7 +75,7 @@ from the Apps Script editor. `setupMaster` never deletes tabs or data rows:
 
 | Tab | Purpose |
 | --- | --- |
-| Settings | Key/value config. Provider-scoped keys: `provider_fee_rate.<PROVIDER>`, `provider_hold_rate.<PROVIDER>` |
+| Settings | Key/value config. Provider-scoped keys: `provider_fee_rate.<PROVIDER>`, `provider_hold_rate.<PROVIDER>`; `default_seller_hold_rate` is legacy (not used for KH001) |
 | Sellers | User-managed desired mapping: 1 row = 1 seller, endpoint_<N>_name/key pairs |
 | Endpoint Mapping | System-managed effective-dated endpoint ownership history |
 | Source System | Raw internal transactions (import-only) |
@@ -126,29 +126,36 @@ DISPUTE, DISPUTE_FEE, HOLD, RELEASE, OTHER) can share one `external_transaction_
 
 ### 3. Two economic layers, never mixed
 
-Provider and seller economics are computed separately from the same `net_amount`.
-Each layer uses only its own fee and its own hold.
+Provider and seller economics are kept separate. Fees are independent per layer; for
+KH001 the seller hold **mirrors** the provider hold (policy `MIRROR_PROVIDER`).
 
 | | Provider layer (provider pays us) | Seller layer (we owe the seller) |
 | --- | --- | --- |
-| Fee | `provider_fee = net × provider_fee_rate.<PROVIDER>` | `seller_fee = net × seller_fee_rate` |
-| Hold | `provider_hold_amount = net × provider_hold_rate.<PROVIDER>` | `seller_hold_amount = net × seller_hold_rate` |
-| Result | provider payout = `net − provider_fee − provider_hold_amount (+ provider_adjustments)` | `seller_available_amount = net − seller_fee − seller_hold_amount` |
+| Fee | `provider_fee_amount`: actual provider value (KH001: DoiSoat `Phí thuê OP`); rates in Settings are only a fallback/validation | `seller_fee_amount = net × seller_fee_rate` |
+| Hold | `provider_hold_amount`: actual provider value (KH001: DoiSoat `Hold`) | **KH001:** `seller_hold_amount = frozen provider_hold_amount of that exact transaction` (1:1) |
+| Result | provider payout = `net − provider_fee − provider_hold (+ provider_adjustments)` | `seller_available_amount = net − seller_fee_amount − frozen provider_hold_amount` |
 | Lives in | Settlements (+ provider columns on legs/items) | Settlement Items, Adjustments, Seller Payouts |
 
-- `system_margin = seller_fee − provider_fee`.
-- Seller available **never** subtracts `provider_fee` or `provider_hold_amount`.
-- Provider settlement **never** uses `seller_hold_amount`.
-- Seller rates fall back to Settings (`seller_fee_rate`, `default_seller_hold_rate`)
-  when the Sellers row leaves them blank. There is no shared hold setting.
+- **KH001 seller hold = provider hold, 1:1, per transaction.** Provider hold 0 → seller hold 0;
+  10 → 10; 20 → 20. It is never recalculated from a rate. There is no separate KH001 seller
+  hold rate.
+- `system_margin = seller_fee_amount − provider_fee_amount` — the fee difference only. The
+  hold contributes no margin because it is mirrored.
+- Seller available **never** subtracts `provider_fee_amount`.
+- Provider fee and seller fee remain separate economics; one never overwrites the other.
+- Settings `seller_fee_rate` is the default seller fee. Settings `default_seller_hold_rate` is
+  **LEGACY — not used for KH001 mirror-hold accounting**; it is kept (not deleted or migrated)
+  until an explicit cleanup phase. Future providers may define their own seller-hold policy;
+  KH001 is explicitly `MIRROR_PROVIDER`.
 
-Example (KH001: provider fee 7%, provider hold 10%; seller fee 8%, seller hold 10%):
+Example (KH001 transaction: provider fee 6.72 and provider hold 9.60 from DoiSoat; seller fee 8%):
 
 ```
 Gross 100.00 − Processing fee 4.00 = Net 96.00
-Provider payout  = 96.00 − 6.72 (fee) − 9.60 (provider hold) = 79.68
-Seller available = 96.00 − 7.68 (fee) − 9.60 (seller hold)   = 78.72
-System margin    = 7.68 − 6.72                               =  0.96
+Provider payout  = 96.00 − 6.72 (provider fee) − 9.60 (provider hold) = 79.68
+Seller hold      = 9.60 (= provider hold, 1:1)
+Seller available = 96.00 − 7.68 (seller fee)   − 9.60 (seller hold)   = 78.72
+System margin    = 7.68 − 6.72                                        =  0.96
 ```
 
 ### 4. Lifecycle and where money comes from
@@ -425,10 +432,10 @@ Entry points: `publishSellerMapping()` and read-only `verifySellerMapping()`.
   `resolveEndpointByNameAndKey_` — match `effective_from <= date <= effective_to`
   (blank = open) on Master-timezone date keys; none → UNMAPPED, several → error; name and
   key together must resolve to the same row.
-- **Seller hold (locked rule for the next phase):** `seller_hold_amount =
-  provider_hold_amount` of the same transaction, 1:1. There is no independent KH001 seller
-  hold percentage and Sellers does not configure it. Legacy hold-rate Settings keys are left
-  for a later explicit cleanup.
+- **Seller hold (locked rule for the next phase):** for KH001, `seller_hold_amount` = the
+  frozen `provider_hold_amount` of the same transaction, 1:1 (see Financial design rules §3).
+  There is no independent KH001 seller hold percentage and Sellers does not configure it.
+  `default_seller_hold_rate` is legacy and left for a later explicit cleanup.
 
 ## Tests
 
