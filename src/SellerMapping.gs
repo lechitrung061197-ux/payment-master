@@ -259,6 +259,8 @@ function validateMappingHistory_(records, digestHex) {
     if (ids[r.mapping_id]) integrity.push(label + ': duplicate mapping_id');
     ids[r.mapping_id] = true;
     if (r.seller_id === '') integrity.push(label + ': seller_id is blank');
+    if (r.seller_name_snapshot === '') integrity.push(label + ': seller_name_snapshot is blank');
+    if (isBlankCell_(r.opened_at)) integrity.push(label + ': opened_at is blank');
     if (r.endpoint_name === '') integrity.push(label + ': endpoint_name is blank');
     if (r.endpoint_key === '') integrity.push(label + ': endpoint_key is blank');
     if (r.effective_from === '') integrity.push(label + ': effective_from is required');
@@ -269,6 +271,7 @@ function validateMappingHistory_(records, digestHex) {
       integrity.push(label + ': OPEN row must have blank effective_to, closed_version and closed_at');
     }
     if (r.status === 'CLOSED' && r.effective_to === '') integrity.push(label + ': CLOSED row requires effective_to');
+    if (r.status === 'CLOSED' && isBlankCell_(r.closed_at)) integrity.push(label + ': CLOSED row requires closed_at');
     if (r.status !== 'OPEN' && r.status !== 'CLOSED') integrity.push(label + ': status must be OPEN or CLOSED');
     if (!versionOk(r.opened_version)) integrity.push(label + ': invalid opened_version "' + r.opened_version + '"');
     if (r.status === 'CLOSED') {
@@ -305,7 +308,71 @@ function validateMappingHistory_(records, digestHex) {
   };
   checkOverlaps(function (r) { return r.endpoint_key; }, 'endpoint_key');
   checkOverlaps(function (r) { return endpointNameKey_(r.endpoint_name); }, 'endpoint_name');
-  return { integrity: integrity, overlap: overlap };
+  return { integrity: integrity, overlap: overlap, versionBoundary: mappingVersionBoundaries_(records).errors };
+}
+
+/** All history validation errors as one list. */
+function historyValidationErrors_(check) {
+  return check.integrity.concat(check.overlap).concat(check.versionBoundary);
+}
+
+/**
+ * Effective date of every mapping version, derived from history:
+ *   opened_version -> effective_from;  closed_version -> effective_to + 1 day (CLOSED rows).
+ * Every occurrence of a version must give the same date, and dates must strictly increase
+ * with the version number.
+ * @return {{boundaries: Array<{version: string, number: number, date: string}>, errors: Array<string>}}
+ */
+function mappingVersionBoundaries_(records) {
+  const dates = {};
+  const errors = [];
+  const add = function (version, date, source) {
+    const n = parseSequenceId_(SELLER_MAPPING.versionPrefix, version);
+    if (n === null || date === '') return;
+    (dates[version] = dates[version] || { number: n, seen: {} }).seen[date] = (dates[version].seen[date] || []).concat([source]);
+  };
+  records.forEach(function (r) {
+    add(r.opened_version, r.effective_from, r.mapping_id + ' opened');
+    if (r.status === 'CLOSED' && r.effective_to !== '') add(r.closed_version, addDaysToDateKey_(r.effective_to, 1), r.mapping_id + ' closed');
+  });
+  const boundaries = Object.keys(dates).map(function (v) {
+    const d = Object.keys(dates[v].seen).sort();
+    if (d.length > 1) {
+      errors.push('Version ' + v + ' has conflicting effective dates: ' +
+        d.map(function (x) { return x + ' (' + dates[v].seen[x].join(', ') + ')'; }).join('; '));
+    }
+    return { version: v, number: dates[v].number, date: d[0] };
+  }).sort(function (a, b) { return a.number - b.number; });
+  for (let i = 1; i < boundaries.length; i++) {
+    if (!(boundaries[i].date > boundaries[i - 1].date)) {
+      errors.push('Version ' + boundaries[i].version + ' (' + boundaries[i].date + ') is not after ' +
+        boundaries[i - 1].version + ' (' + boundaries[i - 1].date + ')');
+    }
+  }
+  return { boundaries: boundaries, errors: errors };
+}
+
+/** Latest published version boundary {version, date}, or null for empty history. */
+function latestMappingBoundary_(records) {
+  const b = mappingVersionBoundaries_(records).boundaries;
+  if (b.length === 0) return null;
+  return b.reduce(function (m, x) { return x.date > m.date ? x : m; }, b[0]);
+}
+
+/**
+ * Every seller_id that ever appeared in history must be on exactly one Sellers row (it may
+ * be INACTIVE with no endpoints). Duplicates are reported by the draft parser.
+ */
+function checkHistoricalSellersRetained_(sellers, records) {
+  const present = {};
+  sellers.forEach(function (s) { if (s.seller_id) present[s.seller_id] = true; });
+  const historical = {};
+  records.forEach(function (r) { if (r.seller_id) historical[r.seller_id] = true; });
+  return Object.keys(historical).sort()
+    .filter(function (id) { return !present[id]; })
+    .map(function (id) {
+      return 'Historical seller ' + id + ' is missing from Sellers; keep its row (it may be INACTIVE with no endpoints)';
+    });
 }
 
 /**
@@ -387,13 +454,18 @@ function resolvePublishEffectiveDate_(diff, sellers) {
   return { effectiveFrom: errors.length === 0 && distinct.length === 1 ? distinct[0] : null, errors: errors };
 }
 
-/** After the initial publish, changes must start strictly after every published effective_from. */
+/**
+ * After the initial publish, a change must start strictly after the latest published version
+ * boundary (which also covers publishes that only closed rows) and after the effective_from
+ * of every row it closes.
+ */
 function checkNonRetroactive_(effectiveFrom, records, toClose) {
   const errors = [];
   if (records.length === 0) return errors;
-  const latest = records.reduce(function (m, r) { return r.effective_from > m ? r.effective_from : m; }, '');
-  if (!(effectiveFrom > latest)) {
-    errors.push('effective_from ' + effectiveFrom + ' must be after the latest published effective_from ' + latest);
+  const latest = latestMappingBoundary_(records);
+  if (latest && !(effectiveFrom > latest.date)) {
+    errors.push('effective_from ' + effectiveFrom + ' must be after the latest published version boundary ' +
+      latest.date + ' (' + latest.version + ')');
   }
   toClose.forEach(function (o) {
     if (!(effectiveFrom > o.effective_from)) {
@@ -482,6 +554,34 @@ function checkHistoryImmutability_(before, after) {
     });
   });
   return errors;
+}
+
+/**
+ * Pure publish plan for a valid draft whose seller IDs are all assigned, against validated
+ * history. Throws on any rule violation; never mutates its inputs.
+ * @return {{status: 'NO_CHANGE'|'CHANGES', desired: Array<Object>, diff: Object,
+ *           effectiveFrom: ?string, version: ?string, newRecords: ?Array<Object>}}
+ */
+function planSellerMappingPublish_(sellers, records, publishedAt, digestHex) {
+  throwIfErrors_('Historical seller IDs are missing from Sellers', checkHistoricalSellersRetained_(sellers, records));
+  const desired = desiredMappings_(sellers);
+  const diff = diffSellerMapping_(desired, records.filter(function (r) { return r.status === 'OPEN'; }));
+  const plan = { status: 'NO_CHANGE', desired: desired, diff: diff, effectiveFrom: null, version: null, newRecords: null };
+  if (diff.changes.length === 0) return plan;
+
+  const eff = resolvePublishEffectiveDate_(diff, sellers);
+  throwIfErrors_('Effective date is invalid', eff.errors);
+  throwIfErrors_('Retroactive change', checkNonRetroactive_(eff.effectiveFrom, records, diff.toClose));
+  const version = nextMappingVersion_(records);
+  const newRecords = buildPublishedHistory_(records, diff, eff.effectiveFrom, version, publishedAt, sellers, digestHex);
+  const after = validateMappingHistory_(newRecords, digestHex);
+  throwIfErrors_('Resulting Endpoint Mapping history is invalid',
+    historyValidationErrors_(after).concat(checkHistoryImmutability_(records, newRecords)));
+  plan.status = 'CHANGES';
+  plan.effectiveFrom = eff.effectiveFrom;
+  plan.version = version;
+  plan.newRecords = newRecords;
+  return plan;
 }
 
 /** Record -> sheet row; date keys become Master date values via dateFromKey. */
@@ -589,21 +689,25 @@ function runPublishSellerMapping_() {
   const locked = lock.tryLock(CANONICAL_LOCK_TIMEOUT_MS);
   const details = { assigned_seller_ids: [] };
   let status = 'FAILED';
+  let ss = null;
+  const tab = endpointMappingTab_();
   try {
     if (!locked) throw new Error('Could not acquire script lock within ' + CANONICAL_LOCK_TIMEOUT_MS + ' ms.');
-    const ss = getSpreadsheet_();
-    const tab = endpointMappingTab_();
+    ss = getSpreadsheet_();
 
     // 1. Recover an interrupted Endpoint Mapping swap before reading it.
     const recovery = recoverSwapState_(ss, tab);
-    details.swap_state = recovery.state;
+    details.initial_swap_state = recovery.state;
+    details.recovery_actions = recovery.actions;
 
     // 2. Draft + current history (history is needed so seller IDs are never recycled).
     let draft = readSellersDraft_(ss);
     throwIfErrors_('Sellers draft is invalid', draft.parsed.errors);
     const history = readEndpointMappingRecords_(ss);
-    const historyCheck = validateMappingHistory_(history.records);
-    throwIfErrors_('Endpoint Mapping history is invalid', historyCheck.integrity.concat(historyCheck.overlap));
+    throwIfErrors_('Endpoint Mapping history is invalid', historyValidationErrors_(validateMappingHistory_(history.records)));
+    // Historical seller rows must still exist before anything is written back to Sellers.
+    throwIfErrors_('Historical seller IDs are missing from Sellers',
+      checkHistoricalSellersRetained_(draft.parsed.sellers, history.records));
 
     // 3-4. Assign missing seller IDs, then re-read and re-validate.
     const assignments = planSellerIdAssignments_(draft.parsed.sellers, history.records.map(function (r) { return r.seller_id; }));
@@ -616,27 +720,53 @@ function runPublishSellerMapping_() {
       if (draft.parsed.sellers.some(function (s) { return s.seller_id === ''; })) throw new Error('Seller ID assignment did not persist.');
     }
 
-    // 5-7. Desired mapping and diff.
+    // 5-13. Pure plan: diff, single effective date, non-retroactive, version, new history.
     const sellers = draft.parsed.sellers;
-    const desired = desiredMappings_(sellers);
-    const openRecords = history.records.filter(function (r) { return r.status === 'OPEN'; });
-    const diff = diffSellerMapping_(desired, openRecords);
+    const publishedAt = new Date(Math.floor(Date.now() / 1000) * 1000);
+    const plan = planSellerMappingPublish_(sellers, history.records, publishedAt);
     details.draft_seller_count = sellers.length;
-    details.draft_endpoint_count = desired.length;
-    details.draft_checksum = ownershipChecksum_(desired);
-    details.changes = summarizeMappingChanges_(diff);
+    details.draft_endpoint_count = plan.desired.length;
+    details.draft_checksum = ownershipChecksum_(plan.desired);
+    details.changes = summarizeMappingChanges_(plan.diff);
 
-    if (diff.changes.length === 0) {
-      details.open_mapping_count_after = openRecords.length;
+    if (plan.status === 'NO_CHANGE') {
+      details.open_mapping_count_after = history.records.filter(function (r) { return r.status === 'OPEN'; }).length;
       details.history_checksum = history.checksum;
       status = 'NO_CHANGE';
     } else {
-      status = publishMappingChanges_(ss, tab, recovery, history, sellers, diff, details);
+      // 14-15. Whole-table crash-safe write (unchanged rows keep their stored values).
+      const columns = getColumnNames_(SHEETS.ENDPOINT_MAPPING);
+      const rows = plan.newRecords.map(function (r) {
+        if (!r._new && !r._closedNow) return history.rows[r._index];
+        if (r._closedNow) {
+          const row = history.rows[r._index].slice();
+          row[columns.indexOf('effective_to')] = masterDateFromKey_(r.effective_to);
+          row[columns.indexOf('closed_version')] = r.closed_version;
+          row[columns.indexOf('status')] = r.status;
+          row[columns.indexOf('closed_at')] = r.closed_at;
+          return row;
+        }
+        return mappingRecordToRow_(r, columns, masterDateFromKey_);
+      });
+      const written = writeCanonicalTable_(ss, getTableSchema_(SHEETS.ENDPOINT_MAPPING), tab, rows);
+      details.effective_from = plan.effectiveFrom;
+      details.mapping_version = plan.version;
+      details.opened_count = plan.diff.toOpen.length;
+      details.closed_count = plan.diff.toClose.length;
+      details.open_mapping_count_after = plan.newRecords.filter(function (r) { return r.status === 'OPEN'; }).length;
+      details.history_checksum = written.checksum;
+      details.writer_recovery_state = written.swapState;
+      status = 'SUCCESS';
     }
   } catch (err) {
     details.error = err && err.message ? err.message : String(err);
     status = 'FAILED';
   } finally {
+    try {
+      if (ss) details.final_swap_state = detectSwapState_(ss, tab).state;
+    } catch (stateErr) {
+      details.final_swap_state = 'UNKNOWN (' + stateErr.message + ')';
+    }
     try {
       appendAuditLog_({
         action: 'SELLER_MAPPING_PUBLISH_' + status,
@@ -651,47 +781,6 @@ function runPublishSellerMapping_() {
     if (locked) lock.releaseLock();
   }
   return Object.assign({ status: status }, details);
-}
-
-/** Steps 9-15 of a publish with ownership changes. Throws on any validation failure. */
-function publishMappingChanges_(ss, tab, recovery, history, sellers, diff, details) {
-  // 9-10. One effective date, not retroactive.
-  const eff = resolvePublishEffectiveDate_(diff, sellers);
-  throwIfErrors_('Effective date is invalid', eff.errors);
-  throwIfErrors_('Retroactive change', checkNonRetroactive_(eff.effectiveFrom, history.records, diff.toClose));
-  details.effective_from = eff.effectiveFrom;
-
-  // 11-13. Version, new history, re-validate.
-  const version = nextMappingVersion_(history.records);
-  const publishedAt = new Date(Math.floor(Date.now() / 1000) * 1000);
-  const newRecords = buildPublishedHistory_(history.records, diff, eff.effectiveFrom, version, publishedAt, sellers);
-  const after = validateMappingHistory_(newRecords);
-  throwIfErrors_('Resulting Endpoint Mapping history is invalid', after.integrity.concat(after.overlap)
-    .concat(checkHistoryImmutability_(history.records, newRecords)));
-
-  // 14-15. Whole-table crash-safe write (unchanged rows are written back with their stored values).
-  const columns = getColumnNames_(SHEETS.ENDPOINT_MAPPING);
-  const rows = newRecords.map(function (r) {
-    if (!r._new && !r._closedNow) return history.rows[r._index];
-    if (r._closedNow) {
-      const row = history.rows[r._index].slice();
-      row[columns.indexOf('effective_to')] = masterDateFromKey_(r.effective_to);
-      row[columns.indexOf('closed_version')] = r.closed_version;
-      row[columns.indexOf('status')] = r.status;
-      row[columns.indexOf('closed_at')] = r.closed_at;
-      return row;
-    }
-    return mappingRecordToRow_(r, columns, masterDateFromKey_);
-  });
-  const written = writeCanonicalTable_(ss, getTableSchema_(SHEETS.ENDPOINT_MAPPING), tab, rows);
-
-  details.mapping_version = version;
-  details.opened_count = diff.toOpen.length;
-  details.closed_count = diff.toClose.length;
-  details.open_mapping_count_after = newRecords.filter(function (r) { return r.status === 'OPEN'; }).length;
-  details.history_checksum = written.checksum;
-  details.swap_state = written.swapState === 'NORMAL' ? recovery.state : written.swapState;
-  return 'SUCCESS';
 }
 
 /** Read-only verification of the Sellers draft and the Endpoint Mapping history. */
@@ -713,6 +802,9 @@ function buildSellerMappingReport_() {
     open_mapping_count: 0,
     closed_mapping_count: 0,
     latest_mapping_version: null,
+    latest_mapping_effective_date: null,
+    version_boundary_errors: [],
+    missing_historical_seller_ids: [],
     history_overlap_errors: [],
     history_integrity_errors: [],
     desired_open_mapping_count: 0,
@@ -753,11 +845,15 @@ function buildSellerMappingReport_() {
     report.history_row_count = history.records.length;
     report.open_mapping_count = history.records.filter(function (r) { return r.status === 'OPEN'; }).length;
     report.closed_mapping_count = history.records.filter(function (r) { return r.status === 'CLOSED'; }).length;
-    report.latest_mapping_version = history.records.length === 0 ? null :
-      formatSequenceId_(SELLER_MAPPING.versionPrefix, parseSequenceId_(SELLER_MAPPING.versionPrefix, nextMappingVersion_(history.records)) - 1);
+    const latest = latestMappingBoundary_(history.records);
+    report.latest_mapping_version = latest ? latest.version : null;
+    report.latest_mapping_effective_date = latest ? latest.date : null;
     report.history_integrity_errors = check.integrity;
     report.history_overlap_errors = check.overlap;
-    if (check.integrity.length + check.overlap.length > 0) report.errors.push('Endpoint Mapping history is invalid.');
+    report.version_boundary_errors = check.versionBoundary;
+    if (historyValidationErrors_(check).length > 0) report.errors.push('Endpoint Mapping history is invalid.');
+    report.missing_historical_seller_ids = checkHistoricalSellersRetained_(draft.sellers, history.records);
+    if (report.missing_historical_seller_ids.length > 0) report.errors.push('Historical seller IDs are missing from Sellers.');
 
     // Dry run of the publish diff (IDs assigned in memory only).
     const planned = planSellerIdAssignments_(draft.sellers, history.records.map(function (r) { return r.seller_id; }));

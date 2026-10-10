@@ -45,32 +45,25 @@ function seller(o) {
 }
 const grid = (rows) => [SELLER_COLUMNS, ...rows];
 
-/** Pure replica of publishSellerMapping(): returns { status, records, sellers, diff, ... } or throws. */
+/**
+ * Pure part of publishSellerMapping(): draft + history validation, historical seller retention,
+ * seller ID assignment, then the real planSellerMappingPublish_(). Returns the new records.
+ */
 function publish(draftRows, records, at) {
   const draft = H.parseSellersDraft_(grid(draftRows), dateKeyOf);
   const errs = js(H.flattenErrors_(draft.errors));
   if (errs.length) throw new Error('DRAFT: ' + errs.join(' | '));
-  const hist = H.validateMappingHistory_(records);
-  if (hist.integrity.length + hist.overlap.length) throw new Error('HISTORY: ' + js(hist.integrity.concat(hist.overlap)).join(' | '));
+  const hist = js(H.historyValidationErrors_(H.validateMappingHistory_(records)));
+  if (hist.length) throw new Error('HISTORY: ' + hist.join(' | '));
+  const retained = js(H.checkHistoricalSellersRetained_(draft.sellers, records));
+  if (retained.length) throw new Error('RETENTION: ' + retained.join(' | '));
   const assignments = js(H.planSellerIdAssignments_(draft.sellers, records.map((r) => r.seller_id)));
-  const byRow = Object.fromEntries(assignments.map((a) => [a.row, a.seller_id]));
-  const sellers = draft.sellers.map((s) => (s.seller_id ? s : { ...s, seller_id: byRow[s.row] }));
-  const desired = H.desiredMappings_(sellers);
-  const diff = H.diffSellerMapping_(desired, records.filter((r) => r.status === 'OPEN'));
-  if (diff.changes.length === 0) return { status: 'NO_CHANGE', records, sellers, diff, assignments };
-  const eff = H.resolvePublishEffectiveDate_(diff, sellers);
-  if (eff.errors.length) throw new Error('EFFECTIVE: ' + js(eff.errors).join(' | '));
-  const retro = js(H.checkNonRetroactive_(eff.effectiveFrom, records, diff.toClose));
-  if (retro.length) throw new Error('RETRO: ' + retro.join(' | '));
-  const version = H.nextMappingVersion_(records);
-  const next = H.buildPublishedHistory_(records, diff, eff.effectiveFrom, version, at || 'T', sellers);
-  const after = H.validateMappingHistory_(next);
-  const imm = js(H.checkHistoryImmutability_(records, next));
-  if (after.integrity.length + after.overlap.length + imm.length) {
-    throw new Error('RESULT: ' + js(after.integrity.concat(after.overlap)).concat(imm).join(' | '));
-  }
-  const clean = next.map((r, i) => { const x = { ...r, _index: i }; delete x._new; delete x._closedNow; return x; });
-  return { status: 'SUCCESS', records: clean, sellers, diff, assignments, version, effectiveFrom: eff.effectiveFrom };
+  const byRow = Object.fromEntries(assignments.map((x) => [x.row, x.seller_id]));
+  const sellers = draft.sellers.map((x) => (x.seller_id ? x : { ...x, seller_id: byRow[x.row] }));
+  const plan = H.planSellerMappingPublish_(sellers, records, at || 'T');
+  if (plan.status === 'NO_CHANGE') return { status: 'NO_CHANGE', records, sellers, diff: plan.diff, assignments };
+  const clean = plan.newRecords.map((r, i) => { const x = { ...r, _index: i }; delete x._new; delete x._closedNow; return x; });
+  return { status: 'SUCCESS', records: clean, sellers, diff: plan.diff, assignments, version: plan.version, effectiveFrom: plan.effectiveFrom };
 }
 const open = (records) => records.filter((r) => r.status === 'OPEN');
 const owner = (records, key, date) => { const r = H.resolveEndpointByKey_(records, key, date); return r.mapping ? r.mapping.seller_id : null; };
@@ -228,16 +221,110 @@ test('a changed row without effective_from fails; unchanged rows may keep old da
   assert.equal(publish([DITECH({ from: '2026-11-01', endpoints: [['Endpoint A', 'key_a']] }), OTHER({ from: '2026-10-01' })], r).status, 'SUCCESS');
 });
 
-test('retroactive future publish fails (strictly after the latest published effective date)', () => {
+test('retroactive future publish fails (strictly after the latest published version boundary)', () => {
   const r = initial().records;
   assert.throws(() => publish([DITECH({ from: '2026-10-01', endpoints: [['Endpoint A', 'key_a']] }), OTHER()], r),
-    /RETRO: effective_from 2026-10-01 must be after the latest published effective_from 2026-10-01/);
-  assert.throws(() => publish([DITECH({ from: '2026-09-15', endpoints: [['Endpoint A', 'key_a']] }), OTHER()], r), /RETRO/);
+    /Retroactive change .*effective_from 2026-10-01 must be after the latest published version boundary 2026-10-01 \(SMV-000001\)/);
+  assert.throws(() => publish([DITECH({ from: '2026-09-15', endpoints: [['Endpoint A', 'key_a']] }), OTHER()], r), /Retroactive change/);
 });
 
 test('deleting a seller row that owns OPEN mappings fails', () => {
   const r = initial().records;
-  assert.throws(() => publish([OTHER()], r), /Seller SLR-000001 owns OPEN mapping .* its row was removed from Sellers/);
+  assert.throws(() => publish([OTHER()], r), /RETENTION: Historical seller SLR-000001 is missing from Sellers/);
+  // The effective-date resolver keeps its own guard as defence in depth.
+  const sellers = H.parseSellersDraft_(grid([OTHER()]), dateKeyOf).sellers;
+  const diff = H.diffSellerMapping_(H.desiredMappings_(sellers), open(r));
+  assert.match(js(H.resolvePublishEffectiveDate_(diff, sellers).errors).join(), /SLR-000001 owns OPEN mapping .* its row was removed/);
+});
+
+// ---- A. Version boundaries --------------------------------------------------------
+test('version boundaries: opened -> effective_from, closed -> effective_to + 1 day', () => {
+  const p0 = initial();
+  const p1 = publish([DITECH({ from: '2026-11-01', endpoints: [['Endpoint A', 'key_a']] }), OTHER()], p0.records, 'T1');
+  assert.deepEqual(js(H.mappingVersionBoundaries_(p1.records).boundaries).map((b) => [b.version, b.date]),
+    [['SMV-000001', '2026-10-01'], ['SMV-000002', '2026-11-01']]);
+  assert.deepEqual(js(H.latestMappingBoundary_(p1.records)), { version: 'SMV-000002', number: 2, date: '2026-11-01' });
+  assert.equal(H.latestMappingBoundary_([]), null);
+});
+
+test('pure removal sets a boundary: a later publish dated before it is retroactive, after it succeeds', () => {
+  const a = seller({ id: 'SLR-000001', name: 'Seller One', from: '2026-10-01', endpoints: [['Endpoint A', 'key_a']] });
+  const p0 = publish([a], [], 'T0');
+  // Pure removal effective 2026-11-01: only a closure, no row with effective_from 2026-11-01.
+  const p1 = publish([seller({ id: 'SLR-000001', name: 'Seller One', from: '2026-11-01', endpoints: [] })], p0.records, 'T1');
+  assert.deepEqual(js(p1.diff.changes).map((c) => c.type), ['REMOVED']);
+  assert.ok(!p1.records.some((r) => r.effective_from === '2026-11-01'), 'no row starts on the boundary');
+  // New unrelated endpoint effective 2026-10-15 -> retroactive (max row effective_from would wrongly allow it).
+  const lateNew = [seller({ id: 'SLR-000001', name: 'Seller One', from: '2026-11-01', endpoints: [] }),
+    seller({ name: 'Seller Two', from: '2026-10-15', endpoints: [['Endpoint Z', 'key_z']] })];
+  assert.throws(() => publish(lateNew, p1.records, 'T2'),
+    /Retroactive change .*2026-10-15 must be after the latest published version boundary 2026-11-01 \(SMV-000002\)/);
+  const ok = [seller({ id: 'SLR-000001', name: 'Seller One', from: '2026-11-01', endpoints: [] }),
+    seller({ name: 'Seller Two', from: '2026-12-01', endpoints: [['Endpoint Z', 'key_z']] })];
+  const p3 = publish(ok, p1.records, 'T3');
+  assert.equal(p3.status, 'SUCCESS');
+  assert.equal(p3.version, 'SMV-000003');
+  assert.equal(owner(p3.records, 'key_z', '2026-12-01'), 'SLR-000002');
+});
+
+test('one version with conflicting effective dates is a history integrity error', () => {
+  const r = initial().records;
+  const a = r.find((x) => x.endpoint_key === 'key_a');
+  const closedA = { ...a, status: 'CLOSED', effective_to: '2026-10-31', closed_version: 'SMV-000002', closed_at: 'T1' };
+  const opened = { mapping_id: H.mappingIdFor_('SLR-000002', 'key_a', '2026-11-02'), seller_id: 'SLR-000002',
+    seller_name_snapshot: 'Seller Two', endpoint_name: 'Endpoint A', endpoint_key: 'key_a', effective_from: '2026-11-02',
+    effective_to: '', opened_version: 'SMV-000002', closed_version: '', status: 'OPEN', opened_at: 'T1', closed_at: '', notes: '' };
+  const bad = r.map((x) => (x === a ? closedA : x)).concat([opened]);
+  const v = H.validateMappingHistory_(bad);
+  assert.match(js(v.versionBoundary).join(), /Version SMV-000002 has conflicting effective dates: 2026-11-01 \(.* closed\); 2026-11-02 \(.* opened\)/);
+  assert.throws(() => publish([DITECH(), OTHER()], bad), /HISTORY: .*conflicting effective dates/);
+  // Version dates must increase with the version number.
+  const swapped = r.map((x) => ({ ...x }));
+  swapped[0] = { ...swapped[0], opened_version: 'SMV-000002' };
+  swapped.push({ ...opened, opened_version: 'SMV-000001', mapping_id: H.mappingIdFor_('SLR-000002', 'key_q', '2026-11-02'),
+    endpoint_key: 'key_q', endpoint_name: 'Endpoint Q' });
+  assert.match(js(H.validateMappingHistory_(swapped).versionBoundary).join(), /is not after/);
+});
+
+// ---- B. Historical seller retention ---------------------------------------------------
+function closedHistory() {
+  const a = seller({ id: 'SLR-000001', name: 'Seller One', from: '2026-10-01', endpoints: [['Endpoint A', 'key_a']] });
+  const p0 = publish([a], [], 'T0');
+  return publish([seller({ id: 'SLR-000001', name: 'Seller One', from: '2026-11-01', endpoints: [] })], p0.records, 'T1').records;
+}
+
+test('historical seller row deleted after all its mappings are CLOSED: publish fails', () => {
+  const r = closedHistory();
+  assert.equal(open(r).length, 0);
+  assert.throws(() => publish([seller({ name: 'Someone new', from: '2026-12-01', endpoints: [['Endpoint B', 'key_b']] })], r),
+    /RETENTION: Historical seller SLR-000001 is missing from Sellers/);
+});
+
+test('historical seller kept as INACTIVE with a new name and no endpoints is valid', () => {
+  const r = closedHistory();
+  const p = publish([seller({ id: 'SLR-000001', name: 'Seller One renamed', status: 'INACTIVE', from: '' })], r);
+  assert.equal(p.status, 'NO_CHANGE');
+});
+
+test('changing a historical seller_id (SLR-000001 -> SLR-000099) fails', () => {
+  const r = closedHistory();
+  assert.throws(() => publish([seller({ id: 'SLR-000099', name: 'Seller One', status: 'INACTIVE' })], r),
+    /RETENTION: Historical seller SLR-000001 is missing/);
+  assert.deepEqual(js(H.checkHistoricalSellersRetained_([], r)), [
+    'Historical seller SLR-000001 is missing from Sellers; keep its row (it may be INACTIVE with no endpoints)']);
+});
+
+// ---- C. Integrity hardening -------------------------------------------------------------
+test('history integrity: snapshot name, opened_at, closed_at and OPEN closure fields', () => {
+  const r = closedHistory();
+  const closed = r.find((x) => x.status === 'CLOSED');
+  const v = (rows) => js(H.validateMappingHistory_(rows).integrity).join(' | ');
+  assert.match(v([{ ...closed, seller_name_snapshot: '' }]), /seller_name_snapshot is blank/);
+  assert.match(v([{ ...closed, opened_at: '' }]), /opened_at is blank/);
+  assert.match(v([{ ...closed, closed_at: '' }]), /CLOSED row requires closed_at/);
+  assert.match(v([{ ...closed, closed_version: '' }]), /invalid closed_version/);
+  assert.match(v([{ ...closed, status: 'OPEN' }]), /OPEN row must have blank effective_to, closed_version and closed_at/);
+  assert.equal(v(r), '');
 });
 
 test('old effective_from is never rewritten; closure changes only the allowed fields; closed rows immutable', () => {

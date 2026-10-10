@@ -405,13 +405,22 @@ Entry points: `publishSellerMapping()` and read-only `verifySellerMapping()`.
   desired entries not OPEN are opened. Reported as NEW / REMOVED / MOVED_TO_ANOTHER_SELLER /
   NAME_CHANGED / KEY_CHANGED. All changes share one `effective_from` taken from the involved
   Sellers rows (old owner of every closed row, new owner of every opened row) and one
-  version `SMV-######`. The initial publish may be back-dated; later publishes must be
-  strictly after every published `effective_from`. A row owning OPEN mappings may not be
-  deleted from Sellers (remove the pair or set INACTIVE with `effective_from`). A seller
-  name or notes change alone is NO_CHANGE. CLOSED rows are immutable.
-- The new history is validated (ids, dates, versions, no overlaps per key / per name, at most
-  one open-ended row each, immutability) and written as a whole table through the shared
-  crash-safe swap (`writeCanonicalTable_`).
+  version `SMV-######`. A seller name or notes change alone is NO_CHANGE. CLOSED rows are
+  immutable.
+- **Version boundaries:** every version has one effective date, derived from history —
+  `opened_version` → `effective_from`, `closed_version` → `effective_to + 1 day` (CLOSED rows).
+  All occurrences of a version must agree and dates must increase with the version number
+  (history integrity). The initial publish may be back-dated; every later publish must be
+  strictly after the latest version boundary (this covers publishes that only closed rows)
+  and after the `effective_from` of every row it closes.
+- **Seller retention:** every `seller_id` that ever appeared in Endpoint Mapping must stay on
+  exactly one Sellers row forever (it may be INACTIVE with no endpoints; the name may change).
+  A missing or re-keyed historical seller fails the publish before anything is written.
+- The new history is validated (ids, snapshot name, opened/closed timestamps, dates, versions
+  and version boundaries, no overlaps per key / per name, at most one open-ended row each,
+  immutability) and written as a whole table through the shared crash-safe swap
+  (`writeCanonicalTable_`). Audit reports `initial_swap_state`, `recovery_actions` and
+  `final_swap_state`.
 - **Resolvers** (for later phases): `resolveEndpointByKey_`, `resolveEndpointByName_`,
   `resolveEndpointByNameAndKey_` — match `effective_from <= date <= effective_to`
   (blank = open) on Master-timezone date keys; none → UNMAPPED, several → error; name and
