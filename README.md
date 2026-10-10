@@ -371,6 +371,8 @@ Order: `syncKh001Raw` → `normalizeKh001ProviderTransactions` → `normalizeKh0
   net, provider fee, hold, payout), using the canonical cell serialization. Sections A/B,
   other settlements, unrelated DoiSoat rows, row numbers and timestamps are excluded. Full
   raw checksums are recorded only in the operation-level audit.
+- The section-D sheet row is not stored (row position is not a stable identity); the
+  verifier/audit report the current row as diagnostic `settlement_source_rows` only.
 - **Immutability boundary:** Settlements is still a *rebuildable observed* provider
   settlement layer — a later provider edit changes the affected settlement on the next run.
   Before Settlement Items are created/frozen (Phase 2E), a commit/lock boundary must prevent

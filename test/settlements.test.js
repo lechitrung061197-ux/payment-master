@@ -327,6 +327,35 @@ test('fingerprint: changing sections A/B only does not change settlement fingerp
   assert.equal(js(moved.rows)[0].gross_amount, js(base.rows)[0].gross_amount);
 });
 
+test('moving section D (rows inserted/removed above it) keeps the canonical partition checksum: NO_CHANGE', () => {
+  const rcRows = defaultReconciled();
+  const run = (grid) => H.buildKh001Settlements_(grid, reconciledGrid(rcRows), ptIndexFor(rcRows), { timeZone: TZ });
+  const checksumOf = (b) => H.partitionChecksum_(b.rows.map((o) => H.settlementObjectToRow_(o, COLUMNS, dateFromKey)),
+    COLUMNS, SORT, 'normalized_at');
+  const base = run(settlementsGrid(defaultHistory()));
+  const inserted = settlementsGrid(defaultHistory());
+  inserted.splice(4, 0, titled('A. extra line 1'), titled('A. extra line 2'), blankRow());   // D moves down by 3
+  const removed = settlementsGrid(defaultHistory());
+  removed.splice(4, 2);                                                                      // D moves up by 2
+  const a = run(inserted);
+  const b = run(removed);
+  assert.equal(errs(a), '');
+  assert.equal(errs(b), '');
+  assert.deepEqual(js(a.sourceRows).map((x) => x.source_row), [13, 14], 'diagnostic row moved');
+  assert.deepEqual(js(b.sourceRows).map((x) => x.source_row), [8, 9], 'diagnostic row moved');
+  assert.equal(checksumOf(a), checksumOf(base));
+  assert.equal(checksumOf(b), checksumOf(base));
+  // Writer decision against a target holding the base partition (as replaceCanonicalPartition_ compares it).
+  const sortIdx = SORT.map((c) => COLUMNS.indexOf(c));
+  const stamp = [COLUMNS.indexOf('normalized_at')];
+  const tableOf = (x) => H.buildTableValues_(COLUMNS, H.sortCanonicalRows_(x.rows.map((o) => H.settlementObjectToRow_(o, COLUMNS, dateFromKey)), sortIdx));
+  const stored = H.tableChecksumExcluding_(tableOf(base), stamp);
+  assert.equal(H.decideCanonicalWrite_(H.tableChecksumExcluding_(tableOf(a), stamp), stored), 'NO_CHANGE');
+  assert.equal(H.decideCanonicalWrite_(H.tableChecksumExcluding_(tableOf(b), stamp), stored), 'NO_CHANGE');
+  assert.ok(!COLUMNS.includes('source_settlement_row'), 'row position is not part of the schema');
+  assert.equal(COLUMNS.length, 34);
+});
+
 test('fingerprint: an unrelated future DoiSoat row does not change older settlements', () => {
   const rows = defaultReconciled().concat([rcRow({ 'Transaction ID': 'T10', 'Lần chốt (ngày)': '' }),
     rcRow({ 'Transaction ID': 'T11', 'Có trên PP': 0 })]);

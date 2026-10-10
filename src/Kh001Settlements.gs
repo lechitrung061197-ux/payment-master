@@ -222,7 +222,8 @@ function flattenSettlementErrors_(errors) {
  * @param {Object} ptIndex provider_transaction_id -> Provider Transaction object
  * @param {{timeZone: string}} opts
  * @return {{rows: Array<Object>, errors: Object, warnings: Array<string>,
- *           holdReconciliation: Array<Object>, includedTransactions: number}}
+ *           holdReconciliation: Array<Object>, includedTransactions: number,
+ *           sourceRows: Array<{settlement_number: number, source_row: number}>}}  sourceRows is diagnostic only
  */
 function buildKh001Settlements_(settlementsValues, reconciledValues, ptIndex, opts) {
   const cfg = KH001_SETTLEMENTS;
@@ -458,7 +459,6 @@ function buildKh001Settlements_(settlementsValues, reconciledValues, ptIndex, op
       fx_rate: n.fx_rate,
       payout_currency: n.source_paid_payout_amount === '' ? '' : cfg.payoutCurrencyWhenVnd,
       source_paid_payout_amount: n.source_paid_payout_amount,
-      source_settlement_row: s.row,
       source_fingerprint: computeKh001SettlementFingerprint_({
         source_settlement_number: s.number,
         period_start_date: s.dates.period_start_date,
@@ -483,7 +483,10 @@ function buildKh001Settlements_(settlementsValues, reconciledValues, ptIndex, op
     });
   });
 
-  return { rows: rows, errors: errors, warnings: warnings, holdReconciliation: holdReconciliation, includedTransactions: included };
+  // Current section-D row of each settlement: diagnostic only (never stored or fingerprinted).
+  const sourceRows = history.map(function (s) { return { settlement_number: s.number, source_row: s.row }; });
+  return { rows: rows, errors: errors, warnings: warnings, holdReconciliation: holdReconciliation,
+    includedTransactions: included, sourceRows: sourceRows };
 }
 
 function assertNoSettlementErrors_(errors) {
@@ -635,6 +638,7 @@ function runKh001SettlementsNormalizer_() {
       return { settlement_id: r.settlement_id, source_fingerprint: r.source_fingerprint };
     });
     details.hold_reconciliation = built.holdReconciliation;
+    details.settlement_source_rows = built.sourceRows;
     details.warnings = built.warnings;
 
     const result = replaceCanonicalPartition_(ss, {
@@ -721,6 +725,7 @@ function buildKh001SettlementsReport_() {
     report.settlement_fingerprints = built.rows.map(function (r) {
       return { settlement_id: r.settlement_id, source_fingerprint: r.source_fingerprint };
     });
+    report.settlement_source_rows = built.sourceRows; // diagnostic only, not stored
     report.warnings = built.warnings;
 
     report.swap_state = detectSwapState_(ss, settlementsTab_()).state;

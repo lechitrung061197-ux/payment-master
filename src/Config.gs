@@ -312,7 +312,6 @@ const SCHEMA = Object.freeze([
       col_('fx_rate', T.FX_RATE),
       col_('payout_currency', T.TEXT),
       col_('source_paid_payout_amount', T.AMOUNT),
-      col_('source_settlement_row', T.INTEGER),
       col_('source_fingerprint', T.ID),
       col_('normalizer_version', T.TEXT),
       col_('normalized_at', T.DATETIME),
