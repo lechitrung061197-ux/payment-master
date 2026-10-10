@@ -9,7 +9,7 @@
 
 const APP = Object.freeze({
   NAME: 'Payment Master',
-  SCHEMA_VERSION: 2,
+  SCHEMA_VERSION: 3,
   LOCALE: 'en_US',
   TIMEZONE: 'America/New_York',
   DEFAULT_CURRENCY: 'USD',
@@ -72,6 +72,7 @@ const ENUMS = Object.freeze({
   ADJUSTMENT_STATUS: ['PENDING', 'APPLIED', 'VOID'],
   DISPUTE_STATUS: ['OPEN', 'UNDER_REVIEW', 'WON', 'LOST', 'CLOSED'],
   SETTING_VALUE_TYPE: ['STRING', 'RATE', 'NUMBER', 'BOOLEAN'],
+  IMPORT_BATCH_STATUS: ['RUNNING', 'SUCCESS', 'NO_CHANGE', 'FAILED'],
 });
 
 /** Tab names, in display order. */
@@ -92,6 +93,11 @@ const SHEETS = Object.freeze({
   DISPUTES: 'Disputes',
   DASHBOARD: 'Dashboard',
   AUDIT_LOG: 'Audit Log',
+  IMPORT_BATCHES: 'Import Batches',
+  RAW_KH001_PAYPAL: 'Raw KH001 PayPal',
+  RAW_KH001_RECONCILED: 'Raw KH001 Reconciled',
+  RAW_KH001_SETTLEMENTS: 'Raw KH001 Settlements',
+  RAW_KH001_DISPUTES: 'Raw KH001 Disputes',
 });
 
 /** Shorthand column constructor: col_('name', COL_TYPE.X, ENUMS.Y?) */
@@ -411,7 +417,53 @@ const SCHEMA = Object.freeze([
       col_('details', T.TEXT),
     ],
   },
+  {
+    sheet: SHEETS.IMPORT_BATCHES,
+    description: 'One row per source-tab sync attempt. checksum is the snapshot checksum ' +
+      '(SHA-256 over canonical cell values) of the source at sync time.',
+    columns: [
+      col_('import_batch_id', T.ID),
+      col_('provider_id', T.ID),
+      col_('source_spreadsheet_id', T.ID),
+      col_('source_sheet', T.TEXT),
+      col_('target_sheet', T.TEXT),
+      col_('started_at', T.DATETIME),
+      col_('completed_at', T.DATETIME),
+      col_('source_rows', T.INTEGER),
+      col_('source_columns', T.INTEGER),
+      col_('checksum', T.ID),
+      col_('status', T.ENUM, ENUMS.IMPORT_BATCH_STATUS),
+      col_('error_message', T.TEXT),
+      col_('actor', T.TEXT),
+    ],
+  },
 ]);
+
+/**
+ * Raw snapshot sources. Source spreadsheet ID and source tab names are read from
+ * Settings at run time (keys below); only Master-side target/staging tab names live here.
+ * Target tabs are exact value mirrors of the source used range and have no schema.
+ */
+const RAW_SOURCES = Object.freeze({
+  KH001: {
+    providerId: 'KH001',
+    enabledSetting: 'source.KH001.enabled',
+    spreadsheetIdSetting: 'source.KH001.spreadsheet_id',
+    tabs: [
+      { sourceSheetSetting: 'source.KH001.raw_paypal_sheet',
+        targetSheet: SHEETS.RAW_KH001_PAYPAL, stagingSheet: '__STAGE_KH001_RAW_PP' },
+      { sourceSheetSetting: 'source.KH001.reconciled_sheet',
+        targetSheet: SHEETS.RAW_KH001_RECONCILED, stagingSheet: '__STAGE_KH001_RECONCILED' },
+      { sourceSheetSetting: 'source.KH001.settlements_sheet',
+        targetSheet: SHEETS.RAW_KH001_SETTLEMENTS, stagingSheet: '__STAGE_KH001_SETTLEMENTS' },
+      { sourceSheetSetting: 'source.KH001.disputes_sheet',
+        targetSheet: SHEETS.RAW_KH001_DISPUTES, stagingSheet: '__STAGE_KH001_DISPUTES' },
+    ],
+  },
+});
+
+/** Prefix of hidden staging tabs used only by raw sync. */
+const STAGING_SHEET_PREFIX = '__STAGE_';
 
 /**
  * Initial Settings rows, written only when the key does not exist yet.
@@ -428,6 +480,15 @@ const DEFAULT_SETTINGS = Object.freeze([
   ['provider_fee_model.KH001', 'PERCENT_OF_NET', 'STRING', 'Fee model for provider KH001.'],
   ['provider_fee_rate.KH001', 0.07, 'RATE', 'Provider KH001 fee rate on net amount.'],
   ['provider_hold_rate.KH001', 0.10, 'RATE', 'Provider KH001 hold rate on net amount (provider holds from us).'],
+  ['source.KH001.enabled', true, 'BOOLEAN', 'Enable KH001 raw sync.'],
+  ['source.KH001.spreadsheet_id', '1gDg2NrxIkXNSnFSOgH-jCUH4GZOpSyrm2Zf8oEuiBzM', 'STRING',
+    'KH001 source spreadsheet (PayPal_KH001_T10-2026_MR TRUNG LE).'],
+  ['source.KH001.timezone', 'America/Los_Angeles', 'STRING',
+    'KH001 source timezone. Raw sync does not convert; used by the future normalizer.'],
+  ['source.KH001.raw_paypal_sheet', 'RAW_PP', 'STRING', 'KH001 source tab mirrored to Raw KH001 PayPal.'],
+  ['source.KH001.reconciled_sheet', 'DoiSoat_GD', 'STRING', 'KH001 source tab mirrored to Raw KH001 Reconciled.'],
+  ['source.KH001.settlements_sheet', 'PhieuDoiSoat', 'STRING', 'KH001 source tab mirrored to Raw KH001 Settlements.'],
+  ['source.KH001.disputes_sheet', 'Dispute', 'STRING', 'KH001 source tab mirrored to Raw KH001 Disputes.'],
 ]);
 
 /** Settings keys whose value is always kept in sync with code. */

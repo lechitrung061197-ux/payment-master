@@ -47,7 +47,9 @@ function verifyMaster() {
     scriptTimeZone: Session.getScriptTimeZone(),
     tabs: actual,
     missingTabs: expected.filter(function (n) { return actual.indexOf(n) < 0; }),
-    extraTabs: actual.filter(function (n) { return expected.indexOf(n) < 0; }),
+    extraTabs: actual.filter(function (n) {
+      return expected.indexOf(n) < 0 && n.indexOf(STAGING_SHEET_PREFIX) !== 0 && n.indexOf('__SWAP_') !== 0;
+    }),
     headerIssues: headerIssues,
     schemaVersion: { expected: APP.SCHEMA_VERSION, actual: schemaVersion },
     missingSettings: DEFAULT_SETTINGS
@@ -61,4 +63,49 @@ function verifyMaster() {
 
   Logger.log(JSON.stringify(report, null, 2));
   return report;
+}
+
+/* ---------------------------------------------------------------------------
+ * KH001 raw sync (RAW INGESTION ONLY: no normalization, matching or accounting)
+ * ------------------------------------------------------------------------- */
+
+/** Syncs all KH001 raw tabs. One tab failing does not stop the others. */
+function syncKh001Raw() {
+  const summary = syncRawSource_(RAW_SOURCES.KH001);
+  Logger.log(JSON.stringify(summary, null, 2));
+  return summary;
+}
+
+function syncKh001RawPayPal() {
+  return runSingleRawTab_(RAW_SOURCES.KH001, SHEETS.RAW_KH001_PAYPAL);
+}
+
+function syncKh001RawReconciled() {
+  return runSingleRawTab_(RAW_SOURCES.KH001, SHEETS.RAW_KH001_RECONCILED);
+}
+
+function syncKh001RawSettlements() {
+  return runSingleRawTab_(RAW_SOURCES.KH001, SHEETS.RAW_KH001_SETTLEMENTS);
+}
+
+function syncKh001RawDisputes() {
+  return runSingleRawTab_(RAW_SOURCES.KH001, SHEETS.RAW_KH001_DISPUTES);
+}
+
+/** Read-only: compares each KH001 source tab with its raw target tab. */
+function verifyKh001RawSync() {
+  const report = verifyRawSource_(RAW_SOURCES.KH001);
+  Logger.log(JSON.stringify(report, null, 2));
+  return report;
+}
+
+function runSingleRawTab_(source, targetSheet) {
+  const tab = source.tabs.find(function (t) { return t.targetSheet === targetSheet; });
+  if (!tab) throw new Error('No raw tab configured for target ' + targetSheet);
+  const result = syncRawTab_(source, tab);
+  const summary = { provider: source.providerId };
+  summary[result.sourceSheet || targetSheet] = result.status;
+  if (result.error) summary.error = result.error;
+  Logger.log(JSON.stringify(summary, null, 2));
+  return summary;
 }

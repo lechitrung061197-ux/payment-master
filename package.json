@@ -1,0 +1,8 @@
+{
+  "name": "payment-master",
+  "private": true,
+  "description": "Payment Master: Google Sheets + Apps Script. Local tests only; Apps Script code lives in src/.",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}

@@ -39,6 +39,7 @@ function runSetup_() {
 
   adoptDefaultSheet_(ss);
   SCHEMA.forEach(function (table) { ensureTable_(ss, table, warnings, migratedTabs); });
+  ensureRawTargetTabs_(ss);
   ensureDashboard_(ss);
   orderSheets_(ss);
   const oldSchemaVersion = readSettingValue_(ss, 'schema_version');
@@ -177,6 +178,18 @@ function protectHeader_(sheet, columnCount) {
   sheet.getRange(1, 1, 1, columnCount).protect()
     .setDescription(HEADER_PROTECTION_DESCRIPTION)
     .setWarningOnly(true);
+}
+
+/**
+ * Creates empty raw target tabs that do not exist yet. Their content is managed
+ * only by raw sync (RawSync.gs); setup never writes or clears them.
+ */
+function ensureRawTargetTabs_(ss) {
+  Object.keys(RAW_SOURCES).forEach(function (k) {
+    RAW_SOURCES[k].tabs.forEach(function (tab) {
+      if (!ss.getSheetByName(tab.targetSheet)) ss.insertSheet(tab.targetSheet);
+    });
+  });
 }
 
 /**

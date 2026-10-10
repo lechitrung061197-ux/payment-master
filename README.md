@@ -35,7 +35,12 @@ src/
   Setup.gs          Idempotent, non-destructive spreadsheet setup/formatting
   Audit.gs          Append-only Audit Log writer
   Utils.gs          Generic helpers
-  Main.gs           Public entry points: setupMaster(), verifyMaster()
+  Settings.gs       Read access to the Settings tab
+  ImportBatches.gs  Import Batches rows (one per source-tab sync attempt)
+  RawSnapshot.gs    Pure helpers: canonical serialization, checksum, trim, validation
+  RawSync.gs        Safe raw snapshot sync (staging + verified swap) and verify
+  Main.gs           Public entry points
+test/               Node unit tests for pure helpers (npm test, not pushed)
 ```
 
 `rootDir` is `.` (not `src`) because clasp 3.4.0 resolves `rootDir` twice on
@@ -80,6 +85,13 @@ from the Apps Script editor. `setupMaster` never deletes tabs or data rows:
 | Disputes | Dispute case tracking |
 | Dashboard | Skeleton summary |
 | Audit Log | Append-only operation log |
+| Import Batches | One row per raw source-tab sync attempt (RUNNING → SUCCESS / NO_CHANGE / FAILED) |
+| Raw KH001 PayPal | Raw mirror of KH001 `RAW_PP` |
+| Raw KH001 Reconciled | Raw mirror of KH001 `DoiSoat_GD` |
+| Raw KH001 Settlements | Raw mirror of KH001 `PhieuDoiSoat` |
+| Raw KH001 Disputes | Raw mirror of KH001 `Dispute` |
+
+Hidden `__STAGE_*` tabs are internal to raw sync and must never be read by business logic.
 
 ## Financial design rules
 
@@ -188,6 +200,46 @@ e.g. SP-001 $1,300 = KH001 settlement $800 + Stripe settlement $500.
 
 Matches are reversed (`match_status = REVERSED`), never deleted. Settlements are
 `LOCKED`, not edited. Important operations are written to Audit Log.
+
+## Raw ingestion (KH001)
+
+Entry points: `syncKh001Raw()` (all tabs), `syncKh001RawPayPal()`,
+`syncKh001RawReconciled()`, `syncKh001RawSettlements()`, `syncKh001RawDisputes()`,
+and read-only `verifyKh001RawSync()`.
+
+Configuration comes only from Settings: `source.KH001.enabled`,
+`source.KH001.spreadsheet_id`, `source.KH001.timezone`, and the source tab names
+`source.KH001.raw_paypal_sheet`, `.reconciled_sheet`, `.settlements_sheet`, `.disputes_sheet`.
+
+**Raw means raw.** The used range of each source tab is mirrored as evaluated values
+(`getValues()`; formulas are never copied). No renaming, filtering, normalization,
+recalculation, business rules or timezone conversion. Types are kept
+(number, Date, text, boolean, blank); text cells are written as plain text so values
+like `00123` are not re-parsed. Trailing fully-blank rows/columns of the used range
+(e.g. formulas returning `""`) are not part of the snapshot.
+
+**Safe snapshot.** Per source tab, under a script lock: read the whole source once →
+validate → checksum → compare with the last SUCCESS/NO_CHANGE batch *and* the current
+target → `NO_CHANGE` (no write) or write the full dataset to a hidden staging tab →
+verify staging → swap staging into the target by renaming → verify the target (rollback
+on mismatch) → log. The live target is never cleared or partially written; the previous
+snapshot becomes the staging tab and is kept until the next write. A failure in one tab
+does not affect the others.
+
+**Checksum.** SHA-256 over a canonical, locale-independent serialization: blank `E`,
+text `S<json>`, number `N<decimal>`, boolean `B1/B0`, Date `D<epoch ms>`, hashed in
+2,000-row chunks and combined with the dimensions.
+
+**Timezone.** Dates are mirrored as the same instant (epoch ms). Because Master runs in
+`America/New_York` and KH001 in `America/Los_Angeles`, a source date-time displays
+3 hours later in Master (e.g. 08:00 LA shows as 11:00 NY). The value is unchanged;
+interpretation is left to the future KH001 normalizer (`source.KH001.timezone`).
+
+## Tests
+
+```bash
+npm test   # Node built-in test runner, no dependencies
+```
 
 ## Out of scope (current phase)
 
