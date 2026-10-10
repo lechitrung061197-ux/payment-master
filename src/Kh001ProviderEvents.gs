@@ -8,9 +8,12 @@
  * - PayPal signed amounts are kept as-is (Fee stays negative): gross + fee = net.
  * - balance_effect_amount follows Balance Impact: Credit/Debit = net, Memo = 0.
  * - PAYMENT / RESERVE_HOLD must link to an existing Provider Transaction; WITHDRAWAL has no link.
+ * - Before any write or NO_CHANGE, the KH001 Provider Transactions partition must equal what
+ *   its normalizer produces from the CURRENT raw tabs (dependency freshness gate).
  * - RESERVE_HOLD is the actual PayPal reserve. It is not the KH001 contractual hold and no
  *   percentage is derived here. No settlements, fees, holds or withdrawal allocation.
- * - Reads only Master tabs (Raw KH001 PayPal; Provider Transactions for integrity).
+ * - Reads only Master tabs (Raw KH001 PayPal for events; Raw KH001 Reconciled and Provider
+ *   Transactions only for the dependency/integrity checks).
  *
  * The first part of this file is pure (unit-tested in Node); the I/O part follows.
  */
@@ -406,18 +409,40 @@ function providerEventsTab_() {
 }
 
 /**
- * Reads Provider Transactions (read-only) for referential integrity. Requires the tab to
- * be in a NORMAL swap state; recovery of that tab belongs to its own normalizer.
+ * Reads the Provider Transactions dependency (read-only): requires a NORMAL swap state
+ * (recovery of that tab belongs to its own normalizer), indexes its rows for referential
+ * integrity, and checks that its KH001 partition is exactly what the Provider Transactions
+ * normalizer would produce from the CURRENT Raw KH001 PayPal + Raw KH001 Reconciled.
+ * Raw KH001 Reconciled is read only for this freshness check, not as event data.
+ * @param {{values: Array<Array<*>>, checksum: string}} paypalGrid already-read Raw KH001 PayPal
+ * @return {{index: Object, dependency: Object}}
  */
-function readProviderTransactionsIndex_(ss) {
+function readProviderTransactionsDependency_(ss, paypalGrid) {
   const state = detectSwapState_(ss, providerTransactionsTab_()).state;
   if (state !== 'NORMAL') {
     throw new Error('Provider Transactions swap state is ' + state + '; run normalizeKh001ProviderTransactions first.');
   }
+  const reconciledSheet = ss.getSheetByName(SHEETS.RAW_KH001_RECONCILED);
+  if (!reconciledSheet) throw new Error('Raw tab "' + SHEETS.RAW_KH001_RECONCILED + '" not found. Run syncKh001Raw first.');
+  const reconciled = readSheetGrid_(reconciledSheet);
+
   const sheet = ss.getSheetByName(SHEETS.PROVIDER_TRANSACTIONS);
   const columns = getColumnNames_(SHEETS.PROVIDER_TRANSACTIONS);
   const rows = tableRowsFromGrid_(readSheetGrid_(sheet).values, columns, SHEETS.PROVIDER_TRANSACTIONS);
-  return indexProviderTransactions_(rows.map(function (r) { return rowToObject_(r, columns); }));
+  const check = checkKh001ProviderTransactionsCurrent_(paypalGrid, reconciled, rows, columns);
+  return {
+    index: indexProviderTransactions_(rows.map(function (r) { return rowToObject_(r, columns); })),
+    dependency: {
+      provider_transactions_current: check.current,
+      swap_state: state,
+      reconciled_checksum: reconciled.checksum,
+      expected_checksum: check.expected_checksum,
+      stored_checksum: check.stored_checksum,
+      expected_rows: check.expected_rows,
+      stored_rows: check.stored_rows,
+      reason: check.reason,
+    },
+  };
 }
 
 function readKh001EventsInput_(ss) {
@@ -444,8 +469,12 @@ function runKh001ProviderEventsNormalizer_() {
     details.source_fingerprint = input.fingerprint;
     details.paypal_checksum = input.paypal.checksum;
 
-    const ptIndex = readProviderTransactionsIndex_(ss);
-    const built = buildKh001ProviderEvents_(input.paypal.values, ptIndex, input.fingerprint);
+    // Dependency freshness gate: must pass before any write or NO_CHANGE result.
+    const dep = readProviderTransactionsDependency_(ss, input.paypal);
+    details.provider_transactions_checksum = dep.dependency.stored_checksum;
+    if (!dep.dependency.provider_transactions_current) throw new Error(dep.dependency.reason);
+
+    const built = buildKh001ProviderEvents_(input.paypal.values, dep.index, input.fingerprint);
     details.input_event_rows = built.eventRows;
     assertNoEventErrors_(built.errors);
 
@@ -504,6 +533,7 @@ function buildKh001ProviderEventsReport_() {
     totals_by_event_type: {},
     total_balance_effect: null,
     linked_counts: {},
+    dependency: null,
     target_match: false,
     swap_state: null,
     pass: false,
@@ -522,7 +552,10 @@ function buildKh001ProviderEventsReport_() {
       selected_event_rows: null,
     };
 
-    const ptIndex = readProviderTransactionsIndex_(ss);
+    const dep = readProviderTransactionsDependency_(ss, input.paypal);
+    const ptIndex = dep.index;
+    report.dependency = dep.dependency;
+    if (!dep.dependency.provider_transactions_current) report.errors.push(dep.dependency.reason);
     let expectedChecksum = null;
     const built = buildKh001ProviderEvents_(input.paypal.values, ptIndex, input.fingerprint);
     report.source.selected_event_rows = built.eventRows;

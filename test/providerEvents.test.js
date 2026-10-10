@@ -26,11 +26,12 @@ const FP = 'e'.repeat(64);
 
 // ---- Fixtures ---------------------------------------------------------------
 const HEADER = ['Thời gian', 'Name', 'Type', 'Status', 'Currency', 'Gross', 'Fee', 'Net', 'From Email Address',
-  'Transaction ID', 'Reference Txn ID', 'Invoice Number', 'Balance Impact', 'Mã cổng', 'Nhóm GD', 'Txn gốc', 'Balance'];
+  'To Email Address', 'Transaction ID', 'Reference Txn ID', 'Invoice Number', 'Balance Impact', 'Mã cổng', 'Nhóm GD', 'Txn gốc', 'Balance'];
 function row(o) {
   const r = {
     'Thời gian': D('2026-10-02T15:00:00Z'), Name: 'Buyer', Type: 'Express Checkout Payment', Status: 'Completed',
-    Currency: 'USD', Gross: 91.98, Fee: -3.24, Net: 88.74, 'From Email Address': 'b@x.com', 'Transaction ID': 'PAY1',
+    Currency: 'USD', Gross: 91.98, Fee: -3.24, Net: 88.74, 'From Email Address': 'b@x.com', 'To Email Address': 's@x.com',
+    'Transaction ID': 'PAY1',
     'Reference Txn ID': '', 'Invoice Number': 'INV-1', 'Balance Impact': 'Credit', 'Mã cổng': 'G01',
     'Nhóm GD': 'Thanh toán', 'Txn gốc': 'PAY1', Balance: 0, ...o,
   };
@@ -267,4 +268,83 @@ test('regression report is separate and only passes for the expected snapshot', 
   const r = js(H.evaluateKh001ProviderEventsRegression_({ ...summary, total_balance_effect: 119.31 }, source));
   assert.deepEqual(r.failed, ['total_balance_effect']);
   assert.equal(H.evaluateKh001ProviderEventsRegression_(js(H.summarizeProviderEvents_(ok().rows)), source).pass, false);
+});
+
+// ---- Dependency freshness: Provider Transactions must match CURRENT raw snapshots ----
+const PT_COLUMNS = js(H.getColumnNames_('Provider Transactions'));
+const RC_HEADER = ['Transaction ID', 'Có trên KH', 'Có trên PP', 'Trạng thái', 'Mã cổng', 'Sub account', 'Thời gian GD',
+  'Số tiền KH', 'Gross PayPal', 'Chênh lệch', 'Phí PayPal', 'Net'];
+function reconciled(overrides) {
+  const r = { 'Transaction ID': 'PAY1', 'Có trên KH': 'x', 'Có trên PP': 'x', 'Trạng thái': 'Khớp', 'Mã cổng': 'G01',
+    'Sub account': 'SUB-1', 'Thời gian GD': D('2026-10-02T15:00:00Z'), 'Số tiền KH': 91.98, 'Gross PayPal': 91.98,
+    'Chênh lệch': 0, 'Phí PayPal': 3.24, Net: 88.74, ...overrides };
+  const blank = RC_HEADER.map(() => '');
+  return [blank, blank, blank, blank, blank, RC_HEADER, RC_HEADER.map((h) => r[h])];
+}
+const grid = (values) => ({ values, checksum: H.computeRawChecksum_(values) });
+/** Simulates normalizeKh001ProviderTransactions output stored in the sheet (sorted, stamped). */
+function storedPt(paypalValues, reconciledValues) {
+  const p = grid(paypalValues);
+  const r = grid(reconciledValues);
+  const fp = H.computeKh001SourceFingerprint_(p.checksum, r.checksum);
+  const rows = H.buildKh001ProviderTransactions_(paypalValues, reconciledValues, fp).rows.map((o) => H.objectToRow_(o, PT_COLUMNS));
+  const sortIdx = ['provider_id', 'payment_source', 'transaction_at', 'external_transaction_id'].map((c) => PT_COLUMNS.indexOf(c));
+  return H.sortCanonicalRows_(rows, sortIdx).map((row) => { const x = row.slice(); x[PT_COLUMNS.indexOf('normalized_at')] = D('2026-10-11T00:00:00Z'); return x; });
+}
+const fresh = (paypalValues, reconciledValues, stored) =>
+  js(H.checkKh001ProviderTransactionsCurrent_(grid(paypalValues), grid(reconciledValues), stored, PT_COLUMNS));
+
+test('dependency: Provider Transactions exactly matching current raw PayPal + Reconciled is current', () => {
+  const c = fresh(inputs(), reconciled({}), storedPt(inputs(), reconciled({})));
+  assert.equal(c.current, true);
+  assert.equal(c.reason, null);
+  assert.equal(c.stored_rows, 2);
+  assert.equal(c.expected_checksum, c.stored_checksum);
+});
+
+test('dependency: stale Provider Transaction (raw status/amount changed, PT not rerun) fails', () => {
+  // PT normalized while 80B... was Pending/Memo; raw later shows Completed/Credit with a fee.
+  const before = inputs();
+  const after = inputs();
+  set(after, 2, 'Status', 'Completed'); set(after, 2, 'Balance Impact', 'Credit');
+  set(after, 2, 'Fee', -2.5); set(after, 2, 'Net', 76.23);
+  const c = fresh(after, reconciled({}), storedPt(before, reconciled({})));
+  assert.equal(c.current, false);
+  assert.match(c.reason, /Provider Transactions KH001 partition is stale or modified; run normalizeKh001ProviderTransactions first/);
+  // The event links themselves would still resolve, which is why this gate is needed.
+  const b = build(after, H.indexProviderTransactions_(storedPt(before, reconciled({})).map((r) => H.rowToObject_(r, PT_COLUMNS))));
+  assert.deepEqual(js(H.flattenEventErrors_(b.errors)), []);
+});
+
+test('dependency: manually edited Provider Transaction with intact IDs and fingerprint fails', () => {
+  const stored = storedPt(inputs(), reconciled({}));
+  stored[0] = stored[0].slice();
+  stored[0][PT_COLUMNS.indexOf('gross_amount')] = 1000;   // id + source_fingerprint unchanged
+  const c = fresh(inputs(), reconciled({}), stored);
+  assert.equal(c.current, false);
+  assert.match(c.reason, /stale or modified/);
+  const reordered = storedPt(inputs(), reconciled({})).reverse();
+  assert.equal(fresh(inputs(), reconciled({}), reordered).current, false, 'non-canonical stored order is a modification');
+});
+
+test('dependency: Reconciled snapshot changed and PT not rerun fails until PT is refreshed', () => {
+  const stored = storedPt(inputs(), reconciled({}));
+  const changed = reconciled({ 'Sub account': 'SUB-9' });
+  assert.equal(fresh(inputs(), changed, stored).current, false);
+  assert.equal(fresh(inputs(), changed, storedPt(inputs(), changed)).current, true, 'after PT refresh');
+});
+
+test('dependency: missing KH001 rows, extra rows and other providers', () => {
+  const stored = storedPt(inputs(), reconciled({}));
+  assert.equal(fresh(inputs(), reconciled({}), stored.slice(1)).current, false, 'missing row');
+  assert.equal(fresh(inputs(), reconciled({}), []).current, false, 'empty Provider Transactions');
+  const other = H.objectToRow_({ provider_id: 'KH002', payment_source: 'STRIPE', external_transaction_id: 'pi_1' }, PT_COLUMNS);
+  assert.equal(fresh(inputs(), reconciled({}), stored.concat([other])).current, true, 'other providers are ignored');
+});
+
+test('dependency: raw that the Provider Transactions normalizer rejects is reported, not thrown', () => {
+  const bad = set(inputs(), 1, 'Net', 1);
+  const c = fresh(bad, reconciled({}), storedPt(inputs(), reconciled({})));
+  assert.equal(c.current, false);
+  assert.match(c.reason, /cannot be rebuilt from the current raw snapshot: .*Amount invariant failed/);
 });

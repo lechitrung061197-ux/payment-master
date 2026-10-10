@@ -343,6 +343,51 @@ function evaluateKh001ProviderTxRegression_(summary) {
   };
 }
 
+/**
+ * Read-only dependency freshness check used by downstream normalizers.
+ * Rebuilds the KH001 partition in memory from the given raw grids (same normalizer and
+ * source fingerprint as normalizeKh001ProviderTransactions) and compares it with the
+ * stored KH001 rows over full row content, excluding only normalized_at, in stored order.
+ * Detects a partition that is stale (raw changed, normalizer not rerun) as well as
+ * manual edits that kept IDs and source_fingerprint intact.
+ * @param {{values: Array<Array<*>>, checksum: string}} paypalGrid "Raw KH001 PayPal"
+ * @param {{values: Array<Array<*>>, checksum: string}} reconciledGrid "Raw KH001 Reconciled"
+ * @param {Array<Array<*>>} storedRows Provider Transactions data rows (all providers)
+ * @param {Array<string>} columns Provider Transactions columns
+ * @return {{current: boolean, expected_checksum: ?string, stored_checksum: string,
+ *           expected_rows: ?number, stored_rows: number, reason: ?string}}
+ */
+function checkKh001ProviderTransactionsCurrent_(paypalGrid, reconciledGrid, storedRows, columns) {
+  const providerIdx = columns.indexOf('provider_id');
+  const stored = storedRows.filter(function (r) { return r[providerIdx] === KH001_PROVIDER_TX.providerId; });
+  const storedChecksum = tableChecksumExcluding_(buildTableValues_(columns, stored), [columns.indexOf('normalized_at')]);
+  const result = {
+    current: false,
+    expected_checksum: null,
+    stored_checksum: storedChecksum,
+    expected_rows: null,
+    stored_rows: stored.length,
+    reason: null,
+  };
+  let built;
+  try {
+    const fingerprint = computeKh001SourceFingerprint_(paypalGrid.checksum, reconciledGrid.checksum);
+    built = buildKh001ProviderTransactions_(paypalGrid.values, reconciledGrid.values, fingerprint);
+  } catch (e) {
+    result.reason = 'Provider Transactions cannot be rebuilt from the current raw snapshot: ' + e.message;
+    return result;
+  }
+  result.expected_rows = built.rows.length;
+  result.expected_checksum = kh001PartitionChecksum_(built.rows.map(function (o) { return objectToRow_(o, columns); }), columns);
+  result.current = result.expected_checksum === storedChecksum;
+  if (!result.current) {
+    result.reason = 'Provider Transactions KH001 partition is stale or modified; run normalizeKh001ProviderTransactions first ' +
+      '(expected ' + result.expected_rows + ' rows / ' + result.expected_checksum + ', stored ' + result.stored_rows +
+      ' rows / ' + storedChecksum + ').';
+  }
+  return result;
+}
+
 /* ---------------------------------- I/O --------------------------------- */
 
 /** Target/staging descriptor (a function so no other file's constant is read at load time). */
