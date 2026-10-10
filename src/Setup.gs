@@ -4,9 +4,11 @@
  *
  * Setup is idempotent and non-destructive:
  * - Missing tabs are created; existing tabs are never deleted.
- * - Headers are written only on an empty header row. A header row that differs from
- *   the schema is reported as a warning and that tab is left untouched.
- * - Settings rows are added only for keys that do not exist yet.
+ * - A header row that differs from the schema is migrated only when the tab has no
+ *   data rows. A tab with data rows and a different header is reported as a warning
+ *   and left untouched.
+ * - Renamed Settings keys are migrated in place (value kept); other Settings rows are
+ *   added only for keys that do not exist yet.
  */
 
 const HEADER_BACKGROUND = '#f3f3f3';
@@ -30,14 +32,17 @@ const COLUMN_WIDTHS = Object.freeze({
 function runSetup_() {
   const ss = getSpreadsheet_();
   const warnings = [];
+  const migratedTabs = [];
 
   ss.setSpreadsheetLocale(APP.LOCALE);
   ss.setSpreadsheetTimeZone(APP.TIMEZONE);
 
   adoptDefaultSheet_(ss);
-  SCHEMA.forEach(function (table) { ensureTable_(ss, table, warnings); });
+  SCHEMA.forEach(function (table) { ensureTable_(ss, table, warnings, migratedTabs); });
   ensureDashboard_(ss);
   orderSheets_(ss);
+  const oldSchemaVersion = readSettingValue_(ss, 'schema_version');
+  const renamedKeys = migrateSettingKeys_(ss, warnings);
   seedSettings_(ss);
   SpreadsheetApp.flush();
 
@@ -45,11 +50,17 @@ function runSetup_() {
     action: 'SCHEMA_SETUP',
     entityType: 'SPREADSHEET',
     entityId: ss.getId(),
+    oldStatus: oldSchemaVersion === null ? '' : 'SCHEMA_V' + oldSchemaVersion,
     newStatus: 'SCHEMA_V' + APP.SCHEMA_VERSION,
-    details: { warnings: warnings },
+    details: { migratedTabs: migratedTabs, renamedSettingKeys: renamedKeys, warnings: warnings },
   });
 
-  return { spreadsheetId: ss.getId(), warnings: warnings };
+  return {
+    spreadsheetId: ss.getId(),
+    migratedTabs: migratedTabs,
+    renamedSettingKeys: renamedKeys,
+    warnings: warnings,
+  };
 }
 
 /**
@@ -66,19 +77,23 @@ function adoptDefaultSheet_(ss) {
   sheet.setName(SHEETS.SETTINGS);
 }
 
-function ensureTable_(ss, table, warnings) {
+function ensureTable_(ss, table, warnings, migratedTabs) {
   const sheet = ss.getSheetByName(table.sheet) || ss.insertSheet(table.sheet);
   const headers = table.columns.map(function (c) { return c.name; });
   const existing = readHeaderRow_(sheet);
+  const headerMatches = arraysEqual_(existing, headers);
 
-  if (existing.length === 0) {
-    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-  } else if (!arraysEqual_(existing, headers)) {
-    warnings.push('Header mismatch on "' + table.sheet + '"; tab left unchanged.');
-    return;
+  if (existing.length > 0 && !headerMatches) {
+    if (sheet.getLastRow() > 1) {
+      warnings.push('Header mismatch on "' + table.sheet + '" with data rows; tab left unchanged.');
+      return;
+    }
+    resetEmptyTable_(sheet);
+    migratedTabs.push(table.sheet);
   }
 
-  trimEmptyColumns_(sheet, headers.length);
+  fitColumnCount_(sheet, headers.length);
+  if (!headerMatches) sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
   formatHeader_(sheet, headers.length);
   formatColumns_(sheet, table.columns);
   ensureFilter_(sheet, headers.length);
@@ -86,10 +101,24 @@ function ensureTable_(ss, table, warnings) {
   sheet.getRange(1, 1).setNote(table.description);
 }
 
-/** Removes empty columns to the right of the table so tabs stay compact. */
-function trimEmptyColumns_(sheet, columnCount) {
+/**
+ * Clears the header row, filter, managed header protection and all data validation
+ * of a tab that has no data rows, so a new header layout can be applied cleanly.
+ */
+function resetEmptyTable_(sheet) {
+  const filter = sheet.getFilter();
+  if (filter) filter.remove();
+  getHeaderProtections_(sheet).forEach(function (p) { p.remove(); });
+  sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getMaxColumns()).clearDataValidations();
+  sheet.getRange(1, 1, 1, sheet.getMaxColumns()).clearContent().clearNote();
+}
+
+/** Adds missing columns, and removes empty columns to the right of the table. */
+function fitColumnCount_(sheet, columnCount) {
   const maxColumns = sheet.getMaxColumns();
-  if (maxColumns > columnCount && sheet.getLastColumn() <= columnCount) {
+  if (maxColumns < columnCount) {
+    sheet.insertColumnsAfter(maxColumns, columnCount - maxColumns);
+  } else if (maxColumns > columnCount && sheet.getLastColumn() <= columnCount) {
     sheet.deleteColumns(columnCount + 1, maxColumns - columnCount);
   }
 }
@@ -119,6 +148,8 @@ function formatColumns_(sheet, columns) {
         .setAllowInvalid(false)
         .setHelpText('Allowed: ' + column.values.join(', '))
         .build());
+    } else {
+      range.clearDataValidations();
     }
 
     sheet.setColumnWidth(i + 1, COLUMN_WIDTHS[column.type] || 140);
@@ -126,16 +157,23 @@ function formatColumns_(sheet, columns) {
 }
 
 function ensureFilter_(sheet, columnCount) {
-  if (sheet.getFilter()) return;
+  const filter = sheet.getFilter();
+  if (filter && filter.getRange().getNumColumns() === columnCount) return;
+  if (filter) filter.remove();
   sheet.getRange(1, 1, sheet.getMaxRows(), columnCount).createFilter();
+}
+
+function getHeaderProtections_(sheet) {
+  return sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE).filter(function (p) {
+    return p.getDescription() === HEADER_PROTECTION_DESCRIPTION;
+  });
 }
 
 /** Warning-only protection: editors can still edit, but get a confirmation prompt. */
 function protectHeader_(sheet, columnCount) {
-  const exists = sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE).some(function (p) {
-    return p.getDescription() === HEADER_PROTECTION_DESCRIPTION;
-  });
-  if (exists) return;
+  const existing = getHeaderProtections_(sheet);
+  if (existing.length === 1 && existing[0].getRange().getNumColumns() === columnCount) return;
+  existing.forEach(function (p) { p.remove(); });
   sheet.getRange(1, 1, 1, columnCount).protect()
     .setDescription(HEADER_PROTECTION_DESCRIPTION)
     .setWarningOnly(true);
@@ -199,19 +237,80 @@ function orderSheets_(ss) {
   ss.setActiveSheet(ss.getSheets()[0]);
 }
 
-/** Appends default Settings rows whose key is not present yet. */
+/** Returns Settings keys in sheet order (index 0 = row 2). */
+function readSettingKeys_(sheet) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+  const keyCol = getColumnIndex_(SHEETS.SETTINGS, 'key');
+  return sheet.getRange(2, keyCol, lastRow - 1, 1).getValues().map(function (r) { return String(r[0]); });
+}
+
+/** Returns a Settings value by key, or null when the key does not exist. */
+function readSettingValue_(ss, key) {
+  const sheet = ss.getSheetByName(SHEETS.SETTINGS);
+  const index = readSettingKeys_(sheet).indexOf(key);
+  if (index < 0) return null;
+  return sheet.getRange(2 + index, getColumnIndex_(SHEETS.SETTINGS, 'value')).getValue();
+}
+
+function findDefaultSetting_(key) {
+  return DEFAULT_SETTINGS.find(function (s) { return s[0] === key; }) || null;
+}
+
+/**
+ * Renames Settings keys listed in SETTING_KEY_RENAMES. The existing value is kept;
+ * the description is replaced with the new default description.
+ * Returns the list of applied renames.
+ */
+function migrateSettingKeys_(ss, warnings) {
+  const sheet = ss.getSheetByName(SHEETS.SETTINGS);
+  const keys = readSettingKeys_(sheet);
+  const applied = [];
+
+  SETTING_KEY_RENAMES.forEach(function (rename) {
+    const oldIndex = keys.indexOf(rename[0]);
+    if (oldIndex < 0) return;
+    if (keys.indexOf(rename[1]) >= 0) {
+      warnings.push('Settings has both "' + rename[0] + '" and "' + rename[1] + '"; not renamed.');
+      return;
+    }
+    const row = 2 + oldIndex;
+    const defaults = findDefaultSetting_(rename[1]);
+    sheet.getRange(row, getColumnIndex_(SHEETS.SETTINGS, 'key')).setValue(rename[1]);
+    if (defaults) sheet.getRange(row, getColumnIndex_(SHEETS.SETTINGS, 'description')).setValue(defaults[3]);
+    sheet.getRange(row, getColumnIndex_(SHEETS.SETTINGS, 'updated_at')).setValue(new Date());
+    keys[oldIndex] = rename[1];
+    applied.push(rename[0] + ' -> ' + rename[1]);
+  });
+
+  return applied;
+}
+
+/**
+ * Appends default Settings rows whose key is not present yet, and syncs the values of
+ * MANAGED_SETTING_KEYS with code.
+ */
 function seedSettings_(ss) {
   const sheet = ss.getSheetByName(SHEETS.SETTINGS);
-  const keyCol = getColumnIndex_(SHEETS.SETTINGS, 'key');
   const typeCol = getColumnIndex_(SHEETS.SETTINGS, 'value_type');
   const valueCol = getColumnIndex_(SHEETS.SETTINGS, 'value');
+  const updatedCol = getColumnIndex_(SHEETS.SETTINGS, 'updated_at');
 
   const lastRow = sheet.getLastRow();
-  const existingKeys = lastRow > 1
-    ? sheet.getRange(2, keyCol, lastRow - 1, 1).getValues().map(function (r) { return String(r[0]); })
-    : [];
-
+  const existingKeys = readSettingKeys_(sheet);
   const now = new Date();
+
+  MANAGED_SETTING_KEYS.forEach(function (key) {
+    const index = existingKeys.indexOf(key);
+    const defaults = findDefaultSetting_(key);
+    if (index < 0 || !defaults) return;
+    const valueCell = sheet.getRange(2 + index, valueCol);
+    if (String(valueCell.getValue()) !== String(defaults[1])) {
+      valueCell.setValue(defaults[1]);
+      sheet.getRange(2 + index, updatedCol).setValue(now);
+    }
+  });
+
   const newRows = DEFAULT_SETTINGS
     .filter(function (s) { return existingKeys.indexOf(s[0]) < 0; })
     .map(function (s) { return [s[0], s[1], s[2], s[3], now]; });

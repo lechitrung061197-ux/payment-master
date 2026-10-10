@@ -8,6 +8,8 @@
 function setupMaster() {
   const result = runSetup_();
   Logger.log('Setup complete for spreadsheet %s', result.spreadsheetId);
+  Logger.log('Migrated tabs: %s', JSON.stringify(result.migratedTabs));
+  Logger.log('Renamed Settings keys: %s', JSON.stringify(result.renamedSettingKeys));
   if (result.warnings.length > 0) {
     Logger.log('WARNINGS:\n%s', result.warnings.join('\n'));
   }
@@ -32,6 +34,10 @@ function verifyMaster() {
     dataRowCounts[t.sheet] = sheet ? Math.max(sheet.getLastRow() - 1, 0) : null;
   });
 
+  const settingsSheet = ss.getSheetByName(SHEETS.SETTINGS);
+  const settingKeys = settingsSheet ? readSettingKeys_(settingsSheet) : [];
+  const schemaVersion = settingsSheet ? readSettingValue_(ss, 'schema_version') : null;
+
   const report = {
     name: ss.getName(),
     id: ss.getId(),
@@ -43,6 +49,13 @@ function verifyMaster() {
     missingTabs: expected.filter(function (n) { return actual.indexOf(n) < 0; }),
     extraTabs: actual.filter(function (n) { return expected.indexOf(n) < 0; }),
     headerIssues: headerIssues,
+    schemaVersion: { expected: APP.SCHEMA_VERSION, actual: schemaVersion },
+    missingSettings: DEFAULT_SETTINGS
+      .map(function (d) { return d[0]; })
+      .filter(function (k) { return settingKeys.indexOf(k) < 0; }),
+    legacySettings: SETTING_KEY_RENAMES
+      .map(function (r) { return r[0]; })
+      .filter(function (k) { return settingKeys.indexOf(k) >= 0; }),
     dataRowCounts: dataRowCounts,
   };
 
