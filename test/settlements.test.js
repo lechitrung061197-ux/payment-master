@@ -22,9 +22,9 @@ for (const f of ['Config', 'Utils', 'RawSnapshot', 'CanonicalTable', 'Kh001Provi
 const H = context;
 const js = (v) => JSON.parse(JSON.stringify(v));
 const D = (iso) => vm.runInContext(`new Date(${JSON.stringify(iso)})`, context);
-const LA = (day) => D(day + 'T07:00:00Z'); // midnight America/Los_Angeles (PDT)
+// Midnight America/Los_Angeles: PDT (UTC-7) until DST ends on 2026-11-01, then PST (UTC-8).
+const LA = (day) => D(day + (day >= '2026-11-01' ? 'T08:00:00Z' : 'T07:00:00Z'));
 const TZ = 'America/Los_Angeles';
-const FP = 'a'.repeat(64);
 const COLUMNS = js(H.getColumnNames_('Settlements'));
 const SORT = ['provider_id', 'payment_source', 'source_settlement_number'];
 const dateFromKey = (k) => D(k + 'T04:00:00Z'); // deterministic stand-in for Utilities.parseDate
@@ -92,13 +92,22 @@ const defaultReconciled = () => [
   rcRow({ 'Transaction ID': 'KH-ONLY', 'Có trên PP': 0, 'Trạng thái': 'Thiếu trên PayPal' }),
   rcRow({ 'Transaction ID': 'T9', 'Lần chốt (ngày)': '' }), // not settled yet
 ];
-const PT = (id, status) => ({ provider_transaction_id: 'PT-KH001-PAYPAL-' + id, provider_id: 'KH001', payment_source: 'PAYPAL',
-  external_transaction_id: id, external_status: status || 'Completed' });
-const ptIndex = (ids) => H.indexProviderTransactions_((ids || ['T1', 'T2', 'T3', 'T9']).map((id) => PT(id)));
+/** Provider Transactions consistent with the given reconciled rows (Completed, USD, same PayPal economics). */
+function ptsFor(rcRows, overrides) {
+  return rcRows.map((r) => {
+    const id = r[RC.indexOf('Transaction ID')];
+    return { provider_transaction_id: 'PT-KH001-PAYPAL-' + id, provider_id: 'KH001', payment_source: 'PAYPAL',
+      external_transaction_id: id, external_status: 'Completed', currency: 'USD',
+      gross_amount: r[RC.indexOf('Doanh thu (Gross)')], processing_fee: r[RC.indexOf('Phí PayPal')], net_amount: r[RC.indexOf('Net')],
+      ...((overrides || {})[id] || {}) };
+  });
+}
+const ptIndexFor = (rcRows, overrides) => H.indexProviderTransactions_(ptsFor(rcRows, overrides));
 function build(o) {
   o = o || {};
-  return H.buildKh001Settlements_(settlementsGrid(o.history || defaultHistory()), reconciledGrid(o.reconciled || defaultReconciled()),
-    o.ptIndex || ptIndex(), { sourceFingerprint: FP, timeZone: TZ });
+  const rcRows = o.reconciled || defaultReconciled();
+  return H.buildKh001Settlements_(settlementsGrid(o.history || defaultHistory()), reconciledGrid(rcRows),
+    o.ptIndex || ptIndexFor(rcRows, o.pt), { timeZone: TZ });
 }
 const errs = (b) => js(H.flattenSettlementErrors_(b.errors)).join(' | ');
 const rowsByNo = (b) => Object.fromEntries(js(b.rows).map((r) => [r.source_settlement_number, r]));
@@ -175,11 +184,38 @@ test('Lần chốt date without a history row fails as a relationship error', ()
 });
 
 test('included transactions must resolve to a KH001 Provider Transaction', () => {
-  assert.match(errs(build({ ptIndex: ptIndex(['T1', 'T3']) })), /\(T2\): no KH001\/PAYPAL Provider Transaction PT-KH001-PAYPAL-T2/);
-  const wrong = H.indexProviderTransactions_([PT('T1'), { ...PT('T2'), payment_source: 'STRIPE' }, PT('T3')]);
-  assert.match(errs(build({ ptIndex: wrong })), /no KH001\/PAYPAL Provider Transaction PT-KH001-PAYPAL-T2/);
-  const pending = H.indexProviderTransactions_([PT('T1'), PT('T2', 'Pending'), PT('T3')]);
-  assert.ok(js(build({ ptIndex: pending }).warnings).some((w) => /T2\): Provider Transaction status is "Pending"/.test(w)));
+  const rows = defaultReconciled();
+  const withoutT2 = H.indexProviderTransactions_(ptsFor(rows).filter((p) => p.external_transaction_id !== 'T2'));
+  assert.match(errs(build({ ptIndex: withoutT2 })), /\(T2\): no KH001\/PAYPAL Provider Transaction PT-KH001-PAYPAL-T2/);
+  assert.match(errs(build({ pt: { T2: { payment_source: 'STRIPE' } } })), /no KH001\/PAYPAL Provider Transaction PT-KH001-PAYPAL-T2/);
+});
+
+// ---- Cross-check with Provider Transactions (errors, not warnings) ----------------
+test('cross-check: Pending Provider Transaction in a settlement is an error', () => {
+  const b = build({ pt: { T2: { external_status: 'Pending' } } });
+  assert.match(js(b.errors.cross_check).join(' | '), /\(T2\): status "Pending" is not Completed/);
+  assert.ok(!js(b.warnings).some((w) => /Pending/.test(w)), 'no longer a warning');
+});
+
+test('cross-check: gross / processing fee / net / currency mismatches fail', () => {
+  const ce = (pt) => js(build({ pt }).errors.cross_check).join(' | ');
+  assert.match(ce({ T1: { gross_amount: 100.01 } }), /\(T1\): Doanh thu \(Gross\) 100 != Provider Transaction gross_amount 100.01/);
+  assert.match(ce({ T1: { processing_fee: 4.5 } }), /Phí PayPal 4 != Provider Transaction processing_fee 4.5/);
+  assert.match(ce({ T1: { net_amount: 95.5 } }), /Net 96 != Provider Transaction net_amount 95.5/);
+  assert.match(ce({ T1: { currency: 'EUR' } }), /currency "EUR" != USD/);
+  assert.equal(ce({ T1: { gross_amount: 100.004, net_amount: 96.004 } }), '', 'within 0.005');
+});
+
+test('cross-check: AMOUNT_MISMATCH reconciliation is valid while PayPal economics equal the Provider Transaction', () => {
+  const rows = defaultReconciled();
+  rows[0] = rcRow({ 'Trạng thái': 'Lệch số tiền' });
+  const b = build({ reconciled: rows, pt: { T1: { provider_reconciliation_status: 'AMOUNT_MISMATCH' } } });
+  assert.equal(errs(b), '');
+  assert.equal(rowsByNo(b)[1].transaction_count, 2);
+});
+
+test('cross-check does not compare provider fee/hold (DoiSoat is authoritative for those)', () => {
+  assert.equal(errs(build({ pt: { T1: { provider_fee: 999, hold: 999 } } })), '');
 });
 
 test('a transaction settled twice fails', () => {
@@ -201,7 +237,7 @@ test('actual unrounded provider fee/hold are preserved (no rate recalculation, n
       'Thực nhận (chưa gồm hoàn hold)': 26.5019 }),
   ];
   const history = [histRow({ 'Phát sinh phải trả': 53.0038, 'Tổng phải trả': 53.0038, 'Đã thanh toán (USD)': 53.0038,
-    'Đã thanh toán (VND)': 53.0038 * 25300, 'Số dư hold': 6.386 })];
+    'Đã thanh toán (VND)': 53.0038 * 25300, 'Số dư hold': 6.386, 'Hold giữ lần này': 6.386 })];
   const r = rowsByNo(build({ reconciled: rows, history }))[1];
   assert.ok(Math.abs(r.provider_fee_amount - 4.4702) < 1e-9, 'not 2 x round(2.2351, 2)');
   assert.ok(Math.abs(r.provider_hold_created_amount - 6.386) < 1e-9);
@@ -264,12 +300,108 @@ test('hold release reduces the expected roll-forward', () => {
 });
 
 // ---- Determinism / canonical write ---------------------------------------------
-test('source fingerprint is deterministic', () => {
-  const a = H.computeKh001SettlementsFingerprint_('s1', 'r1');
-  assert.equal(a, H.computeKh001SettlementsFingerprint_('s1', 'r1'));
-  assert.notEqual(a, H.computeKh001SettlementsFingerprint_('s2', 'r1'));
-  assert.notEqual(a, H.computeKh001SettlementsFingerprint_('s1', 'r2'));
-  assert.equal(a, crypto.createHash('sha256').update('s1|r1|KH001_SETTLEMENT_HEADERS_V1').digest('hex'));
+// ---- Settlement-specific fingerprints --------------------------------------------
+const fps = (b) => Object.fromEntries(js(b.rows).map((r) => [r.source_settlement_number, r.source_fingerprint]));
+
+test('fingerprint: deterministic, per settlement, and matches the documented algorithm', () => {
+  const f = fps(build());
+  assert.deepEqual(f, fps(build()));
+  assert.match(f[1], /^[0-9a-f]{64}$/);
+  assert.notEqual(f[1], f[2]);
+  const ser = (v) => H.serializeCell_(v);
+  const hist = [1, '2026-10-01', '2026-10-04', '2026-10-06', 119.52, 0, 119.52, 119.52, 0, 14.4, 0, 14.4, '2026-11-30',
+    '2026-12-03', 'Bank transfer #1', 25300, 3023856].map(ser).join('\u001f');
+  const tx = (id, key, g, fee, n, pf, h, p) => [id, key, g, fee, n, pf, h, p].map(ser).join('\u001f');
+  const text = ['KH001_SETTLEMENT_HEADERS_V1', 'H', hist, 'T', '2',
+    tx('T1', '2026-10-04', 100, 4, 96, 6.72, 9.6, 79.68), tx('T2', '2026-10-04', 50, 2, 48, 3.36, 4.8, 39.84)].join('\u001e');
+  assert.equal(f[1], crypto.createHash('sha256').update(text, 'utf8').digest('hex'));
+});
+
+test('fingerprint: changing sections A/B only does not change settlement fingerprints (or rows)', () => {
+  const base = build();
+  const grid = settlementsGrid(defaultHistory());
+  grid[3][2] = LA('2026-09-01');                       // section A selection changed
+  grid.splice(5, 0, titled('B. extra detail row'));     // section B grew: section D moved down
+  const moved = H.buildKh001Settlements_(grid, reconciledGrid(defaultReconciled()), ptIndexFor(defaultReconciled()), { timeZone: TZ });
+  assert.deepEqual(fps(moved), fps(base));
+  assert.equal(js(moved.rows)[0].gross_amount, js(base.rows)[0].gross_amount);
+});
+
+test('fingerprint: an unrelated future DoiSoat row does not change older settlements', () => {
+  const rows = defaultReconciled().concat([rcRow({ 'Transaction ID': 'T10', 'Lần chốt (ngày)': '' }),
+    rcRow({ 'Transaction ID': 'T11', 'Có trên PP': 0 })]);
+  assert.deepEqual(fps(build({ reconciled: rows })), fps(build()));
+});
+
+test('fingerprint: modifying settlement #2 does not change settlement #1', () => {
+  const history = defaultHistory();
+  history[1][HIST.indexOf('Hình thức / chứng từ') + 1] = 'Bank transfer #2 (corrected)';
+  const before = fps(build());
+  const after = fps(build({ history }));
+  assert.equal(after[1], before[1]);
+  assert.notEqual(after[2], before[2]);
+});
+
+test('fingerprint: modifying one included transaction changes only its settlement', () => {
+  const rows = defaultReconciled();
+  rows[2] = rcRow({ 'Transaction ID': 'T3', 'Lần chốt (ngày)': LA('2026-10-09'), 'Doanh thu (Gross)': 200, 'Phí PayPal': 8, Net: 192,
+    'Phí thuê OP': 13.4401, Hold: 19.2, 'Thực nhận (chưa gồm hoàn hold)': 159.3599 });
+  const history = defaultHistory();
+  history[1][HIST.indexOf('Phát sinh phải trả') + 1] = 159.3599;
+  history[1][HIST.indexOf('Tổng phải trả') + 1] = 159.3599;
+  history[1][HIST.indexOf('Đã thanh toán (USD)') + 1] = 159.3599;
+  history[1][HIST.indexOf('Đã thanh toán (VND)') + 1] = 159.3599 * 25300;
+  const before = fps(build());
+  const b = build({ reconciled: rows, history });
+  assert.equal(errs(b), '');
+  const after = fps(b);
+  assert.equal(after[1], before[1]);
+  assert.notEqual(after[2], before[2]);
+});
+
+// ---- Hold-created reconciliation / required fields --------------------------------
+test('hold created: history "Hold giữ lần này" must equal SUM(DoiSoat Hold) (error, not warning)', () => {
+  const history = defaultHistory();
+  history[0][HIST.indexOf('Hold giữ lần này') + 1] = 14.41;
+  assert.match(errs(build({ history })), /Settlement #1: history "Hold giữ lần này" 14.41 != SUM\(DoiSoat Hold\) 14.4/);
+  history[0][HIST.indexOf('Hold giữ lần này') + 1] = 14.404;
+  assert.equal(errs(build({ history })), '', 'within 0.005');
+});
+
+test('hold balance vs roll-forward stays a warning', () => {
+  const b = build();
+  assert.equal(errs(b), '');
+  assert.ok(js(b.warnings).some((w) => /Settlement #2: provider hold balance/.test(w)));
+});
+
+test('required history financial fields must be numeric (blank is not 0)', () => {
+  for (const field of ['Phát sinh phải trả', 'Còn nợ lần trước', 'Tổng phải trả', 'Còn nợ', 'Hold giữ lần này',
+    'Hold được hoàn lần này', 'Số dư hold']) {
+    const history = defaultHistory();
+    history[0][HIST.indexOf(field) + 1] = '';
+    assert.match(errs(build({ history })), new RegExp('Settlement #1 \\(row 10\\): required ' + field.replace(/[()]/g, '\\$&') + ' is blank'), field);
+  }
+});
+
+test('unpaid (closed, not yet paid) settlement is valid; paid USD requires a payment date', () => {
+  const unpaid = [histRow({ 'Đã thanh toán (USD)': '', 'Còn nợ': 119.52, 'Ngày thanh toán': '', 'Tỷ giá lần này (VND/USD)': '',
+    'Đã thanh toán (VND)': '', 'Hình thức / chứng từ': '' })];
+  const b = build({ history: unpaid, reconciled: defaultReconciled().slice(0, 2) });
+  assert.equal(errs(b), '');
+  const r = rowsByNo(b)[1];
+  assert.equal(r.source_paid_amount, '');
+  assert.equal(r.payout_currency, '');
+  assert.equal(r.outstanding_amount, 119.52);
+  const noDate = [histRow({ 'Ngày thanh toán': '' })];
+  assert.match(errs(build({ history: noDate, reconciled: defaultReconciled().slice(0, 2) })),
+    /Đã thanh toán \(USD\) 119.52 without Ngày thanh toán/);
+});
+
+test('VND payout requires USD paid > 0, FX > 0 and a payment date', () => {
+  const run = (o) => errs(build({ history: [histRow(o)], reconciled: defaultReconciled().slice(0, 2) }));
+  assert.match(run({ 'Đã thanh toán (USD)': '', 'Còn nợ': 119.52 }), /Đã thanh toán \(VND\) populated but Đã thanh toán \(USD\) must be > 0/);
+  assert.match(run({ 'Tỷ giá lần này (VND/USD)': '' }), /Tỷ giá must be > 0/);
+  assert.match(run({ 'Tỷ giá lần này (VND/USD)': 0 }), /Tỷ giá must be > 0/);
 });
 
 const toRows = (b) => b.rows.map((o) => H.settlementObjectToRow_(o, COLUMNS, dateFromKey));

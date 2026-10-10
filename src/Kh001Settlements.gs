@@ -16,6 +16,13 @@
  *   Provider Transactions partition must be current (dependency gate) before write/NO_CHANGE.
  * - No settlement items, seller allocation, balances, payouts or receipt confirmation.
  *
+ * IMMUTABILITY BOUNDARY: Settlements are a REBUILDABLE observed provider settlement layer.
+ * Every run rebuilds the KH001 partition from the current raw tabs, so a later provider edit
+ * to section D or DoiSoat_GD changes the affected settlement. Before Settlement Items are
+ * created/frozen (Phase 2E) a commit/lock boundary must be added so a committed settlement
+ * cannot silently mutate. Each row's source_fingerprint (settlement-specific, see
+ * computeKh001SettlementFingerprint_) is the revision identity for that boundary.
+ *
  * The first part of this file is pure (unit-tested in Node); the I/O part follows.
  */
 
@@ -94,10 +101,37 @@ function kh001SettlementId_(settlementNumber) {
   return KH001_SETTLEMENTS.idPrefix + ('000000' + n).slice(-Math.max(6, n.length));
 }
 
-/** SHA-256 of raw settlements checksum + raw reconciled checksum + version. */
-function computeKh001SettlementsFingerprint_(settlementsChecksum, reconciledChecksum, digestHex) {
+/** Section-D fields of one settlement, in canonical fingerprint order. */
+const KH001_SETTLEMENT_FINGERPRINT_HISTORY_FIELDS = Object.freeze([
+  'source_settlement_number', 'period_start_date', 'period_end_date', 'source_payment_date', 'period_due_amount',
+  'carry_in_amount', 'total_due_amount', 'source_paid_amount', 'outstanding_amount', 'source_hold_created_amount',
+  'provider_hold_released_amount', 'provider_hold_balance', 'hold_release_due_from_date', 'hold_release_due_to_date',
+  'source_payment_reference', 'fx_rate', 'source_paid_payout_amount',
+]);
+/** DoiSoat_GD inputs of one included transaction, in canonical fingerprint order. */
+const KH001_SETTLEMENT_FINGERPRINT_TX_FIELDS = Object.freeze([
+  'transaction_id', 'settlement_date', 'gross', 'processing_fee', 'net', 'provider_fee', 'hold', 'payout',
+]);
+
+/**
+ * Settlement-specific source fingerprint (revision identity of one settlement):
+ * SHA-256 over the normalizer version, that settlement's section-D history fields and the
+ * DoiSoat_GD inputs of the transactions assigned to it (sorted by Transaction ID). Values
+ * use the canonical cell serialization (dates as provider YYYY-MM-DD keys). Sections A/B,
+ * other settlements, unrelated DoiSoat rows, sheet row numbers and timestamps are excluded.
+ * @param {Object} history values keyed by KH001_SETTLEMENT_FINGERPRINT_HISTORY_FIELDS
+ * @param {Array<Object>} transactions values keyed by KH001_SETTLEMENT_FINGERPRINT_TX_FIELDS
+ */
+function computeKh001SettlementFingerprint_(history, transactions, digestHex) {
   const digest = digestHex || sha256Hex_;
-  return digest(settlementsChecksum + '|' + reconciledChecksum + '|' + KH001_SETTLEMENTS.normalizerVersion);
+  const line = function (obj, fields) {
+    return fields.map(function (f) { return serializeCell_(obj[f]); }).join('\u001f');
+  };
+  const txLines = transactions.slice()
+    .sort(function (a, b) { return a.transaction_id < b.transaction_id ? -1 : a.transaction_id > b.transaction_id ? 1 : 0; })
+    .map(function (t) { return line(t, KH001_SETTLEMENT_FINGERPRINT_TX_FIELDS); });
+  return digest([KH001_SETTLEMENTS.normalizerVersion, 'H', line(history, KH001_SETTLEMENT_FINGERPRINT_HISTORY_FIELDS),
+    'T', String(txLines.length)].concat(txLines).join('\u001e'));
 }
 
 /** Row index (0-based) of the section D title, or throws. */
@@ -172,11 +206,12 @@ function near_(a, b, tolerance) {
 }
 
 function emptySettlementErrors_() {
-  return { duplicate: [], relationship: [], amount_invariant: [], history_equation: [], data: [] };
+  return { duplicate: [], relationship: [], cross_check: [], amount_invariant: [], history_equation: [], data: [] };
 }
 
 function flattenSettlementErrors_(errors) {
-  return [].concat(errors.duplicate, errors.relationship, errors.amount_invariant, errors.history_equation, errors.data);
+  return [].concat(errors.duplicate, errors.relationship, errors.cross_check, errors.amount_invariant,
+    errors.history_equation, errors.data);
 }
 
 /**
@@ -185,7 +220,7 @@ function flattenSettlementErrors_(errors) {
  * @param {Array<Array<*>>} settlementsValues full "Raw KH001 Settlements" grid
  * @param {Array<Array<*>>} reconciledValues full "Raw KH001 Reconciled" grid
  * @param {Object} ptIndex provider_transaction_id -> Provider Transaction object
- * @param {{sourceFingerprint: string, timeZone: string}} opts
+ * @param {{timeZone: string}} opts
  * @return {{rows: Array<Object>, errors: Object, warnings: Array<string>,
  *           holdReconciliation: Array<Object>, includedTransactions: number}}
  */
@@ -233,16 +268,36 @@ function buildKh001Settlements_(settlementsValues, reconciledValues, ptIndex, op
       });
     const nums = {};
     let numError = false;
-    [['period_due_amount', 'Phát sinh phải trả'], ['carry_in_amount', 'Còn nợ lần trước'], ['total_due_amount', 'Tổng phải trả'],
-      ['source_paid_amount', 'Đã thanh toán (USD)'], ['outstanding_amount', 'Còn nợ'], ['source_hold_created', 'Hold giữ lần này'],
-      ['provider_hold_released_amount', 'Hold được hoàn lần này'], ['provider_hold_balance', 'Số dư hold'],
-      ['fx_rate', 'Tỷ giá lần này (VND/USD)'], ['source_paid_payout_amount', 'Đã thanh toán (VND)']]
+    // [field, source header, required]: required fields must be numeric (blank is not 0).
+    [['period_due_amount', 'Phát sinh phải trả', true], ['carry_in_amount', 'Còn nợ lần trước', true],
+      ['total_due_amount', 'Tổng phải trả', true], ['source_paid_amount', 'Đã thanh toán (USD)', false],
+      ['outstanding_amount', 'Còn nợ', true], ['source_hold_created', 'Hold giữ lần này', true],
+      ['provider_hold_released_amount', 'Hold được hoàn lần này', true], ['provider_hold_balance', 'Số dư hold', true],
+      ['fx_rate', 'Tỷ giá lần này (VND/USD)', false], ['source_paid_payout_amount', 'Đã thanh toán (VND)', false]]
       .forEach(function (f) {
         const v = optionalNumber_(h(row, f[1]));
         if (v === null) { errors.data.push(label + ': non-numeric ' + f[1] + ' "' + h(row, f[1]) + '"'); numError = true; }
+        else if (v === '' && f[2]) { errors.data.push(label + ': required ' + f[1] + ' is blank'); numError = true; }
         nums[f[0]] = v;
       });
     if (dateError || numError) continue;
+    // Payment consistency: a paid amount needs a payment date; a VND payout needs USD paid > 0,
+    // a positive FX rate and a payment date. Unpaid (closed, not yet paid) rows stay valid.
+    const paidUsd = n0_(nums.source_paid_amount);
+    if (paidUsd > 0 && dates.source_payment_date === '') {
+      errors.data.push(label + ': Đã thanh toán (USD) ' + paidUsd + ' without Ngày thanh toán');
+      continue;
+    }
+    if (nums.source_paid_payout_amount !== '') {
+      const vndProblems = [];
+      if (!(paidUsd > 0)) vndProblems.push('Đã thanh toán (USD) must be > 0');
+      if (!(isFiniteNumber_(nums.fx_rate) && nums.fx_rate > 0)) vndProblems.push('Tỷ giá must be > 0');
+      if (dates.source_payment_date === '') vndProblems.push('Ngày thanh toán is required');
+      if (vndProblems.length > 0) {
+        errors.data.push(label + ': Đã thanh toán (VND) populated but ' + vndProblems.join(', '));
+        continue;
+      }
+    }
     if (byEndKey[dates.period_end_date]) {
       errors.duplicate.push('Settlements #' + byEndKey[dates.period_end_date].number + ' and #' + number +
         ' share Đến ngày ' + dates.period_end_date);
@@ -250,7 +305,7 @@ function buildKh001Settlements_(settlementsValues, reconciledValues, ptIndex, op
     }
     const entry = { number: number, row: sheetRow, dates: dates, nums: nums,
       reference: canonicalText_(h(row, 'Hình thức / chứng từ')),
-      tx: { count: 0, gross: 0, fee: 0, net: 0, providerFee: 0, hold: 0, payout: 0 } };
+      tx: { count: 0, gross: 0, fee: 0, net: 0, providerFee: 0, hold: 0, payout: 0 }, inputs: [] };
     history.push(entry);
     byNumber[number] = entry;
     byEndKey[dates.period_end_date] = entry;
@@ -299,11 +354,27 @@ function buildKh001Settlements_(settlementsValues, reconciledValues, ptIndex, op
       errors.relationship.push(label + ': no KH001/PAYPAL Provider Transaction ' + kh001ProviderTransactionId_(id));
       continue;
     }
-    if (pt.external_status !== 'Completed') warnings.push(label + ': Provider Transaction status is "' + pt.external_status + '"');
+    // Cross-check PayPal economics with the canonical Provider Transaction (provider fee/hold
+    // are DoiSoat-only and are not compared).
+    const mismatches = [];
+    if (pt.external_status !== 'Completed') mismatches.push('status "' + pt.external_status + '" is not Completed');
+    if (pt.currency !== cfg.currency) mismatches.push('currency "' + pt.currency + '" != ' + cfg.currency);
+    [['gross', 'gross_amount', 'Doanh thu (Gross)'], ['fee', 'processing_fee', 'Phí PayPal'], ['net', 'net_amount', 'Net']]
+      .forEach(function (f) {
+        if (!isFiniteNumber_(pt[f[1]]) || !near_(v[f[0]], pt[f[1]], tol)) {
+          mismatches.push(f[2] + ' ' + v[f[0]] + ' != Provider Transaction ' + f[1] + ' ' + pt[f[1]]);
+        }
+      });
+    if (mismatches.length > 0) {
+      errors.cross_check.push(label + ': ' + mismatches.join('; '));
+      continue;
+    }
     included++;
     const t = settlement.tx;
     t.count++;
     t.gross += v.gross; t.fee += v.fee; t.net += v.net; t.providerFee += v.providerFee; t.hold += v.hold; t.payout += v.payout;
+    settlement.inputs.push({ transaction_id: id, settlement_date: key, gross: v.gross, processing_fee: v.fee, net: v.net,
+      provider_fee: v.providerFee, hold: v.hold, payout: v.payout });
   }
 
   // --- Settlement headers, equations, hold roll-forward ---
@@ -334,9 +405,8 @@ function buildKh001Settlements_(settlementsValues, reconciledValues, ptIndex, op
 
     if (t.count === 0) warnings.push(label + ': no reconciled transactions');
     if (!near_(adjustments, 0, tol)) warnings.push(label + ': unclassified provider adjustment ' + fmt4_(adjustments));
-    if (n.source_hold_created !== '' && !near_(n.source_hold_created, t.hold, tol)) {
-      warnings.push(label + ': history "Hold giữ lần này" ' + fmt4_(n.source_hold_created) + ' != transaction hold sum ' + fmt4_(t.hold));
-    }
+    eq(near_(n.source_hold_created, t.hold, tol), 'history "Hold giữ lần này" ' + fmt4_(n.source_hold_created) +
+      ' != SUM(DoiSoat Hold) ' + fmt4_(t.hold));
     if (previousOutstanding !== null && !near_(n0_(n.carry_in_amount), previousOutstanding, tol)) {
       warnings.push(label + ': carry in ' + fmt4_(n0_(n.carry_in_amount)) + ' != previous outstanding ' + fmt4_(previousOutstanding));
     }
@@ -389,7 +459,25 @@ function buildKh001Settlements_(settlementsValues, reconciledValues, ptIndex, op
       payout_currency: n.source_paid_payout_amount === '' ? '' : cfg.payoutCurrencyWhenVnd,
       source_paid_payout_amount: n.source_paid_payout_amount,
       source_settlement_row: s.row,
-      source_fingerprint: opts.sourceFingerprint,
+      source_fingerprint: computeKh001SettlementFingerprint_({
+        source_settlement_number: s.number,
+        period_start_date: s.dates.period_start_date,
+        period_end_date: s.dates.period_end_date,
+        source_payment_date: s.dates.source_payment_date,
+        period_due_amount: n.period_due_amount,
+        carry_in_amount: n.carry_in_amount,
+        total_due_amount: n.total_due_amount,
+        source_paid_amount: n.source_paid_amount,
+        outstanding_amount: n.outstanding_amount,
+        source_hold_created_amount: n.source_hold_created,
+        provider_hold_released_amount: n.provider_hold_released_amount,
+        provider_hold_balance: n.provider_hold_balance,
+        hold_release_due_from_date: s.dates.hold_release_due_from_date,
+        hold_release_due_to_date: s.dates.hold_release_due_to_date,
+        source_payment_reference: s.reference,
+        fx_rate: n.fx_rate,
+        source_paid_payout_amount: n.source_paid_payout_amount,
+      }, s.inputs),
       normalizer_version: cfg.normalizerVersion,
       normalized_at: '',
     });
@@ -511,7 +599,6 @@ function readKh001SettlementsInputs_(ss) {
     reconciled: reconciled,
     timeZone: timeZone,
     dependency: dep,
-    fingerprint: computeKh001SettlementsFingerprint_(settlements.checksum, reconciled.checksum),
   };
 }
 
@@ -529,7 +616,6 @@ function runKh001SettlementsNormalizer_() {
     const columns = table.columns.map(function (c) { return c.name; });
 
     const input = readKh001SettlementsInputs_(ss);
-    details.source_fingerprint = input.fingerprint;
     details.settlements_checksum = input.settlements.checksum;
     details.reconciled_checksum = input.reconciled.checksum;
     details.provider_timezone = input.timeZone;
@@ -538,13 +624,16 @@ function runKh001SettlementsNormalizer_() {
     if (!input.dependency.dependency.provider_transactions_current) throw new Error(input.dependency.dependency.reason);
 
     const built = buildKh001Settlements_(input.settlements.values, input.reconciled.values, input.dependency.index,
-      { sourceFingerprint: input.fingerprint, timeZone: input.timeZone });
+      { timeZone: input.timeZone });
     details.included_transactions = built.includedTransactions;
     assertNoSettlementErrors_(built.errors);
 
     const partition = built.rows.map(function (o) { return settlementObjectToRow_(o, columns, masterDateFromKey_); });
     details.output_rows = partition.length;
     details.output_checksum = partitionChecksum_(partition, columns, SETTLEMENT_SORT_COLUMNS, 'normalized_at');
+    details.settlement_fingerprints = built.rows.map(function (r) {
+      return { settlement_id: r.settlement_id, source_fingerprint: r.source_fingerprint };
+    });
     details.hold_reconciliation = built.holdReconciliation;
     details.warnings = built.warnings;
 
@@ -611,13 +700,12 @@ function buildKh001SettlementsReport_() {
       reconciled_rows: input.reconciled.rows,
       reconciled_checksum: input.reconciled.checksum,
       provider_timezone: input.timeZone,
-      source_fingerprint: input.fingerprint,
     };
     report.dependency = input.dependency.dependency;
     if (!report.dependency.provider_transactions_current) report.errors.push(report.dependency.reason);
 
     const built = buildKh001Settlements_(input.settlements.values, input.reconciled.values, input.dependency.index,
-      { sourceFingerprint: input.fingerprint, timeZone: input.timeZone });
+      { timeZone: input.timeZone });
     const buildErrors = flattenSettlementErrors_(built.errors);
     let expectedChecksum = null;
     if (buildErrors.length === 0) {
@@ -629,6 +717,9 @@ function buildKh001SettlementsReport_() {
     report.hold_balance_reconciliation = built.holdReconciliation;
     report.provider_adjustments = built.rows.map(function (r) {
       return { settlement_number: r.source_settlement_number, provider_adjustments: r.provider_adjustments };
+    });
+    report.settlement_fingerprints = built.rows.map(function (r) {
+      return { settlement_id: r.settlement_id, source_fingerprint: r.source_fingerprint };
     });
     report.warnings = built.warnings;
 
@@ -651,6 +742,7 @@ function buildKh001SettlementsReport_() {
       expected_checksum: expectedChecksum,
       duplicate_keys: findDuplicateKeys_(allRows, keyIdx),
       relationship_errors: built.errors.relationship,
+      cross_check_errors: built.errors.cross_check,
       amount_invariant_errors: built.errors.amount_invariant,
       history_equation_errors: built.errors.history_equation,
       duplicate_errors: built.errors.duplicate,
@@ -663,7 +755,8 @@ function buildKh001SettlementsReport_() {
     const storedChecksum = tableChecksumExcluding_(buildTableValues_(columns, kh001Rows), [columns.indexOf('normalized_at')]);
     report.target_match = expectedChecksum !== null && storedChecksum === expectedChecksum;
     if (!report.target_match) report.errors.push('Settlements KH001 partition does not match raw snapshot.');
-    ['duplicate_keys', 'relationship_errors', 'amount_invariant_errors', 'history_equation_errors', 'duplicate_errors', 'data_errors']
+    ['duplicate_keys', 'relationship_errors', 'cross_check_errors', 'amount_invariant_errors', 'history_equation_errors',
+      'duplicate_errors', 'data_errors']
       .forEach(function (k) { if (report.output[k].length > 0) report.errors.push(k + ': ' + report.output[k].length); });
 
     report.regression = evaluateKh001SettlementsRegression_(built.rows, summarizeSettlements_(built.rows));

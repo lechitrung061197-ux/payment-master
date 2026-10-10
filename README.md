@@ -340,19 +340,42 @@ Order: `syncKh001Raw` → `normalizeKh001ProviderTransactions` → `normalizeKh0
   belong to the history row whose `Đến ngày` has the same provider-timezone
   (`source.KH001.timezone`) `YYYY-MM-DD` key. Each must resolve to a KH001 Provider
   Transaction; a date with no history row fails.
+- **Cross-check (errors):** each included transaction's Provider Transaction must be
+  KH001/PAYPAL with the exact external id, `external_status = Completed`, `currency = USD`,
+  and DoiSoat `Doanh thu (Gross)` / `Phí PayPal` / `Net` must equal its `gross_amount` /
+  `processing_fee` / `net_amount` within 0.005. Provider fee/hold are not compared
+  (DoiSoat is authoritative for them).
 - **Actual economics:** sums of `Doanh thu (Gross)`, `Phí PayPal`, `Net`, `Phí thuê OP`, `Hold`,
   `Thực nhận (chưa gồm hoàn hold)` — never recalculated from rates, never rounded per row.
   Row and header equations (tolerance 0.005; FX 1 VND) must hold.
 - **History fields** are copied as reported (due, carry-in, paid, outstanding, hold released,
-  hold balance, due dates, reference, FX, VND paid). `provider_adjustments = period_due −
+  hold balance, due dates, reference, FX, VND paid). `Phát sinh phải trả`, `Còn nợ lần trước`,
+  `Tổng phải trả`, `Còn nợ`, `Hold giữ lần này`, `Hold được hoàn lần này`, `Số dư hold` are
+  required numbers (blank is an error, never 0). `Đã thanh toán (USD)` may be blank (unpaid;
+  0 in equations); a paid amount requires `Ngày thanh toán`; a VND payout requires USD paid
+  > 0, FX > 0 and a payment date. `payout_currency` is `VND` only when VND paid is populated.
+- **Hold created must reconcile (error):** history `Hold giữ lần này` = SUM(DoiSoat `Hold`)
+  of the settlement's transactions within 0.005. `provider_adjustments = period_due −
   transaction_payout − hold_released` is an unclassified residual (warned when non-zero).
 - **Hold reconciliation:** `expected_provider_hold_balance` rolls forward
   (previous + created − released) and `hold_balance_difference = provider − expected`.
   The provider value is never overwritten; differences are warnings, not errors.
 - Dates are stored as Master date values of the provider-timezone date keys.
 - IDs `ST-KH001-PAYPAL-<number padded to 6>`; unique `provider_id + payment_source +
-  source_settlement_number`; `source_fingerprint = SHA-256(settlements_raw_checksum |
-  reconciled_raw_checksum | KH001_SETTLEMENT_HEADERS_V1)`.
+  source_settlement_number`.
+- **Settlement-specific `source_fingerprint`** (revision identity of one settlement):
+  SHA-256 of `KH001_SETTLEMENT_HEADERS_V1`, that settlement's section-D fields (number,
+  period dates, payment date, due, carry-in, total due, paid, outstanding, hold created,
+  hold released, hold balance, hold due dates, reference, FX, VND paid) and the DoiSoat inputs
+  of its transactions sorted by Transaction ID (id, settlement date key, gross, PayPal fee,
+  net, provider fee, hold, payout), using the canonical cell serialization. Sections A/B,
+  other settlements, unrelated DoiSoat rows, row numbers and timestamps are excluded. Full
+  raw checksums are recorded only in the operation-level audit.
+- **Immutability boundary:** Settlements is still a *rebuildable observed* provider
+  settlement layer — a later provider edit changes the affected settlement on the next run.
+  Before Settlement Items are created/frozen (Phase 2E), a commit/lock boundary must prevent
+  a committed settlement from silently mutating; the settlement-specific fingerprint is the
+  revision identity for that boundary.
 - The KH001 Provider Transactions partition must be current before any write or NO_CHANGE.
   Written with the shared provider-partition replace and crash-safe swap.
 
