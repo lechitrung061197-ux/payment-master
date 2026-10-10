@@ -44,6 +44,7 @@ src/
   Kh001ProviderTransactions.gs  KH001 normalizer -> Provider Transactions
   Kh001ProviderEvents.gs        KH001 normalizer -> Provider Events
   Kh001Settlements.gs           KH001 normalizer -> Settlements (headers)
+  SellerMapping.gs              Sellers draft -> effective-dated Endpoint Mapping history
   Main.gs           Public entry points
 test/               Node unit tests for pure helpers (npm test, not pushed)
 ```
@@ -75,8 +76,8 @@ from the Apps Script editor. `setupMaster` never deletes tabs or data rows:
 | Tab | Purpose |
 | --- | --- |
 | Settings | Key/value config. Provider-scoped keys: `provider_fee_rate.<PROVIDER>`, `provider_hold_rate.<PROVIDER>` |
-| Sellers | Seller master; optional per-seller fee/hold overrides |
-| Endpoint Mapping | endpoint_token → seller_id / seller_group, effective-dated |
+| Sellers | User-managed desired mapping: 1 row = 1 seller, endpoint_<N>_name/key pairs |
+| Endpoint Mapping | System-managed effective-dated endpoint ownership history |
 | Source System | Raw internal transactions (import-only) |
 | Source Payments | Raw provider events (payment, refund, dispute, hold, …), one row per event |
 | Transactions | Internal transactions (ownership source of truth) |
@@ -380,6 +381,45 @@ Order: `syncKh001Raw` → `normalizeKh001ProviderTransactions` → `normalizeKh0
   revision identity for that boundary.
 - The KH001 Provider Transactions partition must be current before any write or NO_CHANGE.
   Written with the shared provider-partition replace and crash-safe swap.
+
+## Seller / endpoint mapping
+
+Entry points: `publishSellerMapping()` and read-only `verifySellerMapping()`.
+
+- **Sellers** (user-edited): `seller_id, seller_name, status (ACTIVE/INACTIVE), effective_from,
+  endpoint_1_name, endpoint_1_key, … endpoint_10_name, endpoint_10_key, notes`. Pairs are
+  discovered from the header (`endpoint_<N>_name/key`), so adding slots is a schema-only
+  change. A pair is both blank or both filled. Among ACTIVE sellers `endpoint_key` is unique
+  and `endpoint_name` is unique case-insensitively. Row order, slot order, blank slots and
+  notes have no meaning. `effective_from` is the date of the NEXT ownership change of the row.
+- **Seller IDs**: blank `seller_id` gets the next `SLR-######` after every ID seen in Sellers
+  or Endpoint Mapping (never recycled), written back to Sellers under the lock. Custom unique
+  IDs are kept. Identity never comes from `seller_name`.
+- **Endpoint Mapping** (system-managed): `mapping_id, seller_id, seller_name_snapshot,
+  endpoint_name, endpoint_key, effective_from, effective_to, opened_version, closed_version,
+  status (OPEN/CLOSED), opened_at, closed_at, notes`.
+  `mapping_id = EM-<sha256(seller_id|endpoint_key|effective_from)>`.
+- **Publish**: desired = endpoints of ACTIVE sellers. OPEN rows whose
+  (seller_id, endpoint_key, endpoint_name) are not desired are closed
+  (`effective_to = effective_from − 1 day`, `closed_version`, `status`, `closed_at` only);
+  desired entries not OPEN are opened. Reported as NEW / REMOVED / MOVED_TO_ANOTHER_SELLER /
+  NAME_CHANGED / KEY_CHANGED. All changes share one `effective_from` taken from the involved
+  Sellers rows (old owner of every closed row, new owner of every opened row) and one
+  version `SMV-######`. The initial publish may be back-dated; later publishes must be
+  strictly after every published `effective_from`. A row owning OPEN mappings may not be
+  deleted from Sellers (remove the pair or set INACTIVE with `effective_from`). A seller
+  name or notes change alone is NO_CHANGE. CLOSED rows are immutable.
+- The new history is validated (ids, dates, versions, no overlaps per key / per name, at most
+  one open-ended row each, immutability) and written as a whole table through the shared
+  crash-safe swap (`writeCanonicalTable_`).
+- **Resolvers** (for later phases): `resolveEndpointByKey_`, `resolveEndpointByName_`,
+  `resolveEndpointByNameAndKey_` — match `effective_from <= date <= effective_to`
+  (blank = open) on Master-timezone date keys; none → UNMAPPED, several → error; name and
+  key together must resolve to the same row.
+- **Seller hold (locked rule for the next phase):** `seller_hold_amount =
+  provider_hold_amount` of the same transaction, 1:1. There is no independent KH001 seller
+  hold percentage and Sellers does not configure it. Legacy hold-rate Settings keys are left
+  for a later explicit cleanup.
 
 ## Tests
 

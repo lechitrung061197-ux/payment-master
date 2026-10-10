@@ -224,3 +224,25 @@ function replaceCanonicalPartition_(ss, spec) {
   swapStagingIntoTarget_(ss, staging, spec.tab, written, null);
   return Object.assign({ status: 'SUCCESS' }, base);
 }
+
+/**
+ * Replaces a WHOLE schema table with the given rows through the crash-safe staging swap
+ * (for system-managed tables written as one unit, e.g. Endpoint Mapping history).
+ * Caller holds the script lock and has validated the rows. Reuses recoverSwapState_,
+ * prepareTableStaging_, writeTableValues_ and swapStagingIntoTarget_; the partition writer
+ * above is unaffected.
+ * @return {{swapState: string, swapActions: Array<string>, rows: number, checksum: string}}
+ */
+function writeCanonicalTable_(ss, table, tab, rows) {
+  const recovery = recoverSwapState_(ss, tab);
+  const columns = table.columns.map(function (c) { return c.name; });
+  const values = buildTableValues_(columns, rows);
+  const written = { rows: values.length, columns: columns.length, checksum: computeRawChecksum_(values) };
+
+  const staging = prepareTableStaging_(ss, table, tab.stagingSheet, values.length);
+  writeTableValues_(staging, values);
+  SpreadsheetApp.flush();
+  assertSnapshotMatches_(readSheetSnapshot_(staging), written, 'Staging "' + tab.stagingSheet + '"');
+  swapStagingIntoTarget_(ss, staging, tab, written, null);
+  return { swapState: recovery.state, swapActions: recovery.actions, rows: rows.length, checksum: written.checksum };
+}

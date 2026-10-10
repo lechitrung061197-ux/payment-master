@@ -9,7 +9,7 @@
 
 const APP = Object.freeze({
   NAME: 'Payment Master',
-  SCHEMA_VERSION: 6,
+  SCHEMA_VERSION: 7,
   LOCALE: 'en_US',
   TIMEZONE: 'America/New_York',
   DEFAULT_CURRENCY: 'USD',
@@ -81,7 +81,13 @@ const ENUMS = Object.freeze({
   // Canonical provider ledger event types. Only values verified against real data are
   // listed; new types are added together with a verified normalizer mapping.
   PROVIDER_EVENT_TYPE: ['PAYMENT', 'RESERVE_HOLD', 'WITHDRAWAL'],
+  SELLER_STATUS: ['ACTIVE', 'INACTIVE'],
+  // OPEN = open-ended interval (effective_to blank; may start in the future); CLOSED = bounded.
+  ENDPOINT_MAPPING_STATUS: ['OPEN', 'CLOSED'],
 });
+
+/** Number of endpoint_<N>_name / endpoint_<N>_key pairs in Sellers (schema-only to extend). */
+const SELLER_ENDPOINT_SLOTS = 10;
 
 /** Tab names, in display order. */
 const SHEETS = Object.freeze({
@@ -117,6 +123,16 @@ function col_(name, type, values) {
 
 const T = COL_TYPE;
 
+/** endpoint_1_name, endpoint_1_key, ..., endpoint_<count>_key (name beside key). */
+function sellerEndpointColumns_(count) {
+  const columns = [];
+  for (let n = 1; n <= count; n++) {
+    columns.push(col_('endpoint_' + n + '_name', T.TEXT));
+    columns.push(col_('endpoint_' + n + '_key', T.ID));
+  }
+  return columns;
+}
+
 /**
  * Data table schemas. Every table has a single, stable header row (row 1).
  * Dashboard is a layout tab, not a data table, and is defined in Setup.gs.
@@ -135,29 +151,38 @@ const SCHEMA = Object.freeze([
   },
   {
     sheet: SHEETS.SELLERS,
-    description: 'Seller master. Blank rate columns fall back to Settings defaults ' +
-      '(seller_fee_rate, default_seller_hold_rate).',
+    description: 'User-managed desired seller/endpoint mapping: 1 row = 1 seller, each endpoint is an ' +
+      'endpoint_<N>_name + endpoint_<N>_key pair (slot order has no meaning). effective_from is the date ' +
+      'of the NEXT ownership change for this row, not a creation date. Run publishSellerMapping() to ' +
+      'publish changes into Endpoint Mapping. Leave seller_id blank for a new seller (assigned on publish).',
+    frozenColumns: 4,
     columns: [
       col_('seller_id', T.ID),
       col_('seller_name', T.TEXT),
-      col_('seller_fee_rate', T.RATE),
-      col_('seller_hold_rate', T.RATE),
-      col_('default_currency', T.TEXT),
-      col_('status', T.ENUM, ENUMS.RECORD_STATUS),
-      col_('created_at', T.DATETIME),
+      col_('status', T.ENUM, ENUMS.SELLER_STATUS),
+      col_('effective_from', T.DATE),
+    ].concat(sellerEndpointColumns_(SELLER_ENDPOINT_SLOTS)).concat([
       col_('notes', T.TEXT),
-    ],
+    ]),
   },
   {
     sheet: SHEETS.ENDPOINT_MAPPING,
-    description: 'Maps internal endpoint tokens to sellers and seller groups, effective-dated.',
+    description: 'System-managed effective-dated endpoint ownership history (written only by ' +
+      'publishSellerMapping). A row matches a date when effective_from <= date <= effective_to (blank = ' +
+      'open-ended). CLOSED rows are immutable; an OPEN row only ever gets closed.',
     columns: [
-      col_('endpoint_token', T.ID),
+      col_('mapping_id', T.ID),
       col_('seller_id', T.ID),
-      col_('seller_group', T.TEXT),
-      col_('status', T.ENUM, ENUMS.RECORD_STATUS),
-      col_('active_from', T.DATE),
-      col_('active_to', T.DATE),
+      col_('seller_name_snapshot', T.TEXT),
+      col_('endpoint_name', T.TEXT),
+      col_('endpoint_key', T.ID),
+      col_('effective_from', T.DATE),
+      col_('effective_to', T.DATE),
+      col_('opened_version', T.ID),
+      col_('closed_version', T.ID),
+      col_('status', T.ENUM, ENUMS.ENDPOINT_MAPPING_STATUS),
+      col_('opened_at', T.DATETIME),
+      col_('closed_at', T.DATETIME),
       col_('notes', T.TEXT),
     ],
   },

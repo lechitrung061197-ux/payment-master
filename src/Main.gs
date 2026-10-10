@@ -164,3 +164,21 @@ function verifyKh001Settlements() {
   Logger.log(JSON.stringify(report, null, 2));
   return report;
 }
+
+/* ---------------------------------------------------------------------------
+ * Seller / endpoint mapping (ownership history; no seller economics)
+ * ------------------------------------------------------------------------- */
+
+/** Publishes the Sellers draft into effective-dated Endpoint Mapping history. */
+function publishSellerMapping() {
+  const result = runPublishSellerMapping_();
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** Read-only: validates the Sellers draft and Endpoint Mapping history. */
+function verifySellerMapping() {
+  const report = buildSellerMappingReport_();
+  Logger.log(JSON.stringify(report, null, 2));
+  return report;
+}

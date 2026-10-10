@@ -97,6 +97,7 @@ function ensureTable_(ss, table, warnings, migratedTabs) {
   fitColumnCount_(sheet, headers.length);
   if (!headerMatches) sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
   formatHeader_(sheet, headers.length);
+  if (table.frozenColumns) sheet.setFrozenColumns(table.frozenColumns);
   formatColumns_(sheet, table.columns);
   ensureFilter_(sheet, headers.length);
   protectHeader_(sheet, headers.length);
