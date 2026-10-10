@@ -16,7 +16,7 @@ const Utilities = {
 };
 const context = vm.createContext({ Utilities });
 for (const f of ['Config', 'Utils', 'RawSnapshot', 'CanonicalTable', 'Kh001ProviderTransactions', 'Kh001ProviderEvents',
-  'Kh001Settlements', 'SellerMapping']) {
+  'Kh001Settlements', 'SellerMapping', 'EndpointKeyMigration']) {
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'src', f + '.gs'), 'utf8'), context, { filename: f + '.gs' });
 }
 const H = context;

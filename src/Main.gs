@@ -182,3 +182,21 @@ function verifySellerMapping() {
   Logger.log(JSON.stringify(report, null, 2));
   return report;
 }
+
+/* ---------------------------------------------------------------------------
+ * One-time endpoint key correction (Phase 2E.1): full credentials -> endpoint tokens
+ * ------------------------------------------------------------------------- */
+
+/** Guarded one-time migration of Sellers / Endpoint Mapping keys to endpoint tokens. */
+function migrateSellerEndpointKeysToTokens() {
+  const result = runEndpointKeyMigration_();
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** Read-only: endpoint key token state, legacy key counts and migration safety. */
+function verifySellerEndpointKeys() {
+  const report = verifyEndpointKeyState_(getSpreadsheet_());
+  Logger.log(JSON.stringify(report, null, 2));
+  return report;
+}

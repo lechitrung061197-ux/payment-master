@@ -16,6 +16,10 @@
  *   CLOSED rows never change; an OPEN row only ever gets its closure fields set.
  * - Resolver helpers answer "who owned endpoint X on date D" for later phases.
  *
+ * endpoint_key is the stable internal endpoint TOKEN (exact match with the internal export field
+ * endpoint_token), never an API credential; publishing a <token>.<secret> value is refused and
+ * credentials are redacted from errors, audit details and reports.
+ *
  * Seller hold is NOT configured here. Locked KH001 invariant for the next phase:
  * seller_hold_amount = the frozen provider_hold_amount of the same transaction (1:1, policy
  * MIRROR_PROVIDER); Settings default_seller_hold_rate is legacy and not used for KH001.
@@ -566,6 +570,8 @@ function checkHistoryImmutability_(before, after) {
  *           effectiveFrom: ?string, version: ?string, newRecords: ?Array<Object>}}
  */
 function planSellerMappingPublish_(sellers, records, publishedAt, digestHex) {
+  // endpoint_key is the ownership token, never a credential (see EndpointKeyMigration.gs).
+  throwIfErrors_('Sellers contains full endpoint credentials', findCredentialEndpointKeys_(sellers));
   throwIfErrors_('Historical seller IDs are missing from Sellers', checkHistoricalSellersRetained_(sellers, records));
   const desired = desiredMappings_(sellers);
   const diff = diffSellerMapping_(desired, records.filter(function (r) { return r.status === 'OPEN'; }));
@@ -762,7 +768,7 @@ function runPublishSellerMapping_() {
       status = 'SUCCESS';
     }
   } catch (err) {
-    details.error = err && err.message ? err.message : String(err);
+    details.error = redactEndpointCredentials_(err && err.message ? err.message : String(err));
     status = 'FAILED';
   } finally {
     try {
@@ -776,14 +782,14 @@ function runPublishSellerMapping_() {
         entityType: 'SELLER_MAPPING',
         entityId: details.mapping_version || '',
         newStatus: status,
-        details: details,
+        details: redactDeep_(details),
       });
     } catch (auditErr) {
       Logger.log('Failed to write audit entry: %s', auditErr);
     }
     if (locked) lock.releaseLock();
   }
-  return Object.assign({ status: status }, details);
+  return redactDeep_(Object.assign({ status: status }, details));
 }
 
 /** Read-only verification of the Sellers draft and the Endpoint Mapping history. */
@@ -884,5 +890,5 @@ function buildSellerMappingReport_() {
     report.errors.push(err && err.message ? err.message : String(err));
   }
   report.pass = report.errors.length === 0 && report.swap_state === 'NORMAL' && report.published_match;
-  return report;
+  return redactDeep_(report);
 }

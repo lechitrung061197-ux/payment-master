@@ -45,6 +45,7 @@ src/
   Kh001ProviderEvents.gs        KH001 normalizer -> Provider Events
   Kh001Settlements.gs           KH001 normalizer -> Settlements (headers)
   SellerMapping.gs              Sellers draft -> effective-dated Endpoint Mapping history
+  EndpointKeyMigration.gs       One-time guarded correction: credential keys -> endpoint tokens
   Main.gs           Public entry points
 test/               Node unit tests for pure helpers (npm test, not pushed)
 ```
@@ -436,6 +437,31 @@ Entry points: `publishSellerMapping()` and read-only `verifySellerMapping()`.
   frozen `provider_hold_amount` of the same transaction, 1:1 (see Financial design rules §3).
   There is no independent KH001 seller hold percentage and Sellers does not configure it.
   `default_seller_hold_rate` is legacy and left for a later explicit cleanup.
+
+### Endpoint key = ownership token, never a credential
+
+- `endpoint_key` (Sellers `endpoint_<N>_key`, Endpoint Mapping `endpoint_key`) is the stable
+  internal endpoint **token**, e.g. `glk_r8XToW` — an ownership identifier, not an API
+  credential. The internal transaction export field `endpoint_token` maps to it by exact
+  equality (`internal.endpoint_token === Endpoint Mapping.endpoint_key`); no split/prefix
+  heuristics in transaction processing.
+- Full endpoint credentials (`<token>.<secret>`) must never be stored in ownership history.
+  `publishSellerMapping()` refuses them, and credential-looking values are redacted
+  (`<token>.<redacted>`) from errors, audit details, logs and verifier reports. A future
+  realtime integration must keep credentials/configuration in a secured connector/settings
+  layer, never in Endpoint Mapping or other accounting history.
+- **One-time correction** `migrateSellerEndpointKeysToTokens()` (with read-only
+  `verifySellerEndpointKeys()`): rewrites legacy `<glk_token>.<suffix>` keys to the token in
+  Sellers and Endpoint Mapping and recomputes `mapping_id`; every other history field is
+  preserved and no new version is created. It runs under the script lock only when
+  `schema_version = 7`, Source System / Transactions / Payment Matches / Payment Legs /
+  Settlement Items are empty, history is exactly the initial OPEN `SMV-000001` rows effective
+  `2026-10-01`, all keys are recognized, resulting tokens are unique, historical sellers are
+  retained and Sellers matches published ownership (token-normalized). Otherwise it fails
+  without mutation. Endpoint Mapping is written through SafeSwap, Sellers in one batch; the
+  result is re-read and validated. It is idempotent (fully migrated → `NO_CHANGE`) and
+  converges from a partially migrated state. Once any dependent table has data it is refused.
+  The legacy parser is for this migration only.
 
 ## Tests
 
