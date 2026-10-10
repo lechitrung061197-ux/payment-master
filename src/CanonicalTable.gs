@@ -120,6 +120,12 @@ function rowToObject_(row, columns) {
   return obj;
 }
 
+/** Checksum of a partition (header + rows in canonical order), excluding the stamp column. */
+function partitionChecksum_(rowsAsArrays, columns, sortColumns, stampColumn) {
+  const sorted = sortCanonicalRows_(rowsAsArrays, sortColumns.map(function (c) { return columns.indexOf(c); }));
+  return tableChecksumExcluding_(buildTableValues_(columns, sorted), [columns.indexOf(stampColumn)]);
+}
+
 /* ---------------------------------- I/O --------------------------------- */
 
 /** Whole sheet grid with its checksum (same definition as readSheetSnapshot_). */

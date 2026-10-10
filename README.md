@@ -42,6 +42,7 @@ src/
   RawSync.gs        Safe raw snapshot sync and verify
   CanonicalTable.gs Shared provider-partition replace for canonical tables
   Kh001ProviderTransactions.gs  KH001 normalizer -> Provider Transactions
+  Kh001ProviderEvents.gs        KH001 normalizer -> Provider Events
   Main.gs           Public entry points
 test/               Node unit tests for pure helpers (npm test, not pushed)
 ```
@@ -94,6 +95,7 @@ from the Apps Script editor. `setupMaster` never deletes tabs or data rows:
 | Raw KH001 Settlements | Raw mirror of KH001 `PhieuDoiSoat` |
 | Raw KH001 Disputes | Raw mirror of KH001 `Dispute` |
 | Provider Transactions | Canonical provider PAYMENT transactions, all providers (one partition per provider) |
+| Provider Events | Canonical signed provider ledger events (payments, reserve holds, withdrawals), all providers |
 
 Hidden `__STAGE_*` tabs are internal to raw sync and must never be read by business logic.
 
@@ -292,6 +294,36 @@ Entry points: `normalizeKh001ProviderTransactions()` and read-only
   normalization of the current raw tabs, unique keys, amount invariant, swap state).
   A separate `regression` section compares with the October 2026 snapshot expectations
   and does not affect `pass`.
+
+## Provider Events (KH001 normalizer)
+
+Entry points: `normalizeKh001ProviderEvents()` and read-only `verifyKh001ProviderEvents()`.
+Source: `Raw KH001 PayPal` only (Provider Transactions is read for referential integrity).
+
+| Nhóm GD | event_type | Verified Type | Status / Balance Impact | Link |
+| --- | --- | --- | --- | --- |
+| Thanh toán | PAYMENT | Express Checkout Payment | Completed/Credit, Pending/Memo | own Transaction ID |
+| Reserve PP | RESERVE_HOLD | Reserve Hold | Completed/Debit | Reference Txn ID (required) |
+| Rút tiền | WITHDRAWAL | General Withdrawal | Completed/Debit | none |
+
+- Any other non-blank `Nhóm GD`, Type or Status/Balance Impact combination fails; a row with
+  a Transaction ID but blank `Nhóm GD` also fails. No silent `OTHER`.
+- Amounts keep PayPal signs (`Fee` stays negative): `gross_amount + fee_amount = net_amount`
+  within 0.005.
+- `balance_effect_amount`: Credit/Debit → `net_amount` (Credit ≥ 0, Debit ≤ 0), Memo → 0.
+  A Pending/Memo payment is an event but does not move the PayPal balance.
+- `Txn gốc` is a validation signal only: PAYMENT/WITHDRAWAL → equals Transaction ID;
+  RESERVE_HOLD → equals Reference Txn ID (authoritative link).
+- PAYMENT and RESERVE_HOLD must link to an existing KH001/PAYPAL Provider Transaction
+  (`PT-KH001-PAYPAL-<id>`); WITHDRAWAL has no link. A stale Provider Transactions tab or a
+  non-normal swap state on it fails the run.
+- **RESERVE_HOLD is the actual PayPal reserve, not the KH001 contractual hold.** No
+  percentage is derived; settlements and withdrawal allocation are out of scope.
+- IDs `PE-KH001-PAYPAL-<Transaction ID>`; unique `provider_id + payment_source +
+  external_event_id`; `source_fingerprint = SHA-256(paypal_raw_checksum | KH001_PROVIDER_EVENTS_V1)`.
+- Written with the same provider-partition replace and crash-safe swap as Provider
+  Transactions (sorted by `provider_id, payment_source, event_at, external_event_id`).
+- Verify: generic checks decide `pass`; the October 2026 `regression` section is report only.
 
 ## Tests
 

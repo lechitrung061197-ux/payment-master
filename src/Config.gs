@@ -9,7 +9,7 @@
 
 const APP = Object.freeze({
   NAME: 'Payment Master',
-  SCHEMA_VERSION: 4,
+  SCHEMA_VERSION: 5,
   LOCALE: 'en_US',
   TIMEZONE: 'America/New_York',
   DEFAULT_CURRENCY: 'USD',
@@ -75,6 +75,9 @@ const ENUMS = Object.freeze({
   IMPORT_BATCH_STATUS: ['RUNNING', 'SUCCESS', 'NO_CHANGE', 'FAILED'],
   // Reconciliation inside the provider's own workbook, not Payment Master matching.
   PROVIDER_RECONCILIATION_STATUS: ['RECONCILED', 'AMOUNT_MISMATCH', 'PROVIDER_ONLY'],
+  // Canonical provider ledger event types. Only values verified against real data are
+  // listed; new types are added together with a verified normalizer mapping.
+  PROVIDER_EVENT_TYPE: ['PAYMENT', 'RESERVE_HOLD', 'WITHDRAWAL'],
 });
 
 /** Tab names, in display order. */
@@ -101,6 +104,7 @@ const SHEETS = Object.freeze({
   RAW_KH001_SETTLEMENTS: 'Raw KH001 Settlements',
   RAW_KH001_DISPUTES: 'Raw KH001 Disputes',
   PROVIDER_TRANSACTIONS: 'Provider Transactions',
+  PROVIDER_EVENTS: 'Provider Events',
 });
 
 /** Shorthand column constructor: col_('name', COL_TYPE.X, ENUMS.Y?) */
@@ -468,6 +472,37 @@ const SCHEMA = Object.freeze([
       col_('reconciliation_difference', T.AMOUNT),
       col_('source_paypal_row', T.INTEGER),
       col_('source_reconciled_row', T.INTEGER),
+      col_('source_fingerprint', T.ID),
+      col_('normalizer_version', T.TEXT),
+      col_('normalized_at', T.DATETIME),
+    ],
+  },
+  {
+    sheet: SHEETS.PROVIDER_EVENTS,
+    description: 'Canonical provider ledger events, all providers, with signed provider amounts ' +
+      '(gross_amount + fee_amount = net_amount). balance_effect_amount is the actual provider ' +
+      'balance movement (0 for Memo). Unique key: provider_id + payment_source + external_event_id. ' +
+      'RESERVE_HOLD is the provider reserve, not a contractual hold.',
+    columns: [
+      col_('provider_event_id', T.ID),
+      col_('provider_id', T.ID),
+      col_('payment_source', T.ENUM, ENUMS.PAYMENT_SOURCE),
+      col_('gateway_id', T.ID),
+      col_('external_event_id', T.ID),
+      col_('related_external_transaction_id', T.ID),
+      col_('provider_transaction_id', T.ID),
+      col_('event_type', T.ENUM, ENUMS.PROVIDER_EVENT_TYPE),
+      col_('event_at', T.DATETIME),
+      col_('external_status', T.TEXT),
+      col_('currency', T.TEXT),
+      col_('gross_amount', T.AMOUNT),
+      col_('fee_amount', T.AMOUNT),
+      col_('net_amount', T.AMOUNT),
+      col_('balance_impact', T.TEXT),
+      col_('balance_effect_amount', T.AMOUNT),
+      col_('raw_type', T.TEXT),
+      col_('raw_group', T.TEXT),
+      col_('source_paypal_row', T.INTEGER),
       col_('source_fingerprint', T.ID),
       col_('normalizer_version', T.TEXT),
       col_('normalized_at', T.DATETIME),

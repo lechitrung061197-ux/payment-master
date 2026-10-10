@@ -128,3 +128,21 @@ function verifyKh001ProviderTransactions() {
   Logger.log(JSON.stringify(report, null, 2));
   return report;
 }
+
+/* ---------------------------------------------------------------------------
+ * KH001 Provider Events (signed PayPal ledger events; no settlements or holds)
+ * ------------------------------------------------------------------------- */
+
+/** Rebuilds the KH001 partition of Provider Events from Raw KH001 PayPal. */
+function normalizeKh001ProviderEvents() {
+  const result = runKh001ProviderEventsNormalizer_();
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** Read-only: checks Provider Events (KH001) against the current raw snapshot. */
+function verifyKh001ProviderEvents() {
+  const report = buildKh001ProviderEventsReport_();
+  Logger.log(JSON.stringify(report, null, 2));
+  return report;
+}
