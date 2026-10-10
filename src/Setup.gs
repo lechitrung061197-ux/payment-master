@@ -23,6 +23,7 @@ const COLUMN_WIDTHS = Object.freeze({
   DATETIME: 150,
   USD: 120,
   AMOUNT: 120,
+  AMOUNT4: 130,
   RATE: 100,
   FX_RATE: 100,
   INTEGER: 90,

@@ -146,3 +146,21 @@ function verifyKh001ProviderEvents() {
   Logger.log(JSON.stringify(report, null, 2));
   return report;
 }
+
+/* ---------------------------------------------------------------------------
+ * KH001 Settlements (provider settlement headers only; no items or seller effects)
+ * ------------------------------------------------------------------------- */
+
+/** Rebuilds the KH001 partition of Settlements from Master raw tabs. */
+function normalizeKh001Settlements() {
+  const result = runKh001SettlementsNormalizer_();
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** Read-only: checks Settlements (KH001) against the current raw snapshot. */
+function verifyKh001Settlements() {
+  const report = buildKh001SettlementsReport_();
+  Logger.log(JSON.stringify(report, null, 2));
+  return report;
+}

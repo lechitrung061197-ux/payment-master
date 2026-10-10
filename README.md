@@ -43,6 +43,7 @@ src/
   CanonicalTable.gs Shared provider-partition replace for canonical tables
   Kh001ProviderTransactions.gs  KH001 normalizer -> Provider Transactions
   Kh001ProviderEvents.gs        KH001 normalizer -> Provider Events
+  Kh001Settlements.gs           KH001 normalizer -> Settlements (headers)
   Main.gs           Public entry points
 test/               Node unit tests for pure helpers (npm test, not pushed)
 ```
@@ -81,7 +82,7 @@ from the Apps Script editor. `setupMaster` never deletes tabs or data rows:
 | Transactions | Internal transactions (ownership source of truth) |
 | Payment Matches | internal transaction ↔ (payment_source, external_transaction_id) |
 | Payment Legs | One row per matched external payment transaction, live economics |
-| Settlements | Provider payout batches, provider economics (snapshot once LOCKED) |
+| Settlements | Canonical provider settlement headers (provider economics only), all providers |
 | Settlement Items | Frozen per-leg snapshot inside a settlement |
 | Seller Balances | Per-seller balance across all providers |
 | Seller Payouts | Money actually sent to sellers (no settlement_id: one payout may be funded by many settlements) |
@@ -324,6 +325,36 @@ Source: `Raw KH001 PayPal` only (Provider Transactions is read for referential i
 - Written with the same provider-partition replace and crash-safe swap as Provider
   Transactions (sorted by `provider_id, payment_source, event_at, external_event_id`).
 - Verify: generic checks decide `pass`; the October 2026 `regression` section is report only.
+
+## Settlements (KH001 settlement headers)
+
+Entry points: `normalizeKh001Settlements()` and read-only `verifyKh001Settlements()`.
+Order: `syncKh001Raw` → `normalizeKh001ProviderTransactions` → `normalizeKh001Settlements`.
+
+- **History:** only section `D. LỊCH SỬ CHỐT & THANH TOÁN — CÔNG NỢ` of `Raw KH001 Settlements`,
+  found by normalized text (NFC, `…` = `...`, case/whitespace-insensitive); the header row is
+  searched below it. Sections A/B and unlabeled scratch columns are ignored. The history ends
+  at the first row whose `Lần` is not a settlement number; a numbered row with no other
+  values is a placeholder and is skipped.
+- **Membership:** `Raw KH001 Reconciled` rows with `Có trên PP` = 1 and a `Lần chốt (ngày)`
+  belong to the history row whose `Đến ngày` has the same provider-timezone
+  (`source.KH001.timezone`) `YYYY-MM-DD` key. Each must resolve to a KH001 Provider
+  Transaction; a date with no history row fails.
+- **Actual economics:** sums of `Doanh thu (Gross)`, `Phí PayPal`, `Net`, `Phí thuê OP`, `Hold`,
+  `Thực nhận (chưa gồm hoàn hold)` — never recalculated from rates, never rounded per row.
+  Row and header equations (tolerance 0.005; FX 1 VND) must hold.
+- **History fields** are copied as reported (due, carry-in, paid, outstanding, hold released,
+  hold balance, due dates, reference, FX, VND paid). `provider_adjustments = period_due −
+  transaction_payout − hold_released` is an unclassified residual (warned when non-zero).
+- **Hold reconciliation:** `expected_provider_hold_balance` rolls forward
+  (previous + created − released) and `hold_balance_difference = provider − expected`.
+  The provider value is never overwritten; differences are warnings, not errors.
+- Dates are stored as Master date values of the provider-timezone date keys.
+- IDs `ST-KH001-PAYPAL-<number padded to 6>`; unique `provider_id + payment_source +
+  source_settlement_number`; `source_fingerprint = SHA-256(settlements_raw_checksum |
+  reconciled_raw_checksum | KH001_SETTLEMENT_HEADERS_V1)`.
+- The KH001 Provider Transactions partition must be current before any write or NO_CHANGE.
+  Written with the shared provider-partition replace and crash-safe swap.
 
 ## Tests
 

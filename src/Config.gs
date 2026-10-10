@@ -9,7 +9,7 @@
 
 const APP = Object.freeze({
   NAME: 'Payment Master',
-  SCHEMA_VERSION: 5,
+  SCHEMA_VERSION: 6,
   LOCALE: 'en_US',
   TIMEZONE: 'America/New_York',
   DEFAULT_CURRENCY: 'USD',
@@ -22,6 +22,7 @@ const APP = Object.freeze({
  * - GENERAL: no column-wide format (mixed values, e.g. Settings.value).
  * - USD: amounts denominated in the default currency (USD).
  * - AMOUNT: amounts in a currency given by another column (e.g. payout_currency).
+ * - AMOUNT4: like AMOUNT, displayed with 4 decimals (unrounded provider fee/hold values).
  * - RATE: fractional rates shown as percentages (0.07 -> 7.00%).
  */
 const COL_TYPE = Object.freeze({
@@ -33,6 +34,7 @@ const COL_TYPE = Object.freeze({
   DATETIME: 'DATETIME',
   USD: 'USD',
   AMOUNT: 'AMOUNT',
+  AMOUNT4: 'AMOUNT4',
   RATE: 'RATE',
   FX_RATE: 'FX_RATE',
   INTEGER: 'INTEGER',
@@ -47,6 +49,7 @@ const FORMATS = Object.freeze({
   DATETIME: 'yyyy-mm-dd hh:mm:ss',
   USD: '$#,##0.00;-$#,##0.00',
   AMOUNT: '#,##0.00;-#,##0.00',
+  AMOUNT4: '#,##0.0000;-#,##0.0000',
   RATE: '0.00%',
   FX_RATE: '0.000000',
   INTEGER: '#,##0',
@@ -270,29 +273,49 @@ const SCHEMA = Object.freeze([
   },
   {
     sheet: SHEETS.SETTLEMENTS,
-    description: 'Provider payout batches (provider economics only). Snapshot once LOCKED. ' +
-      'payout_base_amount = net_amount - provider_fee - provider_hold_amount + provider_adjustments ' +
-      '(in currency). payout_amount is the actual payout in payout_currency. ' +
-      'Never used to recalculate seller economics.',
+    description: 'Canonical provider settlement headers (provider economics only), all providers. ' +
+      'Unique key: provider_id + payment_source + source_settlement_number. Transaction economics are ' +
+      'actual provider reconciliation sums; history fields are copied from the provider settlement ' +
+      'history. provider_hold_balance is the provider value; expected_provider_hold_balance is a ' +
+      'roll-forward and hold_balance_difference = provider - expected. provider_adjustments = ' +
+      'period_due_amount - transaction_payout_amount - provider_hold_released_amount (unclassified). ' +
+      'Dates are provider-timezone dates. Never used to recalculate seller economics.',
     columns: [
       col_('settlement_id', T.ID),
-      col_('provider', T.ID),
+      col_('provider_id', T.ID),
       col_('payment_source', T.ENUM, ENUMS.PAYMENT_SOURCE),
-      col_('settlement_date', T.DATE),
+      col_('source_settlement_number', T.INTEGER),
+      col_('period_start_date', T.DATE),
+      col_('period_end_date', T.DATE),
+      col_('source_payment_date', T.DATE),
       col_('currency', T.TEXT),
-      col_('gross_amount', T.USD),
-      col_('net_amount', T.USD),
-      col_('provider_fee', T.USD),
-      col_('provider_hold_amount', T.USD),
-      col_('provider_adjustments', T.USD),
-      col_('payout_base_amount', T.USD),
-      col_('payout_amount', T.AMOUNT),
+      col_('transaction_count', T.INTEGER),
+      col_('gross_amount', T.AMOUNT),
+      col_('processing_fee_amount', T.AMOUNT),
+      col_('net_amount', T.AMOUNT),
+      col_('provider_fee_amount', T.AMOUNT4),
+      col_('provider_hold_created_amount', T.AMOUNT4),
+      col_('transaction_payout_amount', T.AMOUNT4),
+      col_('provider_hold_released_amount', T.AMOUNT4),
+      col_('provider_hold_balance', T.AMOUNT4),
+      col_('expected_provider_hold_balance', T.AMOUNT4),
+      col_('hold_balance_difference', T.AMOUNT4),
+      col_('hold_release_due_from_date', T.DATE),
+      col_('hold_release_due_to_date', T.DATE),
+      col_('period_due_amount', T.AMOUNT4),
+      col_('carry_in_amount', T.AMOUNT4),
+      col_('total_due_amount', T.AMOUNT4),
+      col_('source_paid_amount', T.AMOUNT4),
+      col_('outstanding_amount', T.AMOUNT4),
+      col_('provider_adjustments', T.AMOUNT4),
+      col_('source_payment_reference', T.TEXT),
       col_('fx_rate', T.FX_RATE),
       col_('payout_currency', T.TEXT),
-      col_('status', T.ENUM, ENUMS.SETTLEMENT_STATUS),
-      col_('created_at', T.DATETIME),
-      col_('locked_at', T.DATETIME),
-      col_('notes', T.TEXT),
+      col_('source_paid_payout_amount', T.AMOUNT),
+      col_('source_settlement_row', T.INTEGER),
+      col_('source_fingerprint', T.ID),
+      col_('normalizer_version', T.TEXT),
+      col_('normalized_at', T.DATETIME),
     ],
   },
   {
