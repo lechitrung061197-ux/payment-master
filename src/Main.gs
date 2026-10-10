@@ -47,8 +47,9 @@ function verifyMaster() {
     scriptTimeZone: Session.getScriptTimeZone(),
     tabs: actual,
     missingTabs: expected.filter(function (n) { return actual.indexOf(n) < 0; }),
+    // Hidden staging tabs are expected; a leftover __SWAP_ tab is reported here.
     extraTabs: actual.filter(function (n) {
-      return expected.indexOf(n) < 0 && n.indexOf(STAGING_SHEET_PREFIX) !== 0 && n.indexOf('__SWAP_') !== 0;
+      return expected.indexOf(n) < 0 && n.indexOf(STAGING_SHEET_PREFIX) !== 0;
     }),
     headerIssues: headerIssues,
     schemaVersion: { expected: APP.SCHEMA_VERSION, actual: schemaVersion },

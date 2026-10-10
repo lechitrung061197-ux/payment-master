@@ -1,7 +1,7 @@
 /**
  * RawSnapshot.gs
  * Pure helpers for raw snapshot sync: canonical serialization, checksum,
- * trimming, validation and the no-change decision.
+ * validation, the no-change decision and the swap-recovery decision.
  *
  * No Apps Script service is called at load time or inside these helpers, except
  * the default digest function, so they can be unit-tested in Node (see test/).
@@ -85,27 +85,6 @@ function isBlankCell_(value) {
   return value === null || value === undefined || value === '';
 }
 
-/**
- * Removes trailing fully-blank rows and columns (e.g. formulas evaluating to "" at
- * the end of a used range). Inner blank rows/columns are kept. Returns the trimmed
- * dimensions so other parallel arrays (number formats) can be trimmed the same way.
- */
-function computeTrimmedDimensions_(values) {
-  let rows = values.length;
-  while (rows > 0 && values[rows - 1].every(isBlankCell_)) rows--;
-  let columns = 0;
-  for (let r = 0; r < rows; r++) {
-    for (let c = values[r].length - 1; c >= columns; c--) {
-      if (!isBlankCell_(values[r][c])) { columns = c + 1; break; }
-    }
-  }
-  return { rows: rows, columns: columns };
-}
-
-function sliceTo_(matrix, dims) {
-  return matrix.slice(0, dims.rows).map(function (row) { return row.slice(0, dims.columns); });
-}
-
 /** Returns a list of validation errors (empty when valid). */
 function validateRawDataset_(values) {
   const errors = [];
@@ -114,15 +93,61 @@ function validateRawDataset_(values) {
     return errors;
   }
   const columns = Array.isArray(values[0]) ? values[0].length : 0;
-  if (columns === 0) errors.push('Dataset has no columns.');
+  if (columns === 0) {
+    errors.push('Dataset has no columns.');
+    return errors;
+  }
   for (let r = 0; r < values.length; r++) {
     if (!Array.isArray(values[r]) || values[r].length !== columns) {
       errors.push('Row ' + (r + 1) + ' has ' + (Array.isArray(values[r]) ? values[r].length : 'no') +
         ' columns; expected ' + columns + '.');
-      break;
+      return errors;
     }
   }
+  // Guard the last known good snapshot against an accidentally emptied source tab.
+  const hasContent = values.some(function (row) { return !row.every(isBlankCell_); });
+  if (!hasContent) errors.push('Dataset is entirely blank.');
   return errors;
+}
+
+/**
+ * Swap-recovery decision. The swap renames, in order:
+ *   (1) target -> swap   (2) staging -> target   (3) swap -> staging
+ * A hard termination between steps can leave these name combinations. Given which
+ * of the three tab names currently exist, returns the recovery to apply BEFORE
+ * staging is cleared or reused. Recovery never deletes a tab and always restores
+ * the last known good snapshot (the swap tab) when one exists.
+ *
+ *   T W G   state      actions
+ *   1 0 *   NORMAL     none
+ *   0 1 1   B          swap -> target            (interrupted after step 1)
+ *   1 1 0   C          target -> staging, swap -> target
+ *                                               (interrupted after step 2: new target unconfirmed)
+ *   0 1 0   D          swap -> target
+ *   1 1 1   UNKNOWN    throw, manual inspection
+ *   0 0 1   UNKNOWN    throw, manual inspection (target missing, not a swap state)
+ *   0 0 0   NO_TARGET  none (nothing to protect; sync creates the target)
+ *
+ * @param {{targetExists: boolean, swapExists: boolean, stagingExists: boolean}} s
+ * @return {{state: string, actions: Array<string>, error: ?string}}
+ */
+function decideRawSwapRecovery_(s) {
+  const t = !!s.targetExists;
+  const w = !!s.swapExists;
+  const g = !!s.stagingExists;
+  if (t && !w) return { state: 'NORMAL', actions: [], error: null };
+  if (!t && w && g) return { state: 'B', actions: ['RENAME_SWAP_TO_TARGET'], error: null };
+  if (t && w && !g) {
+    return { state: 'C', actions: ['RENAME_TARGET_TO_STAGING', 'RENAME_SWAP_TO_TARGET'], error: null };
+  }
+  if (!t && w && !g) return { state: 'D', actions: ['RENAME_SWAP_TO_TARGET'], error: null };
+  if (!t && !w && !g) return { state: 'NO_TARGET', actions: [], error: null };
+  return {
+    state: 'UNKNOWN',
+    actions: [],
+    error: 'Unrecognized raw swap state (target=' + t + ', swap=' + w + ', staging=' + g +
+      '). Nothing was changed; inspect the tabs manually.',
+  };
 }
 
 /**

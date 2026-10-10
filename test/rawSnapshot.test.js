@@ -88,24 +88,25 @@ test('checksum: row order matters and chunk boundaries are deterministic', () =>
   assert.notEqual(checksum(rows), checksum(lastCellChanged), 'change in the last chunk is detected');
 });
 
-test('computeTrimmedDimensions_: trims only trailing blank rows/columns', () => {
-  const values = [
-    ['h1', '', 'h3', ''],
-    ['', '', '', ''],
-    ['x', '', 1, ''],
-    ['', '', '', ''],
-    ['', null, '', ''],
-  ];
-  assert.deepEqual({ ...H.computeTrimmedDimensions_(values) }, { rows: 3, columns: 3 });
-  assert.deepEqual({ ...H.computeTrimmedDimensions_([['']]) }, { rows: 0, columns: 0 });
-  assert.deepEqual({ ...H.computeTrimmedDimensions_([[0, false]]) }, { rows: 1, columns: 2 }, '0/false are not blank');
-});
-
 test('validateRawDataset_: dimensions', () => {
   assert.deepEqual([...H.validateRawDataset_([['a', 'b'], [1, 2]])], []);
   assert.equal(H.validateRawDataset_([]).length, 1);
   assert.equal(H.validateRawDataset_([[]]).length, 1);
   assert.match(H.validateRawDataset_([['a', 'b'], [1]])[0], /Row 2 has 1 columns; expected 2/);
+});
+
+test('validateRawDataset_: trailing blank rows/columns are valid, an all-blank range is not', () => {
+  assert.deepEqual([...H.validateRawDataset_([['a', ''], ['', ''], ['', '']])], []);
+  assert.deepEqual([...H.validateRawDataset_([[0, false]])], [], '0 and false are content');
+  assert.match(H.validateRawDataset_([['']])[0], /entirely blank/);
+  assert.match(H.validateRawDataset_([['', ''], ['', '']])[0], /entirely blank/);
+});
+
+test('checksum: exact used range, trailing "" cells are part of the snapshot', () => {
+  const used = [['h1', 'h2', ''], ['x', 1, ''], ['', '', '']];
+  const trimmed = [['h1', 'h2'], ['x', 1]];
+  assert.notEqual(checksum(used), checksum(trimmed));
+  assert.equal(checksum(used), checksum(used.map((r) => r.slice())));
 });
 
 test('decideRawSyncAction_: no-change decision', () => {
@@ -128,7 +129,44 @@ test('buildRawNumberFormats_: text forced to plain text, other formats kept', ()
   );
 });
 
-test('sliceTo_: trims a parallel matrix to dimensions', () => {
-  const m = [[1, 2, 3], [4, 5, 6], [7, 8, 9]];
-  assert.deepEqual(JSON.parse(JSON.stringify(H.sliceTo_(m, { rows: 2, columns: 2 }))), [[1, 2], [4, 5]]);
+test('decideRawSwapRecovery_: every target/swap/staging combination', () => {
+  const d = (t, w, g) => {
+    const r = H.decideRawSwapRecovery_({ targetExists: t, swapExists: w, stagingExists: g });
+    return { state: r.state, actions: [...r.actions], hasError: !!r.error };
+  };
+  // NORMAL: target present, no swap (staging present or not)
+  assert.deepEqual(d(true, false, true), { state: 'NORMAL', actions: [], hasError: false });
+  assert.deepEqual(d(true, false, false), { state: 'NORMAL', actions: [], hasError: false });
+  // B: interrupted after target -> swap; restore swap first, staging untouched
+  assert.deepEqual(d(false, true, true), { state: 'B', actions: ['RENAME_SWAP_TO_TARGET'], hasError: false });
+  // C: interrupted after staging -> target; keep last known good (swap)
+  assert.deepEqual(d(true, true, false),
+    { state: 'C', actions: ['RENAME_TARGET_TO_STAGING', 'RENAME_SWAP_TO_TARGET'], hasError: false });
+  // D: only swap left
+  assert.deepEqual(d(false, true, false), { state: 'D', actions: ['RENAME_SWAP_TO_TARGET'], hasError: false });
+  // Unknown states: no actions, descriptive error
+  assert.deepEqual(d(true, true, true), { state: 'UNKNOWN', actions: [], hasError: true });
+  assert.deepEqual(d(false, false, true), { state: 'UNKNOWN', actions: [], hasError: true });
+  // Nothing exists: nothing to protect
+  assert.deepEqual(d(false, false, false), { state: 'NO_TARGET', actions: [], hasError: false });
+});
+
+test('decideRawSwapRecovery_: replaying actions on names always ends in NORMAL', () => {
+  // Simulate the 3-step swap, hard-stopped after each step, then apply recovery.
+  const steps = [
+    (n) => { n.delete('T'); n.add('W'); },  // (1) target -> swap
+    (n) => { n.delete('G'); n.add('T'); },  // (2) staging -> target
+    (n) => { n.delete('W'); n.add('G'); },  // (3) swap -> staging
+  ];
+  for (let stopAfter = 0; stopAfter <= steps.length; stopAfter++) {
+    const names = new Set(['T', 'G']);
+    steps.slice(0, stopAfter).forEach((s) => s(names));
+    const r = H.decideRawSwapRecovery_({ targetExists: names.has('T'), swapExists: names.has('W'), stagingExists: names.has('G') });
+    assert.equal(r.error, null, 'stopAfter=' + stopAfter);
+    r.actions.forEach((a) => {
+      if (a === 'RENAME_TARGET_TO_STAGING') { names.delete('T'); names.add('G'); }
+      if (a === 'RENAME_SWAP_TO_TARGET') { names.delete('W'); names.add('T'); }
+    });
+    assert.deepEqual([...names].sort(), ['G', 'T'], 'stopAfter=' + stopAfter);
+  }
 });

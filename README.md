@@ -215,8 +215,11 @@ Configuration comes only from Settings: `source.KH001.enabled`,
 (`getValues()`; formulas are never copied). No renaming, filtering, normalization,
 recalculation, business rules or timezone conversion. Types are kept
 (number, Date, text, boolean, blank); text cells are written as plain text so values
-like `00123` are not re-parsed. Trailing fully-blank rows/columns of the used range
-(e.g. formulas returning `""`) are not part of the snapshot.
+like `00123` are not re-parsed. The snapshot is exactly the source `getDataRange()`
+(used range) dimensions, including trailing cells that evaluate to `""`; staging and
+target tabs are resized to exactly those dimensions, so a target snapshot is its whole
+grid. A source whose used range is entirely blank fails validation (last known good
+snapshot is kept).
 
 **Safe snapshot.** Per source tab, under a script lock: read the whole source once →
 validate → checksum → compare with the last SUCCESS/NO_CHANGE batch *and* the current
@@ -225,6 +228,26 @@ verify staging → swap staging into the target by renaming → verify the targe
 on mismatch) → log. The live target is never cleared or partially written; the previous
 snapshot becomes the staging tab and is kept until the next write. A failure in one tab
 does not affect the others.
+
+**Hard-interruption recovery.** The swap renames (1) target → `__SWAP_*`,
+(2) staging → target, (3) `__SWAP_*` → staging. If Apps Script is terminated between
+steps, the next sync for that tab (under the script lock, before staging is touched)
+first marks leftover `RUNNING` batches of that target as `FAILED`
+("Recovered interrupted raw sync before next attempt."), then restores names:
+
+| target | swap | staging | state | recovery |
+| --- | --- | --- | --- | --- |
+| yes | no | any | NORMAL | none |
+| no | yes | yes | B (after step 1) | swap → target |
+| yes | yes | no | C (after step 2) | target → staging, swap → target (last known good wins) |
+| no | yes | no | D | swap → target |
+| yes | yes | yes | UNKNOWN | nothing changed; batch FAILED; manual inspection |
+| no | no | yes | UNKNOWN | nothing changed; batch FAILED; manual inspection |
+| no | no | no | NO_TARGET | none; sync creates the target |
+
+Recovery never deletes a tab. Non-normal recoveries are logged as
+`<PROVIDER>_RAW_SYNC_RECOVERED` in Audit Log, and `verifyKh001RawSync()` reports
+`swap_state` per source (read-only).
 
 **Checksum.** SHA-256 over a canonical, locale-independent serialization: blank `E`,
 text `S<json>`, number `N<decimal>`, boolean `B1/B0`, Date `D<epoch ms>`, hashed in

@@ -67,17 +67,34 @@ function completeImportBatch_(batch, result) {
   sheet.getRange(batch._row, 1, 1, columns.length).setValues([columns.map(function (c) { return batch[c]; })]);
 }
 
-/** Reads all batch rows as objects keyed by column name. */
+/** Reads all batch rows as objects keyed by column name (plus _row, the sheet row). */
 function readImportBatches_() {
   const sheet = getImportBatchesSheet_();
   const lastRow = sheet.getLastRow();
   if (lastRow < 2) return [];
   const columns = getColumnNames_(SHEETS.IMPORT_BATCHES);
-  return sheet.getRange(2, 1, lastRow - 1, columns.length).getValues().map(function (row) {
-    const obj = {};
-    columns.forEach(function (c, i) { obj[c] = row[i]; });
+  return sheet.getRange(2, 1, lastRow - 1, columns.length).getValues().map(function (row, i) {
+    const obj = { _row: i + 2 };
+    columns.forEach(function (c, j) { obj[c] = row[j]; });
     return obj;
   });
+}
+
+/**
+ * Marks RUNNING batches of one provider + target tab as FAILED.
+ * Must be called while holding the script lock: every raw sync runs under that lock,
+ * so any RUNNING row seen while holding it belongs to an interrupted execution.
+ * @return {Array<string>} recovered batch IDs
+ */
+function failStaleRunningBatches_(providerId, targetSheet, message) {
+  const recovered = [];
+  readImportBatches_().forEach(function (b) {
+    if (b.status !== IMPORT_BATCH_STATUS.RUNNING) return;
+    if (b.provider_id !== providerId || b.target_sheet !== targetSheet) return;
+    completeImportBatch_(b, { status: IMPORT_BATCH_STATUS.FAILED, errorMessage: message });
+    recovered.push(b.import_batch_id);
+  });
+  return recovered;
 }
 
 /**
