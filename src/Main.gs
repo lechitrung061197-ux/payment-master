@@ -110,3 +110,21 @@ function runSingleRawTab_(source, targetSheet) {
   Logger.log(JSON.stringify(summary, null, 2));
   return summary;
 }
+
+/* ---------------------------------------------------------------------------
+ * KH001 Provider Transactions (canonical PAYMENT rows; no fees, holds or matching)
+ * ------------------------------------------------------------------------- */
+
+/** Rebuilds the KH001 partition of Provider Transactions from Master raw tabs. */
+function normalizeKh001ProviderTransactions() {
+  const result = runKh001ProviderTransactionsNormalizer_();
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** Read-only: checks Provider Transactions (KH001) against the current raw snapshot. */
+function verifyKh001ProviderTransactions() {
+  const report = buildKh001ProviderTransactionsReport_();
+  Logger.log(JSON.stringify(report, null, 2));
+  return report;
+}

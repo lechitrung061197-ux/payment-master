@@ -37,8 +37,11 @@ src/
   Utils.gs          Generic helpers
   Settings.gs       Read access to the Settings tab
   ImportBatches.gs  Import Batches rows (one per source-tab sync attempt)
-  RawSnapshot.gs    Pure helpers: canonical serialization, checksum, trim, validation
-  RawSync.gs        Safe raw snapshot sync (staging + verified swap) and verify
+  RawSnapshot.gs    Pure helpers: canonical serialization, checksum, validation, swap-recovery decision
+  SafeSwap.gs       Shared crash-safe staging + rename swap + recovery
+  RawSync.gs        Safe raw snapshot sync and verify
+  CanonicalTable.gs Shared provider-partition replace for canonical tables
+  Kh001ProviderTransactions.gs  KH001 normalizer -> Provider Transactions
   Main.gs           Public entry points
 test/               Node unit tests for pure helpers (npm test, not pushed)
 ```
@@ -90,6 +93,7 @@ from the Apps Script editor. `setupMaster` never deletes tabs or data rows:
 | Raw KH001 Reconciled | Raw mirror of KH001 `DoiSoat_GD` |
 | Raw KH001 Settlements | Raw mirror of KH001 `PhieuDoiSoat` |
 | Raw KH001 Disputes | Raw mirror of KH001 `Dispute` |
+| Provider Transactions | Canonical provider PAYMENT transactions, all providers (one partition per provider) |
 
 Hidden `__STAGE_*` tabs are internal to raw sync and must never be read by business logic.
 
@@ -257,6 +261,37 @@ text `S<json>`, number `N<decimal>`, boolean `B1/B0`, Date `D<epoch ms>`, hashed
 `America/New_York` and KH001 in `America/Los_Angeles`, a source date-time displays
 3 hours later in Master (e.g. 08:00 LA shows as 11:00 NY). The value is unchanged;
 interpretation is left to the future KH001 normalizer (`source.KH001.timezone`).
+
+## Provider Transactions (KH001 normalizer)
+
+Entry points: `normalizeKh001ProviderTransactions()` and read-only
+`verifyKh001ProviderTransactions()`. Reads only Master raw tabs, never the external sheet.
+
+- **Primary source:** `Raw KH001 PayPal`. One row per row whose `Nhóm GD` is exactly
+  `Thanh toán` (NFC-normalized). Status is not filtered (Pending included); `Type` is kept
+  as `raw_type`. Headers are looked up by name (row 1); missing/duplicate required
+  headers fail.
+- **Enrichment only:** `Raw KH001 Reconciled` (header row 6). Exact `Transaction ID` join.
+  `Khớp` → `RECONCILED`, `Lệch số tiền` → `AMOUNT_MISMATCH`, no row → `PROVIDER_ONLY`;
+  any other status on a joined row fails (`Unmapped KH001 reconciliation status`).
+  Reconciled rows without a RAW_PP payment (e.g. `Thiếu trên PayPal`) create nothing.
+- **Amounts:** `processing_fee = ABS(raw Fee)`; every row must satisfy
+  `gross_amount − processing_fee = net_amount` within 0.005.
+- **Keys:** `provider_transaction_id = PT-KH001-PAYPAL-<external_transaction_id>`;
+  `provider_id + payment_source + external_transaction_id` is unique across the table;
+  a duplicate payment Transaction ID fails.
+- **Lineage:** `source_paypal_row`, `source_reconciled_row`,
+  `source_fingerprint = SHA-256(paypal_raw_checksum | reconciled_raw_checksum | KH001_PROVIDER_TX_V1)`,
+  `normalizer_version`, `normalized_at` (set only when the partition is written).
+- **Safe write:** only the KH001 partition is replaced; other providers' rows are kept.
+  The full table is sorted by `provider_id, payment_source, transaction_at,
+  external_transaction_id`, written to a formatted hidden staging tab, verified, then
+  swapped in with the same crash-safe swap/recovery as raw sync. If the table equals the
+  current target (ignoring `normalized_at`) the result is `NO_CHANGE` and nothing is written.
+- **Verify:** generic checks decide `pass` (target matches a fresh in-memory
+  normalization of the current raw tabs, unique keys, amount invariant, swap state).
+  A separate `regression` section compares with the October 2026 snapshot expectations
+  and does not affect `pass`.
 
 ## Tests
 

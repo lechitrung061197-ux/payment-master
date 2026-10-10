@@ -22,7 +22,6 @@
 const RAW_SYNC_LOCK_TIMEOUT_MS = 30000;
 const RAW_WRITE_CHUNK_ROWS = 5000;
 const RAW_TARGET_PROTECTION_DESCRIPTION = 'Raw snapshot (managed by raw sync)';
-const RAW_SWAP_PREFIX = '__SWAP_';
 const RAW_STALE_BATCH_MESSAGE = 'Recovered interrupted raw sync before next attempt.';
 
 /**
@@ -75,7 +74,7 @@ function syncRawTab_(source, tab) {
     });
 
     // Must run before staging is cleared or reused. Throws (-> FAILED) on unknown states.
-    const recovery = recoverRawSwapState_(ss, tab);
+    const recovery = recoverSwapState_(ss, tab);
     if (staleBatchIds.length > 0 || recovery.state !== 'NORMAL') {
       appendAuditLog_({
         action: source.providerId + '_RAW_SYNC_RECOVERED',
@@ -120,7 +119,7 @@ function syncRawTab_(source, tab) {
     assertSnapshotMatches_(readSheetSnapshot_(staging), snapshot, 'Staging "' + tab.stagingSheet + '"');
 
     // 9-10. Swap staging into target and verify; rolls back on mismatch.
-    swapStagingIntoTarget_(ss, staging, tab, snapshot);
+    swapStagingIntoTarget_(ss, staging, tab, snapshot, protectRawTarget_);
 
     // 11. Log success.
     return finishRawTab_(source, tab, batch, IMPORT_BATCH_STATUS.SUCCESS, snapshot, null);
@@ -201,90 +200,6 @@ function readSourceSnapshot_(spreadsheetId, sheetName) {
   };
 }
 
-/**
- * Reads a staging/target tab as a snapshot: its whole sheet grid. Raw sync sizes these
- * tabs exactly to the source used range, so trailing blank cells are part of the grid.
- */
-function readSheetSnapshot_(sheet) {
-  const rows = sheet.getMaxRows();
-  const columns = sheet.getMaxColumns();
-  const values = sheet.getRange(1, 1, rows, columns).getValues();
-  return { rows: rows, columns: columns, checksum: computeRawChecksum_(values) };
-}
-
-function swapSheetName_(tab) {
-  return RAW_SWAP_PREFIX + tab.stagingSheet.slice(STAGING_SHEET_PREFIX.length);
-}
-
-/** Read-only: which of the target / swap / staging tabs exist. */
-function detectRawSwapState_(ss, tab) {
-  return decideRawSwapRecovery_({
-    targetExists: !!ss.getSheetByName(tab.targetSheet),
-    swapExists: !!ss.getSheetByName(swapSheetName_(tab)),
-    stagingExists: !!ss.getSheetByName(tab.stagingSheet),
-  });
-}
-
-/**
- * Restores a valid target/staging layout after a hard-terminated swap, before staging
- * is cleared or reused. Never deletes a tab. Throws on unrecognized states.
- * @return {{state: string, actions: Array<string>}}
- */
-function recoverRawSwapState_(ss, tab) {
-  const decision = detectRawSwapState_(ss, tab);
-  if (decision.error) throw new Error('Raw swap recovery for "' + tab.targetSheet + '": ' + decision.error);
-
-  decision.actions.forEach(function (action) {
-    if (action === 'RENAME_TARGET_TO_STAGING') {
-      // Unconfirmed new snapshot: park it as staging (the next write rebuilds from source).
-      const current = ss.getSheetByName(tab.targetSheet);
-      current.setName(tab.stagingSheet);
-      current.hideSheet();
-    } else if (action === 'RENAME_SWAP_TO_TARGET') {
-      // Last known good snapshot goes back to the target name.
-      const lastKnownGood = ss.getSheetByName(swapSheetName_(tab));
-      lastKnownGood.setName(tab.targetSheet);
-      lastKnownGood.showSheet();
-    }
-  });
-
-  // Normalize visibility (an interruption can leave it inconsistent).
-  const target = ss.getSheetByName(tab.targetSheet);
-  if (target && target.isSheetHidden()) target.showSheet();
-  const staging = ss.getSheetByName(tab.stagingSheet);
-  if (staging && !staging.isSheetHidden()) staging.hideSheet();
-
-  return { state: decision.state, actions: decision.actions };
-}
-
-function assertSnapshotMatches_(actual, expected, label) {
-  if (actual.rows !== expected.rows || actual.columns !== expected.columns || actual.checksum !== expected.checksum) {
-    throw new Error(label + ' verification failed: expected ' + expected.rows + 'x' + expected.columns +
-      ' ' + expected.checksum + ', got ' + actual.rows + 'x' + actual.columns + ' ' + actual.checksum + '.');
-  }
-}
-
-/** Returns an empty, hidden staging tab sized exactly rows x columns. */
-function prepareStagingSheet_(ss, name, rows, columns) {
-  let sheet = ss.getSheetByName(name);
-  if (!sheet) {
-    sheet = ss.insertSheet(name, ss.getNumSheets());
-  }
-  sheet.hideSheet();
-  sheet.clear();
-  sheet.clearNotes();
-
-  const maxRows = sheet.getMaxRows();
-  if (maxRows < rows) sheet.insertRowsAfter(maxRows, rows - maxRows);
-  else if (maxRows > rows) sheet.deleteRows(rows + 1, maxRows - rows);
-
-  const maxColumns = sheet.getMaxColumns();
-  if (maxColumns < columns) sheet.insertColumnsAfter(maxColumns, columns - maxColumns);
-  else if (maxColumns > columns) sheet.deleteColumns(columns + 1, maxColumns - columns);
-
-  return sheet;
-}
-
 /** Batch-writes formats then values in row chunks (formats first so text stays text). */
 function writeSnapshot_(sheet, values, formats) {
   const columns = values[0].length;
@@ -295,52 +210,6 @@ function writeSnapshot_(sheet, values, formats) {
     range.setNumberFormats(numberFormats.slice(start, start + count));
     range.setValues(values.slice(start, start + count));
   }
-}
-
-/**
- * Replaces the target tab with the verified staging tab by renaming.
- * Until the rename succeeds and the new target verifies, the old target is intact;
- * any failure restores the original names.
- */
-function swapStagingIntoTarget_(ss, staging, tab, expected) {
-  const oldTarget = ss.getSheetByName(tab.targetSheet);
-  const swapName = swapSheetName_(tab);
-  const targetIndex = oldTarget ? oldTarget.getIndex() : null;
-
-  function rollback() {
-    if (staging.getName() === tab.targetSheet) {
-      staging.setName(tab.stagingSheet);
-      staging.hideSheet();
-    }
-    if (oldTarget && oldTarget.getName() !== tab.targetSheet) {
-      oldTarget.setName(tab.targetSheet);
-      oldTarget.showSheet();
-    }
-  }
-
-  try {
-    if (oldTarget) oldTarget.setName(swapName);
-    staging.setName(tab.targetSheet);
-    staging.showSheet();
-    if (targetIndex) {
-      ss.setActiveSheet(staging);
-      ss.moveActiveSheet(targetIndex);
-    }
-    SpreadsheetApp.flush();
-    assertSnapshotMatches_(readSheetSnapshot_(staging), expected, 'Target "' + tab.targetSheet + '"');
-  } catch (err) {
-    try { rollback(); } catch (rollbackErr) {
-      throw new Error('Swap failed (' + err.message + ') and rollback failed (' + rollbackErr.message + ').');
-    }
-    throw new Error('Swap failed and was rolled back: ' + err.message);
-  }
-
-  // 12. The previous snapshot becomes the hidden staging tab for the next run.
-  if (oldTarget) {
-    oldTarget.setName(tab.stagingSheet);
-    oldTarget.hideSheet();
-  }
-  protectRawTarget_(staging);
 }
 
 /** Warning-only protection so manual edits to a raw snapshot prompt a confirmation. */
@@ -381,7 +250,7 @@ function verifyRawSource_(source) {
       error: null,
     };
     try {
-      report.swap_state = detectRawSwapState_(ss, tab).state;
+      report.swap_state = detectSwapState_(ss, tab).state;
       const last = findLastSuccessfulBatch_(batches, {
         providerId: source.providerId,
         sourceSpreadsheetId: spreadsheetId,

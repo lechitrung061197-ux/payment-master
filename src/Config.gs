@@ -9,7 +9,7 @@
 
 const APP = Object.freeze({
   NAME: 'Payment Master',
-  SCHEMA_VERSION: 3,
+  SCHEMA_VERSION: 4,
   LOCALE: 'en_US',
   TIMEZONE: 'America/New_York',
   DEFAULT_CURRENCY: 'USD',
@@ -73,6 +73,8 @@ const ENUMS = Object.freeze({
   DISPUTE_STATUS: ['OPEN', 'UNDER_REVIEW', 'WON', 'LOST', 'CLOSED'],
   SETTING_VALUE_TYPE: ['STRING', 'RATE', 'NUMBER', 'BOOLEAN'],
   IMPORT_BATCH_STATUS: ['RUNNING', 'SUCCESS', 'NO_CHANGE', 'FAILED'],
+  // Reconciliation inside the provider's own workbook, not Payment Master matching.
+  PROVIDER_RECONCILIATION_STATUS: ['RECONCILED', 'AMOUNT_MISMATCH', 'PROVIDER_ONLY'],
 });
 
 /** Tab names, in display order. */
@@ -98,6 +100,7 @@ const SHEETS = Object.freeze({
   RAW_KH001_RECONCILED: 'Raw KH001 Reconciled',
   RAW_KH001_SETTLEMENTS: 'Raw KH001 Settlements',
   RAW_KH001_DISPUTES: 'Raw KH001 Disputes',
+  PROVIDER_TRANSACTIONS: 'Provider Transactions',
 });
 
 /** Shorthand column constructor: col_('name', COL_TYPE.X, ENUMS.Y?) */
@@ -435,6 +438,39 @@ const SCHEMA = Object.freeze([
       col_('status', T.ENUM, ENUMS.IMPORT_BATCH_STATUS),
       col_('error_message', T.TEXT),
       col_('actor', T.TEXT),
+    ],
+  },
+  {
+    sheet: SHEETS.PROVIDER_TRANSACTIONS,
+    description: 'Canonical provider PAYMENT transactions, all providers. Unique key: ' +
+      'provider_id + payment_source + external_transaction_id. Each provider partition is ' +
+      'rebuilt by its normalizer from Master raw tabs; other partitions are preserved. ' +
+      'processing_fee is positive; gross_amount - processing_fee = net_amount.',
+    columns: [
+      col_('provider_transaction_id', T.ID),
+      col_('provider_id', T.ID),
+      col_('payment_source', T.ENUM, ENUMS.PAYMENT_SOURCE),
+      col_('gateway_id', T.ID),
+      col_('external_transaction_id', T.ID),
+      col_('transaction_at', T.DATETIME),
+      col_('currency', T.TEXT),
+      col_('gross_amount', T.AMOUNT),
+      col_('processing_fee', T.AMOUNT),
+      col_('net_amount', T.AMOUNT),
+      col_('external_status', T.TEXT),
+      col_('raw_type', T.TEXT),
+      col_('balance_impact', T.TEXT),
+      col_('order_reference', T.TEXT),
+      col_('payer_reference', T.TEXT),
+      col_('provider_sub_account', T.TEXT),
+      col_('provider_reconciliation_status', T.ENUM, ENUMS.PROVIDER_RECONCILIATION_STATUS),
+      col_('provider_reconciliation_raw_status', T.TEXT),
+      col_('reconciliation_difference', T.AMOUNT),
+      col_('source_paypal_row', T.INTEGER),
+      col_('source_reconciled_row', T.INTEGER),
+      col_('source_fingerprint', T.ID),
+      col_('normalizer_version', T.TEXT),
+      col_('normalized_at', T.DATETIME),
     ],
   },
 ]);
