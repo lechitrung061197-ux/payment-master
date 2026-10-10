@@ -1,0 +1,7 @@
+# Push only the manifest and Apps Script sources under src/.
+**/**
+!appsscript.json
+!src/**/*.gs
+!src/**/*.html
+.git/**
+node_modules/**
