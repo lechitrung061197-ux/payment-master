@@ -45,8 +45,9 @@ test('existing Dashboard: known rows get refreshed formula + definition; null-fo
   assert.equal(d.cells['6,2'], '=COUNTIF(INDIRECT("\'Payment Matches\'!G2:G"),"MATCHED")');
   assert.equal(d.cells['6,3'], 'Payment Matches.reconciliation_status = MATCHED');
   assert.equal(d.cells['5,2'], '=COUNTA(INDIRECT("\'Transactions\'!A2:A"))');
-  assert.equal(d.cells['7,2'], 123.45, 'metric without formula keeps its value');
-  assert.equal(d.cells['7,3'], 'Not implemented yet (later phase)', 'but its definition is refreshed');
+  assert.equal(d.cells['7,2'], '=SUMIFS(INDIRECT("\'Seller Balances\'!D2:D"),INDIRECT("\'Seller Balances\'!B2:B"),"USD")',
+    'Available (USD) now has a canonical formula');
+  assert.equal(d.cells['7,3'], 'SUM Seller Balances.available_amount WHERE currency = USD', 'definition refreshed');
   assert.equal(d.cells['8,2'], '=1+1', 'custom row formula untouched');
   assert.equal(d.cells['8,3'], 'custom definition', 'custom row definition untouched');
 });
@@ -57,4 +58,24 @@ test('empty Dashboard: layout written once with current definitions', () => {
   assert.equal(d.cells['4,1'], 'Metric');
   assert.equal(d.cells['6,1'], 'Matched');
   assert.equal(d.cells['6,3'], 'Payment Matches.reconciliation_status = MATCHED');
+});
+
+test('all five financial metrics point to canonical sources with matching definitions', () => {
+  const metrics = Object.fromEntries(H.dashboardMetrics_().map((m) => [m[0], m]));
+  const expect = {
+    'Available (USD)': ["'Seller Balances'!D2:D", 'SUM Seller Balances.available_amount WHERE currency = USD'],
+    'Seller balances (USD)': ["'Seller Balances'!H2:H", 'SUM Seller Balances.current_balance WHERE currency = USD'],
+    'Provider settlements (USD)': ["'Settlements'!Y2:Y", 'SUM Settlements.source_paid_amount WHERE currency = USD'],
+    'Holds (USD)': ["'Seller Balances'!F2:F", 'SUM Seller Balances.seller_hold_balance WHERE currency = USD'],
+  };
+  Object.entries(expect).forEach(([label, [ref, def]]) => {
+    assert.ok(metrics[label][1].includes(ref), label + ' formula uses ' + ref + ': ' + metrics[label][1]);
+    assert.ok(metrics[label][1].includes('"USD"'), label + ' filters USD');
+    assert.equal(metrics[label][2], def);
+  });
+  const margin = metrics['System margin (USD)'];
+  assert.equal(margin[1], '=SUMIFS(INDIRECT("\'Settlement Items\'!Q2:Q"),INDIRECT("\'Settlement Items\'!H2:H"),"USD")-' +
+    'SUMIFS(INDIRECT("\'Settlement Items\'!M2:M"),INDIRECT("\'Settlement Items\'!H2:H"),"USD")');
+  assert.equal(margin[2], 'SUM Settlement Items (seller_fee - provider_fee) WHERE currency = USD');
+  assert.equal(metrics['Waiting settlement'][2], 'Payment Legs.settlement_status = WAITING_SETTLEMENT');
 });

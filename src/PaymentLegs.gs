@@ -13,7 +13,11 @@
  *   OP", provider_hold_amount = "Hold" (actual, authoritative, never from Settings); rates are
  *   derived amount / net (blank when net = 0); net - fee - hold = "Thực nhận" (< 0.005).
  *   "Lần chốt (ngày)" (provider timezone date key) resolves to exactly one KH001 Settlements row
- *   by period_end_date -> settlement_id, settlement_status SETTLED; blank date -> WAITING_SETTLEMENT.
+ *   by period_end_date -> settlement_id; blank date -> WAITING_SETTLEMENT. With a settlement the leg is
+ *   SETTLED, and AVAILABLE only when the provider has fully paid it (Phase 2J): source_payment_date set,
+ *   source_paid_amount >= total_due_amount - 0.005 and outstanding_amount <= 0.005.
+ * - Frozen Settlement Items guard (Phase 2J): a leg that already has a frozen Settlement Item must stay
+ *   AVAILABLE with identical economics; any divergence fails before Payment Legs is written.
  * - Not yet RECONCILED: base values only, provider economics and settlement blank, WAITING_SETTLEMENT.
  * - Per-settlement aggregates of legs must equal the Settlements header (counts, gross, fee, net,
  *   provider fee, provider hold, derived transaction payout).
@@ -31,6 +35,11 @@
  *
  * The first part of this file is pure (unit-tested in Node); the I/O part follows.
  */
+
+/** Leg fields frozen in a Settlement Item; a fresh leg must keep them identical. */
+const FROZEN_LEG_FIELDS = Object.freeze(['settlement_id', 'internal_transaction_id', 'payment_source', 'external_transaction_id',
+  'currency', 'gross_amount', 'processing_fee', 'net_amount', 'provider_fee_rate', 'provider_fee', 'provider_hold_rate',
+  'provider_hold_amount', 'seller_fee_rate', 'seller_fee', 'seller_hold_rate', 'seller_hold_amount', 'seller_available_amount']);
 
 const PAYMENT_LEGS = Object.freeze({
   idPrefix: 'PL-',
@@ -50,7 +59,7 @@ const PAYMENT_LEGS_REGRESSION = Object.freeze({
   payment_source_counts: { PAYPAL: 168 },
   provider_counts: { KH001: 168 },
   settlement_counts: { 'ST-KH001-PAYPAL-000001': 94, 'ST-KH001-PAYPAL-000002': 74 },
-  status_counts: { SETTLED: 168 },
+  status_counts: { AVAILABLE: 168 },
   gross_total: 10627.62,
   processing_fee_total: 420.24,
   net_total: 10207.38,
@@ -86,7 +95,8 @@ function microsDiff_(a, b) {
 
 function emptyLegErrors_() {
   return { duplicate_leg_keys: [], missing_provider_transactions: [], unsupported: [], provider_amount_mismatches: [],
-    provider_economics_errors: [], settlement_resolution_errors: [], settlement_aggregate_errors: [], seller_economics_errors: [] };
+    provider_economics_errors: [], settlement_resolution_errors: [], settlement_aggregate_errors: [], seller_economics_errors: [],
+    frozen_item_conflicts: [] };
 }
 
 function flattenLegErrors_(errors) {
@@ -101,6 +111,7 @@ function flattenLegErrors_(errors) {
  *          transactionDateKeyOf: function(*): string, digestHex?: Function}} input
  *   settlements: stored Settlements rows (objects, all providers); dates are Master date values.
  *   sellerTerms: parsed Seller Terms (parseSellerTerms_().terms).
+ *   frozenItems: existing Settlement Items rows (objects), optional.
  */
 function buildPaymentLegs_(input) {
   const errors = emptyLegErrors_();
@@ -210,7 +221,7 @@ function buildPaymentLegs_(input) {
           return;
         }
         leg.settlement_id = found[0].settlement_id;
-        leg.settlement_status = 'SETTLED';
+        leg.settlement_status = isSettlementProviderPaid_(found[0]) ? 'AVAILABLE' : 'SETTLED';
       }
     }
 
@@ -246,11 +257,38 @@ function buildPaymentLegs_(input) {
   legs.forEach(function (l) { if (ids[l.payment_leg_id]) errors.duplicate_leg_keys.push('payment_leg_id ' + l.payment_leg_id); ids[l.payment_leg_id] = true; });
 
   errors.settlement_aggregate_errors = checkSettlementAggregates_(legs, kh001Settlements);
+  errors.frozen_item_conflicts = checkLegsAgainstFrozenItems_(legs, input.frozenItems || []);
   legs.sort(function (a, b) {
     return compareCanonicalValues_(a.payment_source, b.payment_source) ||
       compareCanonicalValues_(String(a.external_transaction_id), String(b.external_transaction_id));
   });
   return { legs: legs, errors: errors, legSellers: legSellers, stats: { eligible_match_rows: eligible.length } };
+}
+
+/**
+ * Provider-paid rule: payment date present, paid / due / outstanding numeric, paid covers the total
+ * due (within 0.005) and nothing is outstanding (<= 0.005). Membership alone is not availability.
+ */
+function isSettlementProviderPaid_(s) {
+  if (isBlankCell_(s.source_payment_date)) return false;
+  if (!isFiniteNumber_(s.source_paid_amount) || !isFiniteNumber_(s.total_due_amount) || !isFiniteNumber_(s.outstanding_amount)) return false;
+  return Math.round((s.source_paid_amount - s.total_due_amount) * 1e6) >= -5000 && Math.round(s.outstanding_amount * 1e6) <= 5000;
+}
+
+/** Fresh legs must agree with already frozen Settlement Items (same economics, still AVAILABLE). */
+function checkLegsAgainstFrozenItems_(legs, frozenItems) {
+  const errors = [];
+  const byLeg = {};
+  legs.forEach(function (l) { byLeg[l.payment_leg_id] = l; });
+  frozenItems.forEach(function (item) {
+    const leg = byLeg[String(item.payment_leg_id)];
+    const label = 'Settlement Item ' + item.settlement_item_id;
+    if (!leg) { errors.push(label + ': its Payment Leg ' + item.payment_leg_id + ' is no longer produced'); return; }
+    if (leg.settlement_status !== 'AVAILABLE') { errors.push(label + ': Payment Leg would become ' + leg.settlement_status); return; }
+    const changed = FROZEN_LEG_FIELDS.filter(function (f) { return serializeCell_(leg[f]) !== serializeCell_(item[f]); });
+    if (changed.length > 0) errors.push(label + ': fresh Payment Leg differs from the frozen item in ' + changed.join(', '));
+  });
+  return errors;
 }
 
 /** Aggregates legs per settlement_id and compares with the KH001 Settlements headers. */
@@ -431,7 +469,9 @@ function readPaymentLegsInputs_(ss) {
   if (!rcSheet) throw new Error('Raw tab "' + SHEETS.RAW_KH001_RECONCILED + '" not found.');
   const timeZone = String(getRequiredSetting_(readSettingsMap_(), KH001_SETTLEMENTS.timezoneSetting));
   const transactions = readSchemaTableObjects_(ss, SHEETS.TRANSACTIONS, transactionsTab_());
+  const frozen = readSchemaTableObjects_(ss, SHEETS.SETTLEMENT_ITEMS, settlementItemsTab_());
   return buildPaymentLegs_({
+    frozenItems: frozen.rows,
     matches: matches.rows,
     providerTransactions: pt.rows,
     reconciledValues: readSheetGrid_(rcSheet).values,
@@ -442,6 +482,33 @@ function readPaymentLegsInputs_(ss) {
     settlementDateKeyOf: masterDateKey_,
     transactionDateKeyOf: masterDateKey_,
   });
+}
+
+/** Freshness of stored Payment Legs against a fresh build, ignoring only updated_at. */
+function checkPaymentLegsFresh_(built, storedValues, columns) {
+  const updatedIdx = [columns.indexOf('updated_at')];
+  const stored = tableChecksumExcluding_(storedValues, updatedIdx);
+  const problems = flattenLegErrors_(built.errors).length;
+  if (problems > 0) {
+    return { current: false, expected_checksum: null, stored_checksum: stored,
+      reason: 'Payment Legs is stale; run normalizePaymentLegs first (Payment Legs input has ' + problems + ' error(s)).' };
+  }
+  const expected = tableChecksumExcluding_(buildTableValues_(columns, built.legs.map(function (o) { return objectToRow_(o, columns); })), updatedIdx);
+  const current = expected === stored;
+  return { current: current, expected_checksum: expected, stored_checksum: stored,
+    reason: current ? null : 'Payment Legs is stale; run normalizePaymentLegs first.' };
+}
+
+/** Read-only freshness of Payment Legs (rebuild from current inputs). Never throws. */
+function readPaymentLegsFreshness_(ss) {
+  try {
+    const built = readPaymentLegsInputs_(ss);
+    const stored = readSchemaTableObjects_(ss, SHEETS.PAYMENT_LEGS, paymentLegsTab_());
+    return checkPaymentLegsFresh_(built, stored.grid.values, getColumnNames_(SHEETS.PAYMENT_LEGS));
+  } catch (err) {
+    return { current: false, expected_checksum: null, stored_checksum: null,
+      reason: 'Payment Legs is stale; run normalizePaymentLegs first (' + (err && err.message ? err.message : String(err)) + ').' };
+  }
 }
 
 function throwIfLegErrors_(label, list) {
@@ -524,7 +591,7 @@ function buildPaymentLegsReport_() {
     settlement_aggregate_errors: [], disappearing_payment_legs: [], transactions_current: false,
     provider_transactions_current: false, payment_matches_current: false, settlements_current: false, seller_terms_valid: false,
     seller_economics_errors: [], seller_fee_total: 0, seller_hold_total: 0, seller_available_total: 0, system_margin_total: 0,
-    seller_hold_mismatches: [], seller_available_equation_errors: [], by_seller: {},
+    seller_hold_mismatches: [], seller_available_equation_errors: [], by_seller: {}, frozen_item_conflicts: [],
     payment_legs_match: false, swap_state: null, pass: false, errors: [], warnings: [], regression: null,
   };
   try {
@@ -548,6 +615,7 @@ function buildPaymentLegsReport_() {
     report.settlement_resolution_errors = built.errors.settlement_resolution_errors;
     report.settlement_aggregate_errors = built.errors.settlement_aggregate_errors;
     report.seller_economics_errors = built.errors.seller_economics_errors;
+    report.frozen_item_conflicts = built.errors.frozen_item_conflicts;
     if (flattenLegErrors_(built.errors).length > 0) report.errors.push('Payment Legs input has ' + flattenLegErrors_(built.errors).length + ' error(s).');
 
     const summary = summarizePaymentLegs_(built.legs, built.legSellers);
@@ -560,9 +628,7 @@ function buildPaymentLegsReport_() {
     const current = readSchemaTableObjects_(ss, SHEETS.PAYMENT_LEGS, tab);
     report.disappearing_payment_legs = mergePaymentLegTimestamps_(built.legs, current.rows, null, columns).errors;
     if (report.disappearing_payment_legs.length > 0) report.errors.push('Existing Payment Legs are no longer produced.');
-    const updatedIdx = [columns.indexOf('updated_at')];
-    report.payment_legs_match = tableChecksumExcluding_(buildTableValues_(columns,
-      built.legs.map(function (o) { return objectToRow_(o, columns); })), updatedIdx) === tableChecksumExcluding_(current.grid.values, updatedIdx);
+    report.payment_legs_match = checkPaymentLegsFresh_(built, current.grid.values, columns).current;
     if (!report.payment_legs_match) report.errors.push('Payment Legs is stale (run normalizePaymentLegs).');
     if (summary.waiting_settlement_rows > 0) report.warnings.push(summary.waiting_settlement_rows + ' leg(s) waiting for provider settlement.');
     report.regression = evaluatePaymentLegsRegression_(summary);

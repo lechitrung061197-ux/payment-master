@@ -279,3 +279,35 @@ function verifySellerTerms() {
   Logger.log(JSON.stringify(report, null, 2));
   return report;
 }
+
+/* ---------------------------------------------------------------------------
+ * Settlement Items (frozen accounting) and Seller Balances (derived)
+ * ------------------------------------------------------------------------- */
+
+/** Freezes Settlement Items for new AVAILABLE Payment Legs (existing items never change). */
+function normalizeSettlementItems() {
+  const result = runSettlementItemsNormalizer_();
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** Read-only: checks Settlement Items against Payment Legs and its frozen-history rules. */
+function verifySettlementItems() {
+  const report = buildSettlementItemsReport_();
+  Logger.log(JSON.stringify(report, null, 2));
+  return report;
+}
+
+/** Rebuilds Seller Balances from Settlement Items, APPLIED Adjustments and SENT/CONFIRMED payouts. */
+function normalizeSellerBalances() {
+  const result = runSellerBalancesNormalizer_();
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** Read-only: checks Seller Balances against its sources. */
+function verifySellerBalances() {
+  const report = buildSellerBalancesReport_();
+  Logger.log(JSON.stringify(report, null, 2));
+  return report;
+}

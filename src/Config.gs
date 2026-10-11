@@ -9,7 +9,7 @@
 
 const APP = Object.freeze({
   NAME: 'Payment Master',
-  SCHEMA_VERSION: 11,
+  SCHEMA_VERSION: 12,
   LOCALE: 'en_US',
   TIMEZONE: 'America/New_York',
   DEFAULT_CURRENCY: 'USD',
@@ -441,9 +441,10 @@ const SCHEMA = Object.freeze([
   },
   {
     sheet: SHEETS.SETTLEMENT_ITEMS,
-    description: 'Frozen snapshot of each payment leg included in a settlement. ' +
-      'Self-contained: does not depend on live source sheets. A payment_leg_id appears in at most ' +
-      'one non-VOID settlement. seller_available_amount = net_amount - seller_fee - seller_hold_amount.',
+    description: 'Immutable frozen accounting snapshot: one item per AVAILABLE Payment Leg (provider-paid settlement), ' +
+      'settlement_item_id = SI-<sha256(settlement_id|payment_leg_id)>. Written only by normalizeSettlementItems; ' +
+      'existing items are never changed or removed and snapshot_at never changes. seller_hold_amount = ' +
+      'provider_hold_amount; seller_available_amount = net_amount - seller_fee - seller_hold_amount.',
     columns: [
       col_('settlement_item_id', T.ID),
       col_('settlement_id', T.ID),
@@ -453,35 +454,36 @@ const SCHEMA = Object.freeze([
       col_('payment_source', T.ENUM, ENUMS.PAYMENT_SOURCE),
       col_('external_transaction_id', T.ID),
       col_('currency', T.TEXT),
-      col_('gross_amount', T.USD),
-      col_('processing_fee', T.USD),
-      col_('net_amount', T.USD),
+      col_('gross_amount', T.AMOUNT),
+      col_('processing_fee', T.AMOUNT),
+      col_('net_amount', T.AMOUNT),
       col_('provider_fee_rate', T.RATE),
-      col_('provider_fee', T.USD),
+      col_('provider_fee', T.AMOUNT4),
       col_('provider_hold_rate', T.RATE),
-      col_('provider_hold_amount', T.USD),
+      col_('provider_hold_amount', T.AMOUNT4),
       col_('seller_fee_rate', T.RATE),
-      col_('seller_fee', T.USD),
+      col_('seller_fee', T.AMOUNT4),
       col_('seller_hold_rate', T.RATE),
-      col_('seller_hold_amount', T.USD),
-      col_('seller_available_amount', T.USD),
+      col_('seller_hold_amount', T.AMOUNT4),
+      col_('seller_available_amount', T.AMOUNT4),
       col_('snapshot_at', T.DATETIME),
     ],
   },
   {
     sheet: SHEETS.SELLER_BALANCES,
-    description: 'Per-seller, per-currency balance aggregated across all providers (future). ' +
-      'current_balance = SUM(Settlement Items.seller_available_amount) + SUM(APPLIED Adjustments.amount) ' +
-      '- SUM(SENT/CONFIRMED Seller Payouts.amount).',
+    description: 'Derived per seller + currency (written only by normalizeSellerBalances). settled_amount = ' +
+      'SUM(Settlement Items.seller_available_amount); adjustments = SUM(APPLIED Adjustments.amount); paid_amount = ' +
+      'SUM(SENT/CONFIRMED Seller Payouts.amount); current_balance = available_amount = settled + adjustments - paid ' +
+      '(may be negative); seller_hold_balance = SUM(Settlement Items.seller_hold_amount) - SUM(APPLIED HOLD_RELEASE).',
     columns: [
       col_('seller_id', T.ID),
       col_('currency', T.TEXT),
-      col_('settled_amount', T.USD),
-      col_('available_amount', T.USD),
-      col_('paid_amount', T.USD),
-      col_('seller_hold_balance', T.USD),
-      col_('adjustments', T.USD),
-      col_('current_balance', T.USD),
+      col_('settled_amount', T.AMOUNT4),
+      col_('available_amount', T.AMOUNT4),
+      col_('paid_amount', T.AMOUNT4),
+      col_('seller_hold_balance', T.AMOUNT4),
+      col_('adjustments', T.AMOUNT4),
+      col_('current_balance', T.AMOUNT4),
       col_('updated_at', T.DATETIME),
     ],
   },

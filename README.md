@@ -579,7 +579,8 @@ payouts are later phases.
   settlement blank, `WAITING_SETTLEMENT` (no estimated hold).
 - **Settlement membership**: `Lần chốt (ngày)` (provider-timezone date key) resolves to exactly
   one KH001 Settlements row by `period_end_date` → `settlement_id`, `settlement_status = SETTLED`;
-  blank → `WAITING_SETTLEMENT`; zero or several settlements → fail. `AVAILABLE` is never set here.
+  blank → `WAITING_SETTLEMENT`; zero or several settlements → fail. Since Phase 2J a leg whose
+  settlement the provider has fully paid becomes `AVAILABLE` (see below).
 - **Settlement aggregates**: per settlement, leg count and sums of gross / processing fee / net
   (< 0.005) and provider fee / hold / derived transaction payout (< 0.00005) must equal the
   Settlements header. A settled provider payment without a confirmed match therefore fails.
@@ -612,6 +613,46 @@ payouts are later phases.
   seller hold and available stay blank. `system_margin = seller_fee − provider_fee` is reported.
 - `normalizePaymentLegs()` additionally requires valid Seller Terms; `verifyPaymentLegs()` reports
   `seller_terms_valid`, seller totals, per-seller totals and seller-economics invariant errors.
+
+## Provider-paid availability, Settlement Items and Seller Balances (Phase 2J)
+
+Operating order: `syncKh001Raw` → `normalizeKh001ProviderTransactions` →
+`normalizeKh001Settlements` → `normalizeInternalTransactions` → `reconcilePayments` →
+`normalizePaymentLegs` → `normalizeSettlementItems` → `normalizeSellerBalances`. Each step fails
+without writing while any upstream step is stale.
+
+- **AVAILABLE** (Payment Legs): settlement membership alone gives `SETTLED`. A leg becomes
+  `AVAILABLE` only when its settlement has a `source_payment_date`, `source_paid_amount ≥
+  total_due_amount − 0.005` and `outstanding_amount ≤ 0.005` (provider paid in full). Blank
+  payment date, partial payment or any outstanding amount keeps the leg `SETTLED`.
+- **Settlement Items** (`normalizeSettlementItems()` / read-only `verifySettlementItems()`): one
+  item per AVAILABLE leg, `settlement_item_id = SI-<sha256(settlement_id|payment_leg_id)>`;
+  `seller_id` comes from the leg's exact internal Transaction (must be MAPPED). Items are
+  **frozen**: an existing item is kept byte-for-byte (`snapshot_at` set once, on creation); an
+  item whose fresh leg would differ in any frozen field, is no longer AVAILABLE, or disappears is a
+  hard error, as are duplicate item ids or payment legs. Per item `seller_hold = provider_hold`
+  and `seller_available = net − seller_fee − seller_hold`; in total
+  `provider transaction payout = seller available + system margin`.
+- **Frozen guard in Payment Legs**: `normalizePaymentLegs()` also fails (no write) when a fresh
+  leg diverges from its frozen item — e.g. a retroactive Seller Terms rate change or a settlement
+  that stops being paid. Fee changes must be future-dated (close the old row, add a new one).
+- **Seller Balances** (`normalizeSellerBalances()` / read-only `verifySellerBalances()`): derived
+  per `seller_id + currency`, computed in micro-units:
+  `settled_amount = SUM(items.seller_available_amount)`;
+  `adjustments = SUM(Adjustments.amount WHERE status = APPLIED)` (PENDING / VOID ignored);
+  `paid_amount = SUM(Seller Payouts.amount WHERE status IN (SENT, CONFIRMED))` (DRAFT / VOID
+  ignored); `current_balance = available_amount = settled + adjustments − paid` (negative allowed
+  and reported as a warning, never clamped); `seller_hold_balance = SUM(items.seller_hold_amount)
+  − SUM(APPLIED HOLD_RELEASE)`. HOLD_RELEASE amounts must be positive and may not drive the hold
+  below zero; payout amounts must be positive; duplicate ids, unknown sellers, blank currency or
+  non-numeric amounts fail. `updated_at` is preserved while a row is unchanged; a balance key that
+  disappears fails. Gate: Settlement Items must be current.
+- **Dashboard** (USD): Available and Seller balances = Seller Balances `available_amount` /
+  `current_balance`; Provider settlements = Settlements `source_paid_amount`; System margin =
+  Settlement Items `seller_fee − provider_fee`; Holds = Seller Balances `seller_hold_balance`.
+- Schema v12 changes only column types/descriptions of Settlement Items and Seller Balances
+  (`AMOUNT4` for unrounded economics); `setupMaster` on a v10 Master adds Seller Terms (seeded
+  once) and leaves every data tab untouched.
 
 ## Tests
 

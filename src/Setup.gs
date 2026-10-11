@@ -203,7 +203,7 @@ function ensureRawTargetTabs_(ss) {
 }
 
 /**
- * Dashboard metric rows: [label, formula builder or null, definition].
+ * Dashboard metric rows: [label, formula or null, definition, number format (default integer)].
  * Formulas reference tabs by NAME through INDIRECT, so they keep working when a tab is
  * replaced by a crash-safe swap (a direct reference would follow the old sheet object).
  */
@@ -212,18 +212,25 @@ function dashboardMetrics_() {
     return 'INDIRECT("' + dataColumnRef_(sheetName, columnName).replace(/"/g, '""') + '")';
   };
   const disputeStatus = col(SHEETS.DISPUTES, 'dispute_status');
-  const notYet = 'Not implemented yet (later phase)';
+  const usdSum = function (sheetName, columnName) {
+    return '=SUMIFS(' + col(sheetName, columnName) + ',' + col(sheetName, 'currency') + ',"USD")';
+  };
   return [
     ['Total transactions', '=COUNTA(' + col(SHEETS.TRANSACTIONS, 'internal_transaction_id') + ')', 'Count of Transactions rows'],
     ['Matched', '=COUNTIF(' + col(SHEETS.PAYMENT_MATCHES, 'reconciliation_status') + ',"MATCHED")',
       'Payment Matches.reconciliation_status = MATCHED'],
     ['Waiting settlement', '=COUNTIF(' + col(SHEETS.PAYMENT_LEGS, 'settlement_status') + ',"WAITING_SETTLEMENT")',
       'Payment Legs.settlement_status = WAITING_SETTLEMENT'],
-    ['Available (USD)', null, notYet],
-    ['Seller balances (USD)', null, notYet],
-    ['Provider settlements (USD)', null, notYet],
-    ['System margin (USD)', null, notYet],
-    ['Holds (USD)', null, notYet],
+    ['Available (USD)', usdSum(SHEETS.SELLER_BALANCES, 'available_amount'),
+      'SUM Seller Balances.available_amount WHERE currency = USD', FORMATS.USD],
+    ['Seller balances (USD)', usdSum(SHEETS.SELLER_BALANCES, 'current_balance'),
+      'SUM Seller Balances.current_balance WHERE currency = USD', FORMATS.USD],
+    ['Provider settlements (USD)', usdSum(SHEETS.SETTLEMENTS, 'source_paid_amount'),
+      'SUM Settlements.source_paid_amount WHERE currency = USD', FORMATS.USD],
+    ['System margin (USD)', usdSum(SHEETS.SETTLEMENT_ITEMS, 'seller_fee') + '-' + usdSum(SHEETS.SETTLEMENT_ITEMS, 'provider_fee').slice(1),
+      'SUM Settlement Items (seller_fee - provider_fee) WHERE currency = USD', FORMATS.USD],
+    ['Holds (USD)', usdSum(SHEETS.SELLER_BALANCES, 'seller_hold_balance'),
+      'SUM Seller Balances.seller_hold_balance WHERE currency = USD', FORMATS.USD],
     ['Open disputes', '=COUNTIF(' + disputeStatus + ',"OPEN")+COUNTIF(' + disputeStatus + ',"UNDER_REVIEW")',
       'Disputes.dispute_status in OPEN, UNDER_REVIEW'],
   ];
@@ -260,7 +267,7 @@ function ensureDashboard_(ss) {
   metrics.forEach(function (m) {
     const i = labels.indexOf(m[0]);
     if (i < 0) return; // unknown / custom rows are never touched
-    if (m[1]) sheet.getRange(5 + i, 2).setFormula(m[1]).setNumberFormat(FORMATS.INTEGER);
+    if (m[1]) sheet.getRange(5 + i, 2).setFormula(m[1]).setNumberFormat(m[3] || FORMATS.INTEGER);
     sheet.getRange(5 + i, 3).setValue(m[2]);
   });
 }
