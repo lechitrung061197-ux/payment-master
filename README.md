@@ -45,7 +45,9 @@ src/
   Kh001ProviderEvents.gs        KH001 normalizer -> Provider Events
   Kh001Settlements.gs           KH001 normalizer -> Settlements (headers)
   SellerMapping.gs              Sellers draft -> effective-dated Endpoint Mapping history
-  EndpointKeyMigration.gs       One-time guarded correction: credential keys -> endpoint tokens
+  EndpointKeyMigration.gs       One-time guarded correction: credential keys -> endpoint tokens;
+                                also hosts the credential guard/redaction helpers (keep this file)
+  SecurityRedaction.gs          Audit Log credential redaction + exposure check
   Main.gs           Public entry points
 test/               Node unit tests for pure helpers (npm test, not pushed)
 ```
@@ -462,6 +464,13 @@ Entry points: `publishSellerMapping()` and read-only `verifySellerMapping()`.
   result is re-read and validated. It is idempotent (fully migrated → `NO_CHANGE`) and
   converges from a partially migrated state. Once any dependent table has data it is refused.
   The legacy parser is for this migration only.
+- **Security redaction:** `redactAuditLogCredentials()` is a controlled exception to the
+  append-only Audit Log: it replaces credential substrings in existing cells with
+  `<token>.<redacted>` (nothing else changes) and appends a `SECURITY_REDACTION` entry listing
+  the cleaned rows, never the removed values. Read-only `verifyCredentialExposure()` counts rows
+  that still hold credentials in Audit Log, Sellers and Endpoint Mapping. Rotating the exposed
+  credentials is the real remediation; spreadsheet version history and old execution logs
+  cannot be guaranteed clean.
 
 ## Tests
 

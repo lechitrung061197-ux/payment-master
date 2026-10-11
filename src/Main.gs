@@ -200,3 +200,17 @@ function verifySellerEndpointKeys() {
   Logger.log(JSON.stringify(report, null, 2));
   return report;
 }
+
+/** Security exception: redacts endpoint credentials in existing Audit Log cells (logs SECURITY_REDACTION). */
+function redactAuditLogCredentials() {
+  const result = runAuditLogCredentialRedaction_();
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** Read-only: counts rows still holding credential-like values in Audit Log, Sellers, Endpoint Mapping. */
+function verifyCredentialExposure() {
+  const report = buildCredentialExposureReport_();
+  Logger.log(JSON.stringify(report, null, 2));
+  return report;
+}
