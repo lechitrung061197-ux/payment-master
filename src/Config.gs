@@ -9,7 +9,7 @@
 
 const APP = Object.freeze({
   NAME: 'Payment Master',
-  SCHEMA_VERSION: 7,
+  SCHEMA_VERSION: 8,
   LOCALE: 'en_US',
   TIMEZONE: 'America/New_York',
   DEFAULT_CURRENCY: 'USD',
@@ -84,6 +84,8 @@ const ENUMS = Object.freeze({
   SELLER_STATUS: ['ACTIVE', 'INACTIVE'],
   // OPEN = open-ended interval (effective_to blank; may start in the future); CLOSED = bounded.
   ENDPOINT_MAPPING_STATUS: ['OPEN', 'CLOSED'],
+  // Ownership of an internal transaction on its created date (Endpoint Mapping, exact token).
+  OWNERSHIP_STATUS: ['MAPPED', 'UNASSIGNED_ENDPOINT'],
 });
 
 /** Number of endpoint_<N>_name / endpoint_<N>_key pairs in Sellers (schema-only to extend). */
@@ -94,6 +96,7 @@ const SHEETS = Object.freeze({
   SETTINGS: 'Settings',
   SELLERS: 'Sellers',
   ENDPOINT_MAPPING: 'Endpoint Mapping',
+  RAW_INTERNAL_TRANSACTIONS: 'Raw Internal Transactions',
   SOURCE_SYSTEM: 'Source System',
   SOURCE_PAYMENTS: 'Source Payments',
   TRANSACTIONS: 'Transactions',
@@ -187,18 +190,62 @@ const SCHEMA = Object.freeze([
     ],
   },
   {
+    sheet: SHEETS.RAW_INTERNAL_TRANSACTIONS,
+    description: 'Append-only evidence of internal transaction CSV exports. The first 16 columns are the CSV ' +
+      'fields exactly as exported (text, never normalized); the last 5 are ingestion metadata. ' +
+      'row_fingerprint = SHA-256 of the 16 raw fields (see README). The same transaction_id may appear in ' +
+      'several batches (re-exports). Written only by the import step; normalizers never modify it.',
+    columns: [
+      col_('order_id', T.TEXT),
+      col_('payment_method', T.TEXT),
+      col_('transaction_id', T.TEXT),
+      col_('gateway', T.TEXT),
+      col_('status', T.TEXT),
+      col_('total', T.TEXT),
+      col_('currency', T.TEXT),
+      col_('sub_account', T.TEXT),
+      col_('store_domain', T.TEXT),
+      col_('shield_domain', T.TEXT),
+      col_('endpoint_token', T.TEXT),
+      col_('created_at', T.TEXT),
+      col_('refunded_at', T.TEXT),
+      col_('customer', T.TEXT),
+      col_('settled_at', T.TEXT),
+      col_('note', T.TEXT),
+      col_('import_batch_id', T.ID),
+      col_('source_file_name', T.TEXT),
+      col_('source_row_number', T.INTEGER),
+      col_('row_fingerprint', T.ID),
+      col_('imported_at', T.DATETIME),
+    ],
+  },
+  {
     sheet: SHEETS.SOURCE_SYSTEM,
-    description: 'Raw internal-system transactions as imported. Never edited after import.',
+    description: 'Latest canonical snapshot of each internal transaction, rebuilt from Raw Internal ' +
+      'Transactions (latest imported snapshot wins). source_record_id = ISRC-<sha256(payment_source|' +
+      'internal_transaction_id)>. settled_at_raw / refunded_at are internal raw information only.',
     columns: [
       col_('source_record_id', T.ID),
+      col_('internal_transaction_id', T.ID),
+      col_('payment_source', T.ENUM, ENUMS.PAYMENT_SOURCE),
+      col_('gateway', T.TEXT),
       col_('created_at', T.DATETIME),
       col_('endpoint_token', T.ID),
-      col_('store', T.TEXT),
+      col_('sub_account', T.TEXT),
+      col_('store_domain', T.TEXT),
+      col_('shield_domain', T.TEXT),
       col_('order_id', T.ID),
-      col_('order_amount', T.USD),
+      col_('payment_method', T.TEXT),
+      col_('order_amount', T.AMOUNT),
       col_('currency', T.TEXT),
       col_('raw_status', T.TEXT),
+      col_('refunded_at', T.TEXT),
+      col_('customer', T.TEXT),
+      col_('settled_at_raw', T.TEXT),
+      col_('note', T.TEXT),
+      col_('row_fingerprint', T.ID),
       col_('import_batch_id', T.ID),
+      col_('source_file_name', T.TEXT),
       col_('imported_at', T.DATETIME),
     ],
   },
@@ -228,19 +275,36 @@ const SCHEMA = Object.freeze([
   },
   {
     sheet: SHEETS.TRANSACTIONS,
-    description: 'Internal transactions (source of truth for ownership: endpoint, seller, store, order). ' +
-      'status is a derived summary of its payment legs and is never used to calculate money.',
+    description: 'Canonical internal transactions with ownership resolved on the created date ' +
+      '(America/New_York) by exact endpoint_token = Endpoint Mapping.endpoint_key. UNASSIGNED_ENDPOINT ' +
+      'rows exist but are not seller money. status is a derived summary (UNMATCHED until provider ' +
+      'matching) and is never used to calculate money.',
     columns: [
       col_('internal_transaction_id', T.ID),
       col_('created_at', T.DATETIME),
+      col_('payment_source', T.ENUM, ENUMS.PAYMENT_SOURCE),
       col_('endpoint_token', T.ID),
+      col_('mapping_id', T.ID),
+      col_('mapping_version', T.ID),
       col_('seller_id', T.ID),
-      col_('seller_group', T.TEXT),
-      col_('store', T.TEXT),
+      col_('seller_name_snapshot', T.TEXT),
+      col_('endpoint_name_snapshot', T.TEXT),
+      col_('store_domain', T.TEXT),
+      col_('shield_domain', T.TEXT),
+      col_('sub_account', T.TEXT),
       col_('order_id', T.ID),
-      col_('order_amount', T.USD),
+      col_('payment_method', T.TEXT),
+      col_('order_amount', T.AMOUNT),
       col_('currency', T.TEXT),
+      col_('customer', T.TEXT),
+      col_('raw_status', T.TEXT),
+      col_('refunded_at_raw', T.TEXT),
+      col_('settled_at_raw', T.TEXT),
+      col_('ownership_status', T.ENUM, ENUMS.OWNERSHIP_STATUS),
       col_('status', T.ENUM, ENUMS.TRANSACTION_STATUS),
+      col_('source_record_id', T.ID),
+      col_('source_row_fingerprint', T.ID),
+      col_('import_batch_id', T.ID),
       col_('updated_at', T.DATETIME),
     ],
   },
@@ -609,6 +673,9 @@ const DEFAULT_SETTINGS = Object.freeze([
   ['source.KH001.reconciled_sheet', 'DoiSoat_GD', 'STRING', 'KH001 source tab mirrored to Raw KH001 Reconciled.'],
   ['source.KH001.settlements_sheet', 'PhieuDoiSoat', 'STRING', 'KH001 source tab mirrored to Raw KH001 Settlements.'],
   ['source.KH001.disputes_sheet', 'Dispute', 'STRING', 'KH001 source tab mirrored to Raw KH001 Disputes.'],
+  ['source.INTERNAL.naive_timestamp_timezone', '', 'STRING',
+    'Timezone for internal CSV timestamps without an offset (e.g. "2026-10-01 12:00:00"). Blank = such ' +
+    'timestamps are rejected. Timestamps with Z or an offset never use it.'],
 ]);
 
 /** Settings keys whose value is always kept in sync with code. */

@@ -195,50 +195,63 @@ function ensureRawTargetTabs_(ss) {
 }
 
 /**
- * Dashboard skeleton. Written only when the tab is empty so later manual or
- * scripted changes are never overwritten.
+ * Dashboard metric rows: [label, formula builder or null, definition].
+ * Formulas reference tabs by NAME through INDIRECT, so they keep working when a tab is
+ * replaced by a crash-safe swap (a direct reference would follow the old sheet object).
  */
-function ensureDashboard_(ss) {
-  const sheet = ss.getSheetByName(SHEETS.DASHBOARD) || ss.insertSheet(SHEETS.DASHBOARD);
-  if (sheet.getLastRow() > 0) return;
-
-  const txStatus = dataColumnRef_(SHEETS.TRANSACTIONS, 'status');
-  const txId = dataColumnRef_(SHEETS.TRANSACTIONS, 'internal_transaction_id');
-  const disputeStatus = dataColumnRef_(SHEETS.DISPUTES, 'dispute_status');
+function dashboardMetrics_() {
+  const col = function (sheetName, columnName) {
+    return 'INDIRECT("' + dataColumnRef_(sheetName, columnName).replace(/"/g, '""') + '")';
+  };
+  const txStatus = col(SHEETS.TRANSACTIONS, 'status');
+  const disputeStatus = col(SHEETS.DISPUTES, 'dispute_status');
   const notYet = 'Not implemented yet (later phase)';
-
-  const rows = [
-    ['Total transactions', '=COUNTA(' + txId + ')', 'Count of Transactions rows'],
+  return [
+    ['Total transactions', '=COUNTA(' + col(SHEETS.TRANSACTIONS, 'internal_transaction_id') + ')', 'Count of Transactions rows'],
     ['Matched', '=COUNTIF(' + txStatus + ',"MATCHED")', 'Transactions.status = MATCHED'],
     ['Waiting settlement', '=COUNTIF(' + txStatus + ',"WAITING_SETTLEMENT")', 'Transactions.status = WAITING_SETTLEMENT'],
-    ['Available (USD)', '', notYet],
-    ['Seller balances (USD)', '', notYet],
-    ['Provider settlements (USD)', '', notYet],
-    ['System margin (USD)', '', notYet],
-    ['Holds (USD)', '', notYet],
+    ['Available (USD)', null, notYet],
+    ['Seller balances (USD)', null, notYet],
+    ['Provider settlements (USD)', null, notYet],
+    ['System margin (USD)', null, notYet],
+    ['Holds (USD)', null, notYet],
     ['Open disputes', '=COUNTIF(' + disputeStatus + ',"OPEN")+COUNTIF(' + disputeStatus + ',"UNDER_REVIEW")',
       'Disputes.dispute_status in OPEN, UNDER_REVIEW'],
   ];
+}
 
-  sheet.getRange('A1').setValue(APP.NAME + ' Dashboard').setFontWeight('bold').setFontSize(14);
-  sheet.getRange('A2').setValue('Skeleton only. Financial metrics are added in a later phase.')
-    .setFontColor('#666666');
+/**
+ * Dashboard skeleton. The layout is written only when the tab is empty; the formulas of the
+ * known metric rows (matched by label in column A) are refreshed on every setup so they track
+ * schema changes.
+ */
+function ensureDashboard_(ss) {
+  const sheet = ss.getSheetByName(SHEETS.DASHBOARD) || ss.insertSheet(SHEETS.DASHBOARD);
+  const metrics = dashboardMetrics_();
 
-  sheet.getRange(4, 1, 1, 3).setValues([['Metric', 'Value', 'Definition']])
-    .setFontWeight('bold')
-    .setBackground(HEADER_BACKGROUND)
-    .setBorder(null, null, true, null, null, null);
+  if (sheet.getLastRow() === 0) {
+    sheet.getRange('A1').setValue(APP.NAME + ' Dashboard').setFontWeight('bold').setFontSize(14);
+    sheet.getRange('A2').setValue('Skeleton only. Financial metrics are added in a later phase.')
+      .setFontColor('#666666');
+    sheet.getRange(4, 1, 1, 3).setValues([['Metric', 'Value', 'Definition']])
+      .setFontWeight('bold')
+      .setBackground(HEADER_BACKGROUND)
+      .setBorder(null, null, true, null, null, null);
+    sheet.getRange(5, 1, metrics.length, 3).setValues(metrics.map(function (m) { return [m[0], '', m[2]]; }));
+    sheet.getRange(5, 3, metrics.length, 1).setFontColor('#666666');
+    sheet.setColumnWidth(1, 220);
+    sheet.setColumnWidth(2, 140);
+    sheet.setColumnWidth(3, 320);
+  }
 
-  const body = sheet.getRange(5, 1, rows.length, 3);
-  body.setValues(rows.map(function (r) { return [r[0], '', r[2]]; }));
-  rows.forEach(function (r, i) {
-    if (r[1]) sheet.getRange(5 + i, 2).setFormula(r[1]).setNumberFormat(FORMATS.INTEGER);
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 5) return;
+  const labels = sheet.getRange(5, 1, lastRow - 4, 1).getValues().map(function (r) { return String(r[0]); });
+  metrics.forEach(function (m) {
+    const i = labels.indexOf(m[0]);
+    if (i < 0 || !m[1]) return;
+    sheet.getRange(5 + i, 2).setFormula(m[1]).setNumberFormat(FORMATS.INTEGER);
   });
-  sheet.getRange(5, 3, rows.length, 1).setFontColor('#666666');
-
-  sheet.setColumnWidth(1, 220);
-  sheet.setColumnWidth(2, 140);
-  sheet.setColumnWidth(3, 320);
 }
 
 function orderSheets_(ss) {

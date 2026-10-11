@@ -214,3 +214,21 @@ function verifyCredentialExposure() {
   Logger.log(JSON.stringify(report, null, 2));
   return report;
 }
+
+/* ---------------------------------------------------------------------------
+ * Internal transactions (raw CSV evidence -> Source System -> Transactions)
+ * ------------------------------------------------------------------------- */
+
+/** Rebuilds Source System and Transactions from Raw Internal Transactions. */
+function normalizeInternalTransactions() {
+  const result = runInternalNormalizer_();
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** Read-only: checks raw contract, snapshot selection, ownership and both canonical tables. */
+function verifyInternalTransactions() {
+  const report = buildInternalTransactionsReport_();
+  Logger.log(JSON.stringify(report, null, 2));
+  return report;
+}

@@ -48,6 +48,7 @@ src/
   EndpointKeyMigration.gs       One-time guarded correction: credential keys -> endpoint tokens;
                                 also hosts the credential guard/redaction helpers (keep this file)
   SecurityRedaction.gs          Audit Log credential redaction + exposure check
+  InternalTransactions.gs       Raw Internal Transactions -> Source System -> Transactions
   Main.gs           Public entry points
 test/               Node unit tests for pure helpers (npm test, not pushed)
 ```
@@ -81,9 +82,10 @@ from the Apps Script editor. `setupMaster` never deletes tabs or data rows:
 | Settings | Key/value config. Provider-scoped keys: `provider_fee_rate.<PROVIDER>`, `provider_hold_rate.<PROVIDER>`; `default_seller_hold_rate` is legacy (not used for KH001) |
 | Sellers | User-managed desired mapping: 1 row = 1 seller, endpoint_<N>_name/key pairs |
 | Endpoint Mapping | System-managed effective-dated endpoint ownership history |
-| Source System | Raw internal transactions (import-only) |
+| Raw Internal Transactions | Append-only internal CSV evidence: 16 raw CSV columns + 5 ingestion metadata columns |
+| Source System | Latest canonical snapshot per internal transaction (rebuilt from raw) |
 | Source Payments | Raw provider events (payment, refund, dispute, hold, …), one row per event |
-| Transactions | Internal transactions (ownership source of truth) |
+| Transactions | Canonical internal transactions + effective-dated endpoint ownership |
 | Payment Matches | internal transaction ↔ (payment_source, external_transaction_id) |
 | Payment Legs | One row per matched external payment transaction, live economics |
 | Settlements | Canonical provider settlement headers (provider economics only), all providers |
@@ -471,6 +473,48 @@ Entry points: `publishSellerMapping()` and read-only `verifySellerMapping()`.
   that still hold credentials in Audit Log, Sellers and Endpoint Mapping. Rotating the exposed
   credentials is the real remediation; spreadsheet version history and old execution logs
   cannot be guaranteed clean.
+
+## Internal transactions (Phase 2F)
+
+Entry points: `normalizeInternalTransactions()` and read-only `verifyInternalTransactions()`.
+Scope: raw evidence and canonical internal transactions with ownership only — no provider
+matching, Payment Legs, fees, holds, availability, balances or payouts.
+
+- **Raw Internal Transactions** (append-only, written only by the import step): the 16 CSV
+  columns `order_id, payment_method, transaction_id, gateway, status, total, currency,
+  sub_account, store_domain, shield_domain, endpoint_token, created_at, refunded_at, customer,
+  settled_at, note` exactly as exported (written as text, never normalized), then
+  `import_batch_id, source_file_name, source_row_number, row_fingerprint, imported_at`.
+  The same `transaction_id` may appear in several batches.
+- **`row_fingerprint`** (computed by the importer, verified by the normalizer): lowercase hex
+  SHA-256 of the UTF-8 string `"INTERNAL_RAW_V1" + U+001E + join(U+001F, f1..f16)` where `fi`
+  is `E` for an empty field, else `S` + JSON string of the field text. Metadata is excluded,
+  so the same CSV row always has the same fingerprint.
+- **Import Batches** for a manual CSV: `provider_id = INTERNAL`, `source_spreadsheet_id` blank,
+  `source_sheet` = file name, `target_sheet = Raw Internal Transactions`, `source_rows` = CSV data
+  rows, `source_columns = 16`, `checksum` = full file checksum, status SUCCESS / NO_CHANGE /
+  FAILED, `actor = system`. The verifier warns about raw batches without such a record.
+- **Snapshot selection** per `transaction_id`: latest `imported_at` wins (tie: `import_batch_id`,
+  then `source_row_number`). Fails on a blank id, a fingerprint mismatch, two payment sources for
+  one id, or two different snapshots of one id within a batch. Identical repeats are fine.
+- **Gateway**: `paypal → PAYPAL`, `stripe → STRIPE` (case-insensitive); anything else fails.
+- **Timestamps**: Date values or ISO `YYYY-MM-DD[T ]HH:mm[:ss[.fff]]` with `Z`/offset. Timestamps
+  without an offset are rejected unless Settings `source.INTERNAL.naive_timestamp_timezone` is set.
+  `total` must be a plain decimal (e.g. `1234.50`).
+- **Source System**: `source_record_id = ISRC-<sha256(payment_source|internal_transaction_id)>`;
+  raw texts copied, `created_at` / `imported_at` parsed, `order_amount` numeric.
+- **Transactions / ownership**: exact `endpoint_token === Endpoint Mapping.endpoint_key` on the
+  created date in America/New_York (no split, prefix, case folding or fallback to sub_account /
+  names). One mapping → `MAPPED` with `mapping_id`, `mapping_version` (= opened_version),
+  `seller_id`, `seller_name_snapshot`, `endpoint_name_snapshot`; none → `UNASSIGNED_ENDPOINT`
+  (row kept, not seller money); overlapping history → fail. `status = UNMATCHED`.
+  `settled_at_raw` / `refunded_at_raw` are internal raw text only — never settlement proof,
+  availability or adjustments.
+- Both tables are rebuilt from raw under the script lock and written as whole tables through
+  SafeSwap only when their content changed (Transactions keeps `updated_at` for unchanged rows
+  and ignores it for NO_CHANGE). Provider / settlement / seller-money tabs are never touched.
+- Dashboard formulas reference tabs by name (`INDIRECT`) and are refreshed by `setupMaster`, so
+  they keep working when a tab is replaced by a swap.
 
 ## Tests
 
