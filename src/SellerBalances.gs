@@ -199,6 +199,30 @@ function readSellerBalancesInputs_(ss, now) {
     sellerIds: sellerIds, existing: current.rows, now: now, columns: columns }) };
 }
 
+/**
+ * Read-only freshness of Seller Balances: Settlement Items current, the rebuild from Settlement Items,
+ * Adjustments and Seller Payouts has no validation error, and the stored table equals it (ignoring
+ * only updated_at). Never throws.
+ * @param {Object=} itemsFreshness an already computed readSettlementItemsFreshness_(ss)
+ */
+function readSellerBalancesFreshness_(ss, itemsFreshness) {
+  const stale = 'Seller Balances is stale; run normalizeSellerBalances first';
+  try {
+    const items = itemsFreshness || readSettlementItemsFreshness_(ss);
+    if (!items.current) return { current: false, reason: 'Seller Balances upstream is stale (' + items.reason + ')' };
+    const input = readSellerBalancesInputs_(ss, null);
+    const problems = flattenBalanceErrors_(input.built.errors).length;
+    if (problems > 0) return { current: false, reason: 'Seller Balances is invalid (' + problems + ' error(s)); run normalizeSellerBalances.' };
+    const updatedIdx = [input.columns.indexOf('updated_at')];
+    const expected = tableChecksumExcluding_(buildTableValues_(input.columns,
+      input.built.rows.map(function (o) { return objectToRow_(o, input.columns); })), updatedIdx);
+    const current = expected === tableChecksumExcluding_(input.current.grid.values, updatedIdx);
+    return { current: current, reason: current ? null : stale + '.' };
+  } catch (err) {
+    return { current: false, reason: stale + ' (' + (err && err.message ? err.message : String(err)) + ').' };
+  }
+}
+
 function throwIfBalanceErrors_(label, list) {
   if (list.length === 0) return;
   const shown = list.slice(0, SELLER_BALANCES.maxReportedErrors);

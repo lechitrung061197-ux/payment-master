@@ -167,3 +167,28 @@ test('a new AVAILABLE leg is written with snapshot_at = now; existing snapshot_a
   assert.ok(snaps.includes(T1.getTime()), 'existing item keeps T1');
   assert.ok(snaps.some((t) => t !== T1.getTime() && Math.abs(t - Date.now()) < 60000), 'new item stamped at creation');
 });
+
+// ---- 3. Seller Balances read-only freshness (Phase 2K gate) ------------------------------------------------
+test('readSellerBalancesFreshness_: current only when the stored table equals the rebuild (ignoring updated_at)', () => {
+  const items = frozen().map((i) => ({ ...i, seller_id: 'CUS001' }));
+  const built = H.buildSellerBalances_({ items, adjustments: [], payouts: [], sellerIds: ['CUS001', 'CUS002'], existing: [], now: T1,
+    columns: js(H.getColumnNames_('Seller Balances')) }).rows;
+  const fresh = { current: true, reason: null };
+  const run = (balances, extra) => {
+    const ss = fakeSpreadsheet({ Sellers: SELLERS, 'Settlement Items': items, 'Seller Balances': balances, Adjustments: [], 'Seller Payouts': [], ...extra });
+    install(ss);
+    return js(H.readSellerBalancesFreshness_(ss, fresh));
+  };
+  assert.equal(run(built).current, true);
+  assert.equal(run(built.map((b) => ({ ...b, updated_at: D('2027-01-01T00:00:00Z') }))).current, true, 'updated_at ignored');
+  const stale = run(built.map((b) => ({ ...b, current_balance: b.current_balance + 1 })));
+  assert.equal(stale.current, false);
+  assert.match(stale.reason, /Seller Balances is stale; run normalizeSellerBalances first/);
+  const payout = run(built, { 'Seller Payouts': [{ seller_payout_id: 'SP-1', seller_id: 'CUS001', currency: 'USD', amount: 10, status: 'SENT' }] });
+  assert.equal(payout.current, false, 'a new SENT payout makes stored balances stale');
+  const invalid = run(built, { Adjustments: [{ adjustment_id: 'A1', adjustment_type: 'HOLD_RELEASE', seller_id: 'CUS001', currency: 'USD', amount: -1, status: 'APPLIED' }] });
+  assert.match(invalid.reason, /Seller Balances is invalid \(1 error/);
+  install(fakeSpreadsheet({ Sellers: SELLERS }));
+  assert.match(js(H.readSellerBalancesFreshness_(fakeSpreadsheet({ Sellers: SELLERS }), { current: false, reason: 'Settlement Items is stale' })).reason,
+    /Seller Balances upstream is stale \(Settlement Items is stale\)/);
+});

@@ -9,7 +9,7 @@
 
 const APP = Object.freeze({
   NAME: 'Payment Master',
-  SCHEMA_VERSION: 12,
+  SCHEMA_VERSION: 13,
   LOCALE: 'en_US',
   TIMEZONE: 'America/New_York',
   DEFAULT_CURRENCY: 'USD',
@@ -82,6 +82,8 @@ const ENUMS = Object.freeze({
   // listed; new types are added together with a verified normalizer mapping.
   PROVIDER_EVENT_TYPE: ['PAYMENT', 'RESERVE_HOLD', 'WITHDRAWAL'],
   SELLER_STATUS: ['ACTIVE', 'INACTIVE'],
+  // Seller child spreadsheet destination (output only). Only ACTIVE destinations are synced.
+  SELLER_DESTINATION_STATUS: ['ACTIVE', 'INACTIVE'],
   // OPEN = open-ended interval (effective_to blank; may start in the future); CLOSED = bounded.
   ENDPOINT_MAPPING_STATUS: ['OPEN', 'CLOSED'],
   // Ownership of an internal transaction on its created date (Endpoint Mapping, exact token).
@@ -98,6 +100,7 @@ const SHEETS = Object.freeze({
   SETTINGS: 'Settings',
   SELLERS: 'Sellers',
   SELLER_TERMS: 'Seller Terms',
+  SELLER_DESTINATIONS: 'Seller Destinations',
   ENDPOINT_MAPPING: 'Endpoint Mapping',
   RAW_INTERNAL_TRANSACTIONS: 'Raw Internal Transactions',
   SOURCE_SYSTEM: 'Source System',
@@ -184,6 +187,20 @@ const SCHEMA = Object.freeze([
       col_('seller_fee_rate', T.RATE),
       col_('effective_from', T.DATE),
       col_('effective_to', T.DATE),
+      col_('notes', T.TEXT),
+    ],
+  },
+  {
+    sheet: SHEETS.SELLER_DESTINATIONS,
+    description: 'User-managed seller child spreadsheet destinations (output only; never read back). One row per ' +
+      'seller. ACTIVE requires spreadsheet_id (the ID, not the URL); only ACTIVE rows are synced by ' +
+      'syncSellerSheets. A spreadsheet_id may be ACTIVE for one seller only and never the Master itself. ' +
+      'Seeded once (INACTIVE, blank spreadsheet_id) only while this tab is empty; new sellers are added manually.',
+    columns: [
+      col_('seller_id', T.ID),
+      col_('seller_name_snapshot', T.TEXT),
+      col_('spreadsheet_id', T.ID),
+      col_('status', T.ENUM, ENUMS.SELLER_DESTINATION_STATUS),
       col_('notes', T.TEXT),
     ],
   },

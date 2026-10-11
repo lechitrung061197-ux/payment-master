@@ -312,3 +312,28 @@ function verifySellerBalances() {
   Logger.log(JSON.stringify(report, null, 2));
   return report;
 }
+
+/* ---------------------------------------------------------------------------
+ * Seller child spreadsheets (output-only projections of Payment Master)
+ * ------------------------------------------------------------------------- */
+
+/** Read-only: validates Seller Destinations (sellers, ACTIVE spreadsheet IDs, leak-risk conflicts). */
+function verifySellerDestinations() {
+  const report = buildSellerDestinationsReport_();
+  Logger.log(JSON.stringify(report, null, 2));
+  return report;
+}
+
+/** Publishes the current Master projection to every ACTIVE seller child spreadsheet. */
+function syncSellerSheets() {
+  const result = runSellerSheetsSync_();
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** Read-only: checks every ACTIVE seller child spreadsheet against the current Master projection. */
+function verifySellerSheets() {
+  const report = buildSellerSheetsReport_();
+  Logger.log(JSON.stringify(report, null, 2));
+  return report;
+}

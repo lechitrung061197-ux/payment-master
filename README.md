@@ -14,7 +14,8 @@ Local source (managed by clasp)
 Git → private GitHub repository
 ```
 
-Current phase: **Master only** (foundation + schema, financial model v2). Seller spreadsheets come in a later phase.
+Payment Master is the **only** accounting source of truth. Seller child spreadsheets (Phase 2K)
+are output-only projections written by `syncSellerSheets`; nothing is ever read back from them.
 
 ## Conventions
 
@@ -52,6 +53,10 @@ src/
   PaymentReconciliation.gs      Exact Transactions <-> Provider Transactions -> Payment Matches
   SellerTerms.gs                Effective-dated seller fee history (validation, resolution, initial seed)
   PaymentLegs.gs                Confirmed matches -> Payment Legs (provider + seller economics, settlement)
+  SettlementItems.gs            Frozen per-leg accounting snapshot of provider-paid (AVAILABLE) legs
+  SellerBalances.gs             Derived per-seller balances (+ read-only freshness for downstream gates)
+  SellerDestinations.gs         Seller child spreadsheet destinations (validation, initial seed)
+  SellerSheets.gs               Seller child sheet projection: snapshot, sync, verify
   Main.gs           Public entry points
 test/               Node unit tests for pure helpers (npm test, not pushed)
 ```
@@ -85,6 +90,7 @@ from the Apps Script editor. `setupMaster` never deletes tabs or data rows:
 | Settings | Key/value config. Provider-scoped keys: `provider_fee_rate.<PROVIDER>`, `provider_hold_rate.<PROVIDER>`; `default_seller_hold_rate` is legacy (not used for KH001) |
 | Sellers | User-managed desired mapping: 1 row = 1 seller, endpoint_<N>_name/key pairs |
 | Seller Terms | User-edited effective-dated seller fee history (seeded once while empty) |
+| Seller Destinations | User-managed seller child spreadsheet IDs (ACTIVE / INACTIVE; seeded once while empty) |
 | Endpoint Mapping | System-managed effective-dated endpoint ownership history |
 | Raw Internal Transactions | Append-only internal CSV evidence: 16 raw CSV columns + 5 ingestion metadata columns |
 | Source System | Latest canonical snapshot per internal transaction (rebuilt from raw) |
@@ -661,6 +667,77 @@ without writing while any upstream step is stale.
   (`AMOUNT4` for unrounded economics); `setupMaster` on a v10 Master adds Seller Terms (seeded
   once) and leaves every data tab untouched.
 
+## Seller child sheets (Phase 2K)
+
+Seller child spreadsheets are **projections only**. Payment Master stays the sole accounting source
+of truth: child sheets hold values only (no formulas), never compute fee / hold / available /
+balance / eligibility, and are never read back into Master.
+
+**Destination configuration** — tab `Seller Destinations` (`seller_id, seller_name_snapshot,
+spreadsheet_id, status, notes`), user-managed. `setupMaster` seeds it once, while it has no data
+rows, with one `INACTIVE` row per seller and a blank `spreadsheet_id`; it never reseeds, never opens a
+child spreadsheet, and never auto-adds sellers created later. `verifySellerDestinations()` is
+read-only. Hard errors (config ambiguity / data-leak risk — `syncSellerSheets` then writes nothing
+anywhere): unknown or blank seller, duplicate `seller_id` rows, invalid status, a value that is not a
+spreadsheet ID (e.g. a URL), `ACTIVE` without `spreadsheet_id`, the same `spreadsheet_id` ACTIVE for
+several rows, or a `spreadsheet_id` equal to the Payment Master (or the KH001 provider source).
+Warnings only: sellers without a destination row, name-snapshot differences, an ID shared with an
+INACTIVE row. A missing destination never affects accounting.
+
+**Add a seller destination**: create (or pick) a Google Sheet for that seller, share it as needed,
+copy its ID (the part of the URL between `/d/` and `/edit`), add or fill the seller's row in Seller
+Destinations, set `status = ACTIVE`, run `verifySellerDestinations`, then `syncSellerSheets`.
+
+**Sync order**: run the full Master chain first (`syncKh001Raw` → … → `normalizePaymentLegs` →
+`normalizeSettlementItems` → `normalizeSellerBalances`), then `syncSellerSheets`, then
+`verifySellerSheets`.
+
+**Freshness gates**: before any child write, Transactions, Provider Transactions, Payment Matches,
+Settlements, Seller Terms, Payment Legs, Settlement Items and Seller Balances must all be current
+(Seller Balances via a read-only rebuild from Settlement Items, Adjustments and Seller Payouts,
+compared ignoring only `updated_at`). Stale Master → FAILED, nothing written.
+
+**Managed tabs** (the only child tabs ever touched; any other tab is left alone; a missing managed
+tab is created, an existing one is replaced):
+
+- `Summary` — one row per seller + currency: `current_balance`, `settled_hold_remaining`,
+  `paid_amount`, `adjustments` from Seller Balances; `pending_settlement_amount` /
+  `pending_hold_amount` = this seller's non-AVAILABLE Payment Legs with numeric
+  `seller_available_amount` / `seller_hold_amount`; `total_known_hold = settled_hold_remaining +
+  pending_hold_amount`; `total_known_obligation = current_balance + pending_settlement_amount +
+  total_known_hold` (known amounts only — nothing is estimated); transaction counts, including
+  `unknown_economics_transactions` (no actual seller economics yet).
+- `Transactions` — **all** of the seller's internal Transactions (also MISSING_PROVIDER), joined
+  exactly to Payment Matches → Payment Legs → Settlements. `available_to_payout` only for AVAILABLE
+  legs; rows without a leg keep every provider/seller/settlement field blank. `accounting_state` =
+  reconciliation status if not MATCHED, else the leg's settlement status, else MATCHED.
+- `Settlements` — this seller's legs aggregated per settlement + currency (never provider-wide
+  totals or other sellers' portions).
+- `Payouts`, `Adjustments` — this seller's rows (no internal notes / provider tracing fields).
+- `Sync Info` — one row: versions, `last_content_sync_at`, five tab checksums and a combined
+  checksum.
+
+**Seller isolation / privacy**: ownership is the exact `Transactions.seller_id`; every other row
+reaches a seller only through that seller's own rows. Output never contains endpoint tokens or
+credentials, customer / payer data, provider fee / provider hold / system margin, fingerprints,
+import metadata, internal notes or the Master spreadsheet ID; any endpoint-token-like value fails the
+whole sync before any write.
+
+**Idempotency**: the snapshot is built in memory with deterministic checksums. A child already
+matching it is `NO_CHANGE` — nothing is written and `last_content_sync_at` is kept. Otherwise one
+timestamp is used: changed data tabs are rewritten, then Summary, then **Sync Info last** (the commit
+marker, overwritten in one write). The child is reread and verified before `SUCCESS`. If a write
+fails before the commit, the old Sync Info remains and `verifySellerSheets` reports the child as
+stale/incomplete; the next sync repairs it. Sync sets the child spreadsheet time zone to
+America/New_York so dates match Master.
+
+**Results**: per seller `SUCCESS` / `NO_CHANGE` / `FAILED`; overall `SELLER_SHEETS_SYNC_SUCCESS`,
+`_NO_CHANGE`, `_PARTIAL` (some sellers failed, e.g. an inaccessible sheet, others synced) or
+`_FAILED` (nothing synced, or a global gate/config failure), audited with per-seller details.
+`verifySellerSheets()` is read-only: per ACTIVE destination it checks access, the six tabs, headers,
+checksums, Sync Info, combined checksum, timestamp, isolation, forbidden columns, formulas and time
+zone, and reports a report-only production regression of the expected seller summaries.
+
 ## Tests
 
 ```bash
@@ -669,5 +746,5 @@ npm test   # Node built-in test runner, no dependencies
 
 ## Out of scope (current phase)
 
-Seller spreadsheets, production imports, PayPal/Stripe/provider connections,
-web apps, triggers, scheduled sync, automatic settlement, payout automation.
+Production imports, PayPal/Stripe/provider connections, web apps, triggers, scheduled sync,
+automatic settlement, payout automation, refunds/disputes accounting.

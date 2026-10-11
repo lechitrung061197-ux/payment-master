@@ -46,12 +46,19 @@ function runSetup_() {
   const oldSchemaVersion = readSettingValue_(ss, 'schema_version');
   const renamedKeys = migrateSettingKeys_(ss, warnings);
   seedSettings_(ss);
-  // The only business data setup may write: the initial Seller Terms, and only while empty.
+  // The only data setup may write: the initial Seller Terms and Seller Destinations, each only while
+  // empty. Setup never opens or writes a seller child spreadsheet.
   let sellerTermsSeeded = 0;
   try {
     sellerTermsSeeded = seedSellerTermsIfEmpty_(ss, warnings);
   } catch (err) {
     warnings.push('Seller Terms not seeded: ' + (err && err.message ? err.message : String(err)));
+  }
+  let sellerDestinationsSeeded = 0;
+  try {
+    sellerDestinationsSeeded = seedSellerDestinationsIfEmpty_(ss, warnings);
+  } catch (err) {
+    warnings.push('Seller Destinations not seeded: ' + (err && err.message ? err.message : String(err)));
   }
   SpreadsheetApp.flush();
 
@@ -61,7 +68,8 @@ function runSetup_() {
     entityId: ss.getId(),
     oldStatus: oldSchemaVersion === null ? '' : 'SCHEMA_V' + oldSchemaVersion,
     newStatus: 'SCHEMA_V' + APP.SCHEMA_VERSION,
-    details: { migratedTabs: migratedTabs, renamedSettingKeys: renamedKeys, sellerTermsSeeded: sellerTermsSeeded, warnings: warnings },
+    details: { migratedTabs: migratedTabs, renamedSettingKeys: renamedKeys, sellerTermsSeeded: sellerTermsSeeded,
+      sellerDestinationsSeeded: sellerDestinationsSeeded, warnings: warnings },
   });
 
   return {
@@ -69,6 +77,7 @@ function runSetup_() {
     migratedTabs: migratedTabs,
     renamedSettingKeys: renamedKeys,
     sellerTermsSeeded: sellerTermsSeeded,
+    sellerDestinationsSeeded: sellerDestinationsSeeded,
     warnings: warnings,
   };
 }

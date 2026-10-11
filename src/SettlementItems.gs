@@ -220,10 +220,13 @@ function readSettlementItemsInputs_(ss, now) {
     built: buildSettlementItems_({ legs: legs.rows, transactions: transactions.rows, existingItems: existing.rows, now: now, columns: columns }) };
 }
 
-/** Freshness of Settlement Items: upstream current, no errors, no pending new item, table equal. */
-function readSettlementItemsFreshness_(ss) {
+/**
+ * Freshness of Settlement Items: upstream current, no errors, no pending new item, table equal.
+ * @param {Object=} upstream an already computed readSettlementItemsUpstream_(ss) (avoids recomputing it)
+ */
+function readSettlementItemsFreshness_(ss, upstream) {
   try {
-    const upstream = readSettlementItemsUpstream_(ss);
+    upstream = upstream || readSettlementItemsUpstream_(ss);
     const stale = Object.keys(upstream).filter(function (k) { return !upstream[k].current; });
     if (stale.length > 0) return { current: false, reason: 'Settlement Items upstream is stale (' + stale.join(', ') + ').' };
     const input = readSettlementItemsInputs_(ss, null);
