@@ -8,7 +8,8 @@
  *   current_balance     = available_amount = settled + adjustments - paid  (negative allowed, never clamped)
  *   seller_hold_balance = SUM(Settlement Items.seller_hold_amount) - SUM(APPLIED HOLD_RELEASE amount)
  *
- * PENDING / VOID adjustments and DRAFT / VOID payouts do not count. A hold balance that would go
+ * PENDING / VOID adjustments and DRAFT / VOID payouts do not count. Seller Payout Allocations never change a balance;
+ * invalid / incomplete allocations of effective payouts make the rebuild fail closed (allocation_errors). A hold balance that would go
  * materially negative fails. updated_at changes only with content; a disappearing key fails.
  * Requires Settlement Items current. Sums use micro units (1e-6) for deterministic totals.
  *
@@ -40,7 +41,7 @@ const SELLER_BALANCES_REGRESSION = Object.freeze({
 
 function emptyBalanceErrors_() {
   return { duplicate_balance_keys: [], unknown_sellers: [], invalid_adjustments: [], invalid_payouts: [], negative_hold_errors: [],
-    disappearing_balances: [] };
+    disappearing_balances: [], allocation_errors: [] };
 }
 
 function flattenBalanceErrors_(errors) {
@@ -189,14 +190,23 @@ function readPlainTableObjects_(ss, sheetName) {
   return tableRowsFromGrid_(readSheetGrid_(sheet).values, columns, sheetName).map(function (r) { return rowToObject_(r, columns); });
 }
 
+/**
+ * Seller Balances inputs and rebuild. The balance formula never uses allocations; but invalid / incomplete Seller
+ * Payout Allocations (e.g. an effective payout that is not fully allocated) are reported as allocation_errors so
+ * normalizeSellerBalances and its freshness check fail closed.
+ */
 function readSellerBalancesInputs_(ss, now) {
   const items = readSchemaTableObjects_(ss, SHEETS.SETTLEMENT_ITEMS, settlementItemsTab_()).rows;
   const current = readSchemaTableObjects_(ss, SHEETS.SELLER_BALANCES, sellerBalancesTab_());
   const columns = getColumnNames_(SHEETS.SELLER_BALANCES);
   const sellerIds = readSellersDraft_(ss).parsed.sellers.map(function (s) { return s.seller_id; }).filter(function (id) { return id !== ''; });
-  return { current: current, columns: columns, built: buildSellerBalances_({ items: items,
-    adjustments: readPlainTableObjects_(ss, SHEETS.ADJUSTMENTS), payouts: readPlainTableObjects_(ss, SHEETS.SELLER_PAYOUTS),
-    sellerIds: sellerIds, existing: current.rows, now: now, columns: columns }) };
+  const payouts = readPlainTableObjects_(ss, SHEETS.SELLER_PAYOUTS);
+  const built = buildSellerBalances_({ items: items, adjustments: readPlainTableObjects_(ss, SHEETS.ADJUSTMENTS), payouts: payouts,
+    sellerIds: sellerIds, existing: current.rows, now: now, columns: columns });
+  const allocation = validateSellerPayoutAllocations_({ allocations: readPlainTableObjects_(ss, SHEETS.SELLER_PAYOUT_ALLOCATIONS),
+    payouts: payouts, items: items, settlements: readSchemaTableObjects_(ss, SHEETS.SETTLEMENTS, settlementsTab_()).rows });
+  built.errors.allocation_errors = flattenAllocationErrors_(allocation.errors).map(function (e) { return 'Seller Payout Allocations: ' + e; });
+  return { current: current, columns: columns, built: built };
 }
 
 /**

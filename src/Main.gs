@@ -395,3 +395,21 @@ function menuVerifySellerSheets() {
   ui.alert('Verify Seller Sheets', formatSellerVerifyAlert_(report, sellerAlertHiddenIds_()), ui.ButtonSet.OK);
   return report;
 }
+
+/* ---------------------------------------------------------------------------
+ * Seller Payout Allocations (classification of payouts to seller settlement obligations)
+ * ------------------------------------------------------------------------- */
+
+/** Writes FIFO allocation rows for one DRAFT Seller Payout (never changes the payout or existing rows). */
+function autoAllocateSellerPayoutFIFO(payoutId) {
+  const result = runSellerPayoutFifo_(payoutId);
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** Read-only: validates allocations and reports due / paid / remaining and UNPAID / PARTIAL / PAID per seller settlement. */
+function verifySellerPayoutAllocations() {
+  const report = buildSellerPayoutAllocationsReport_();
+  Logger.log(JSON.stringify(report, null, 2));
+  return report;
+}

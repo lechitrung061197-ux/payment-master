@@ -94,6 +94,8 @@ function buildSellerSnapshotsFromMaster_(ss, sellers) {
     adjustments: readPlainTableObjects_(ss, SHEETS.ADJUSTMENTS),
     disputes: readPlainTableObjects_(ss, SHEETS.DISPUTES),
     sellerTerms: readSellerTermsValidity_(ss).terms,
+    settlementItems: readSchemaTableObjects_(ss, SHEETS.SETTLEMENT_ITEMS, settlementItemsTab_()).rows,
+    allocations: readPlainTableObjects_(ss, SHEETS.SELLER_PAYOUT_ALLOCATIONS),
     masterSchemaVersion: APP.SCHEMA_VERSION,
     dateKeyOf: masterDateKey_,
   });

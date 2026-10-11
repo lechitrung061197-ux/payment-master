@@ -55,6 +55,7 @@ src/
   PaymentLegs.gs                Confirmed matches -> Payment Legs (provider + seller economics, settlement)
   SettlementItems.gs            Frozen per-leg accounting snapshot of provider-paid (AVAILABLE) legs
   SellerBalances.gs             Derived per-seller balances (+ read-only freshness for downstream gates)
+  SellerPayoutAllocations.gs    Seller Payout Allocations: obligations, validation, derived states, FIFO
   SellerDestinations.gs         Seller child spreadsheet destinations (validation, initial seed)
   SellerOutput.gs               Seller output contract v2: template anchors, validation, model, checksums
   SellerSheets.gs               Seller child sheet sync / verify (owned-range renderer, _Sync commit)
@@ -104,6 +105,7 @@ from the Apps Script editor. `setupMaster` never deletes tabs or data rows:
 | Settlement Items | Frozen per-leg snapshot inside a settlement |
 | Seller Balances | Per-seller balance across all providers |
 | Seller Payouts | Money actually sent to sellers (no settlement_id: one payout may be funded by many settlements) |
+| Seller Payout Allocations | Classification of each payout to seller settlement obligations (never reduces a balance) |
 | Adjustments | Seller-side money effects: REFUND, DISPUTE, DISPUTE_FEE, MANUAL_ADJUSTMENT, HOLD_RELEASE |
 | Disputes | Dispute case tracking |
 | Dashboard | Skeleton summary |
@@ -677,6 +679,41 @@ without writing while any upstream step is stale.
   (`AMOUNT4` for unrounded economics); `setupMaster` on a v10 Master adds Seller Terms (seeded
   once) and leaves every data tab untouched.
 
+## Seller Payout Allocations (Phase 2L)
+
+- **Seller Payout** = the actual money transfer. It is the only thing that reduces Seller Balances
+  (`current_balance = settled + APPLIED adjustments − SENT/CONFIRMED payouts`, unchanged).
+- **Seller Payout Allocation** = classification of that transfer to seller settlement obligations
+  (tab `Seller Payout Allocations`: `allocation_id, seller_payout_id, seller_id, settlement_id,
+  payment_source, currency, allocated_amount, created_at, notes`; schema v15). Allocations never reduce a
+  balance again and never create money. `allocation_id = SPA-<sha256(seller_payout_id|settlement_id)>`;
+  unique by `seller_payout_id + settlement_id` (one payout may pay several settlements, one settlement may be
+  paid by several payouts).
+- **Obligation** per `seller_id + settlement_id + currency` = SUM of that seller's frozen Settlement Items
+  `seller_available_amount` in that settlement — never provider totals, non-AVAILABLE legs, balances or
+  seller-sheet values. Another seller's share of the same provider settlement is never allocatable.
+- **Effective** = parent payout SENT / CONFIRMED. DRAFT allocations are provisional (do not count as paid);
+  VOID allocations are ignored. Every SENT / CONFIRMED payout must be fully allocated (± 0.00005); no payout
+  may be over-allocated; no obligation over-paid; references, seller, payment source and currency must
+  match exactly. Any violation fails closed: `normalizeSellerBalances` and its freshness check (and
+  therefore seller-sheet sync) stop until the allocations are fixed.
+- **Derived per seller + settlement** (never stored): `due_amount`, `paid_amount` (effective allocations),
+  `remaining_amount = due − paid`, and `UNPAID` (paid 0) / `PARTIAL` / `PAID` (paid = due).
+- **`autoAllocateSellerPayoutFIFO(payoutId)`**: for one DRAFT payout, writes allocation rows for the oldest
+  open obligations of the same seller + currency first (provider payment date, period end, settlement
+  number, id); open = due − effective payments − other DRAFT payouts' provisional claims. It never changes
+  the payout (status stays DRAFT), never touches existing rows (a payout that already has allocations →
+  `NO_CHANGE`, operator review), is idempotent, and refuses a payout larger than the open obligations.
+- **`verifySellerPayoutAllocations()`** (read-only): row counts (draft / effective / void), effective payouts
+  and how many are fully allocated, every error class, per-seller due / paid / remaining, status counts,
+  the per-settlement states and a report-only production regression.
+- **Workflow**: 1) create the Seller Payout as DRAFT; 2) `autoAllocateSellerPayoutFIFO` or enter
+  allocations manually; 3) review them (`verifySellerPayoutAllocations`); 4) set the payout to SENT /
+  CONFIRMED; 5) `normalizeSellerBalances`; 6) `syncSellerSheets`; 7) PhieuDoiSoat section D shows each
+  period as PAID / PARTIAL / UNPAID.
+- Payouts are allocated only to settlement obligations in this phase (no allocation to standalone
+  adjustments yet), so an effective payout can never exceed the seller's open settlement obligations.
+
 ## Seller child sheets (Phase 2K, output contract v2)
 
 Seller child spreadsheets are **output-only projections**. Payment Master stays the sole accounting
@@ -692,9 +729,18 @@ one hidden system tab:
 | --- | --- |
 | `DoiSoat_GD` | One row per seller internal transaction (header row 6, data from row 7): status (Khớp / Lệch số tiền / Thiếu trên cổng), payment source, internal order data and, for MATCHED legs, provider gross, processing fee, net, frozen `seller_fee_rate`, seller fee, seller hold, settlement dates / status and seller amount. MISSING_PROVIDER rows keep every provider / seller / settlement field blank. |
 | `TongHop_Thang` | One row per month, all payment sources together. Transaction month: count, distinct sources, gross / processing fee / net, `Phí VNS` = SUM of frozen leg `seller_fee` (never net × one rate). Provider-paid (AVAILABLE) month — the Seller Balances recognition point: available seller, hold created and the month-end hold balance; actual HOLD_RELEASE by its effective date. Also disputes, effective payouts, adjustments, balance, known obligation. Rows are inserted before the `Logic:` footer when needed. |
-| `PhieuDoiSoat` | Seller + period; "Chưa đối soát / chưa tính" (internal order amount and count of transactions without provider economics) and "Hold đang giữ" (Seller Balances hold) — never added together; A: known economics per payment source (rate shown only when exactly one rate applies); B: seller-only payable from AVAILABLE legs, hold releases, refunds / disputes, APPLIED adjustments, effective payouts → current balance and hold; C: counts / internal amounts by reconciliation status; D: chronological seller-only ledger of paid settlements (seller share only, labelled by provider, e.g. `PAYPAL #1`, `STRIPE #1`), adjustments (by type) and SENT / CONFIRMED payouts (`Payout`). |
+| `PhieuDoiSoat` | (Output schema 3: section D settlement rows are allocation-aware — see below.) Seller + period; "Chưa đối soát / chưa tính" (internal order amount and count of transactions without provider economics) and "Hold đang giữ" (Seller Balances hold) — never added together; A: known economics per payment source (rate shown only when exactly one rate applies); B: seller-only payable from AVAILABLE legs, hold releases, refunds / disputes, APPLIED adjustments, effective payouts → current balance and hold; C: counts / internal amounts by reconciliation status; D: chronological seller-only ledger of paid settlements (seller share only, labelled by provider, e.g. `PAYPAL #1`, `STRIPE #1`), adjustments (by type) and SENT / CONFIRMED payouts (`Payout`). |
 | `Dispute` | Canonical Master disputes attributable to the seller (no buyer data, no internal notes); clean headers when none. |
 | `_Sync` (hidden) | `output_schema_version, seller_id, seller_name, master_schema_version, synced_at`, the four tab checksums and a combined checksum — the commit marker. No Master ID, tokens or PII. |
+
+**Output schema 3 (Phase 2L)** — PhieuDoiSoat section D, same template geometry: a settlement row shows
+`Phát sinh phải trả` = this seller's due (frozen Settlement Items), `Đã payout seller (USD)` = effective
+allocations to it, `Còn nợ` = remaining for that period, and the label `<source> #<n> · PAID | PARTIAL |
+UNPAID`; `Tổng phải trả` (G) carries the running balance. `Payout` rows still show each actual SENT /
+CONFIRMED transfer (running balance in `Còn nợ`). Allocations have no balance effect, so nothing is
+deducted twice; TongHop_Thang `Đã payout seller` and section B keep using actual Seller Payouts. Existing
+schema-2 children are upgraded in place by the next sync (owned content + `_Sync` only; no reclone, no
+formatting writes).
 
 **Template preflight** (`createSellerSheet` before cloning, every sync before writing): the four tabs
 exist and are visible; no other tab (RAW_KH / RAW_PP, the old Phase 2K tabs or anything unknown —

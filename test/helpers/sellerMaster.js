@@ -1,4 +1,4 @@
-// Master accounting fixtures for seller-output tests (fake data). Balances mirror normalizeSellerBalances:
+// Master accounting fixtures for seller-output / allocation tests (fake data). Balances mirror normalizeSellerBalances:
 // AVAILABLE seller amounts + APPLIED adjustments - SENT/CONFIRMED payouts; hold = AVAILABLE seller hold - releases.
 'use strict';
 
@@ -51,8 +51,13 @@ function makeMaster(D, spec) {
     return { seller_id: s.seller_id, currency: 'USD', settled_amount: settled / 1e6, available_amount: current, paid_amount: paid / 1e6,
       seller_hold_balance: (hold - released) / 1e6, adjustments: adjTotal / 1e6, current_balance: current };
   }).filter((b) => b.settled_amount !== 0 || b.current_balance !== 0 || b.seller_hold_balance !== 0);
+  // Frozen Settlement Items = AVAILABLE legs (seller from the exact Transaction).
+  const sellerOf = (l) => transactions.find((t) => t.internal_transaction_id === l.internal_transaction_id).seller_id;
+  const settlementItems = legs.filter((l) => l.settlement_status === 'AVAILABLE').map((l) => ({ settlement_item_id: 'SI-' + l.payment_leg_id,
+    settlement_id: l.settlement_id, payment_leg_id: l.payment_leg_id, internal_transaction_id: l.internal_transaction_id, seller_id: sellerOf(l),
+    payment_source: l.payment_source, currency: l.currency, seller_available_amount: l.seller_available_amount, seller_hold_amount: l.seller_hold_amount }));
   return {
-    transactions, matches, legs, balances, payouts, adjustments,
+    transactions, matches, legs, balances, payouts, adjustments, settlementItems, allocations: spec.allocations || [],
     settlements: spec.settlements || [{ settlement_id: 'ST-1', payment_source: 'PAYPAL', source_settlement_number: 1, period_start_date: D('2026-10-01T04:00:00Z'),
       period_end_date: D('2026-10-04T04:00:00Z'), source_payment_date: D('2026-10-06T04:00:00Z'), hold_release_due_from_date: '', hold_release_due_to_date: '' }],
     disputes: spec.disputes || [],

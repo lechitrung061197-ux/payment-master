@@ -9,7 +9,7 @@
 
 const APP = Object.freeze({
   NAME: 'Payment Master',
-  SCHEMA_VERSION: 14,
+  SCHEMA_VERSION: 15,
   LOCALE: 'en_US',
   TIMEZONE: 'America/New_York',
   DEFAULT_CURRENCY: 'USD',
@@ -112,6 +112,7 @@ const SHEETS = Object.freeze({
   SETTLEMENT_ITEMS: 'Settlement Items',
   SELLER_BALANCES: 'Seller Balances',
   SELLER_PAYOUTS: 'Seller Payouts',
+  SELLER_PAYOUT_ALLOCATIONS: 'Seller Payout Allocations',
   ADJUSTMENTS: 'Adjustments',
   DISPUTES: 'Disputes',
   DASHBOARD: 'Dashboard',
@@ -512,8 +513,8 @@ const SCHEMA = Object.freeze([
   {
     sheet: SHEETS.SELLER_PAYOUTS,
     description: 'Money actually sent to sellers. amount is in currency; payout_amount is in payout_currency. ' +
-      'Valid payouts: status SENT or CONFIRMED. One payout may be funded by several settlements ' +
-      '(future Seller Payout Allocations), so there is no settlement_id here.',
+      'Valid payouts: status SENT or CONFIRMED. One payout may pay several settlements (see Seller Payout ' +
+      'Allocations), so there is no settlement_id here.',
     columns: [
       col_('seller_payout_id', T.ID),
       col_('seller_id', T.ID),
@@ -526,6 +527,24 @@ const SCHEMA = Object.freeze([
       col_('payment_method', T.TEXT),
       col_('reference', T.TEXT),
       col_('status', T.ENUM, ENUMS.SELLER_PAYOUT_STATUS),
+      col_('notes', T.TEXT),
+    ],
+  },
+  {
+    sheet: SHEETS.SELLER_PAYOUT_ALLOCATIONS,
+    description: 'Classification of a Seller Payout to seller settlement obligations (frozen Settlement Items of that ' +
+      'seller + settlement). allocation_id = SPA-<sha256(seller_payout_id|settlement_id)>; unique by seller_payout_id + ' +
+      'settlement_id. Allocations never change Seller Balances (only Seller Payouts do). Only SENT / CONFIRMED payouts ' +
+      'count as paid; DRAFT is provisional; VOID is ignored. An effective payout must be fully allocated.',
+    columns: [
+      col_('allocation_id', T.ID),
+      col_('seller_payout_id', T.ID),
+      col_('seller_id', T.ID),
+      col_('settlement_id', T.ID),
+      col_('payment_source', T.ENUM, ENUMS.PAYMENT_SOURCE),
+      col_('currency', T.TEXT),
+      col_('allocated_amount', T.AMOUNT4),
+      col_('created_at', T.DATETIME),
       col_('notes', T.TEXT),
     ],
   },

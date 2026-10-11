@@ -143,7 +143,7 @@ test('first sync: four template tabs filled in owned ranges, statics / formulas 
   for (let r = 7; r <= 1006; r++) for (let c = 1; c <= 21; c++) assert.ok(!cellOf(a, 'DoiSoat_GD', r, c).f, 'values-only data rows');
   assert.equal(cellOf(a, 'PhieuDoiSoat', 4, 2).v, 'DITECH (CUS001)');
   assert.equal(syncValue(a, 'seller_id'), 'CUS001');
-  assert.equal(syncValue(a, 'output_schema_version'), 2);
+  assert.equal(syncValue(a, 'output_schema_version'), 3);
   const text = JSON.stringify(a.sheets.map((s) => s.cells));
   for (const re of [/"B-1"/, /B-MISS/, /HUI/, /glk_/, /buyer@example/, /MASTER_SPREADSHEET/]) assert.ok(!re.test(text), 'CUS001 sheet must not contain ' + re);
 });
@@ -162,6 +162,7 @@ test('NO_CHANGE: zero writes and synced_at preserved; a change rewrites only the
   await sleep(1100);
   const spec = baseSpec();
   spec.payouts = [{ seller_payout_id: 'SP1', seller_id: 'CUS001', payout_date: D('2026-10-09T04:00:00Z'), currency: 'USD', amount: 10, status: 'SENT' }];
+  spec.allocations = [{ allocation_id: H.sellerAllocationId_('SP1', 'ST-1'), seller_payout_id: 'SP1', seller_id: 'CUS001', settlement_id: 'ST-1', payment_source: 'PAYPAL', currency: 'USD', allocated_amount: 10 }];
   installSync({ children: { [CHILD_A]: a, [CHILD_B]: b }, spec });
   const r2 = js(H.runSellerSheetsSync_());
   assert.deepEqual(r2.sellers.map((s) => s.status), ['SUCCESS', 'NO_CHANGE']);
@@ -203,6 +204,7 @@ test('a failed write before the _Sync commit is detected by verify; the old _Syn
   await sleep(1100);
   const spec = baseSpec();
   spec.payouts = [{ seller_payout_id: 'SP1', seller_id: 'CUS001', payout_date: D('2026-10-09T04:00:00Z'), currency: 'USD', amount: 10, status: 'CONFIRMED' }];
+  spec.allocations = [{ allocation_id: H.sellerAllocationId_('SP1', 'ST-1'), seller_payout_id: 'SP1', seller_id: 'CUS001', settlement_id: 'ST-1', payment_source: 'PAYPAL', currency: 'USD', allocated_amount: 10 }];
   installSync({ children: { [CHILD_A]: a }, spec, destinations: [dest({})] });
   for (const failTab of ['PhieuDoiSoat', '_Sync']) {
     a.failOn = (sheet) => sheet === failTab;
@@ -314,4 +316,27 @@ test('rates land in the template percentage cells (0.08 shown as 8.00%) with zer
   assert.equal(nf[cellOf(a, 'PhieuDoiSoat', 11, 6).s], '0.00%');
   assert.deepEqual(formatOps(a), []);
   assert.deepEqual(a.log.filter((e) => e.op === 'copyTo'), [], 'no format copy without capacity growth');
+});
+
+test('18: an existing output-schema-2 child upgrades to schema 3 in place (no reclone, no format writes, statics kept)', () => {
+  const a = freshChild(CHILD_A);
+  installSync({ children: { [CHILD_A]: a }, destinations: [dest({})] });
+  H.runSellerSheetsSync_();
+  // Make it look exactly like an output-schema-2 child: v2 _Sync version / checksums and the v2 section D label.
+  const sync = a.sheets.find((s) => s.name === '_Sync');
+  Object.entries(sync.cells).forEach(([k, c]) => { if (c.v === 'output_schema_version') sync.cells[k.split(',')[0] + ',2'].v = 2; });
+  a.sheets.find((s) => s.name === 'PhieuDoiSoat').cells['50,1'].v = 'PAYPAL #1';
+  const sheetsBefore = a.sheets.map((s) => s.name);
+  const formatsBefore = JSON.stringify(a.sheets.map((s) => Object.entries(s.cells).map(([k, c]) => [k, c.s])));
+  a.log.length = 0;
+  const r = js(H.runSellerSheetsSync_());
+  assert.equal(r.status, 'SUCCESS', JSON.stringify(r.sellers));
+  assert.deepEqual(r.sellers[0].written_tabs, ['PhieuDoiSoat', '_Sync'], 'only changed owned content + commit marker');
+  assert.equal(syncValue(a, 'output_schema_version'), 3);
+  assert.equal(cellOf(a, 'PhieuDoiSoat', 50, 1).v, 'PAYPAL #1 · UNPAID');
+  assert.deepEqual(a.sheets.map((s) => s.name), sheetsBefore, 'same spreadsheet, no new / replaced tab');
+  assert.equal(JSON.stringify(a.sheets.map((s) => Object.entries(s.cells).map(([k, c]) => [k, c.s]))), formatsBefore, 'no formatting change');
+  assert.deepEqual(formatOps(a), []);
+  assert.deepEqual(a.forbidden, []);
+  assert.equal(js(H.buildSellerSheetsReport_()).pass, true);
 });

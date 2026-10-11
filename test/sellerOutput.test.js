@@ -169,8 +169,9 @@ test('multi-provider: TongHop_Thang Phí VNS = SUM of frozen seller_fee (not Net
   assert.ok(near(snap.blocks.PhieuDoiSoat.total[5], fees));
   assert.equal(snap.blocks.PhieuDoiSoat.total[4], '', 'no single rate on the total row');
   const history = js(snap.blocks.PhieuDoiSoat.history);
-  assert.deepEqual(history.map((r) => r[0]), ['STRIPE #1', 'PAYPAL #1'], 'provider-aware labels: both sources have a settlement #1');
-  assert.ok(near(history[1][8], snap.totals.current_balance));
+  assert.deepEqual(history.map((r) => r[0]), ['STRIPE #1 · UNPAID', 'PAYPAL #1 · UNPAID'], 'provider-aware labels: both sources have a settlement #1');
+  assert.ok(near(history[1][6], snap.totals.current_balance), 'G = running balance after the settlement');
+  assert.ok(near(history[1][8], history[1][4]) && history[1][7] === 0, 'unpaid period: paid 0, remaining = due');
 });
 
 test('Section A shows no single rate when a source has several effective rates in the period', () => {
@@ -186,6 +187,7 @@ test('ledgers: only SENT/CONFIRMED payouts and APPLIED adjustments count; sectio
   spec.payouts = [{ seller_payout_id: 'SP1', seller_id: 'CUS002', payout_date: D('2026-10-09T04:00:00Z'), currency: 'USD', amount: 100, status: 'SENT',
     payment_method: 'Bank', reference: 'R1', fx_rate: 25300, payout_currency: 'VND', payout_amount: 2530000 },
   { seller_payout_id: 'SP2', seller_id: 'CUS002', payout_date: D('2026-10-09T04:00:00Z'), currency: 'USD', amount: 999, status: 'DRAFT' }];
+  spec.allocations = [{ allocation_id: H.sellerAllocationId_('SP1', 'ST-1'), seller_payout_id: 'SP1', seller_id: 'CUS002', settlement_id: 'ST-1', payment_source: 'PAYPAL', currency: 'USD', allocated_amount: 100 }];
   spec.adjustments = [{ adjustment_id: 'A1', adjustment_type: 'HOLD_RELEASE', seller_id: 'CUS002', currency: 'USD', amount: 5, status: 'APPLIED',
     effective_date: D('2026-10-10T04:00:00Z') }, { adjustment_id: 'A2', adjustment_type: 'MANUAL_ADJUSTMENT', seller_id: 'CUS002', currency: 'USD',
     amount: 50, status: 'PENDING', effective_date: D('2026-10-10T04:00:00Z') }];
@@ -194,7 +196,7 @@ test('ledgers: only SENT/CONFIRMED payouts and APPLIED adjustments count; sectio
   assert.ok(near(b[4], 5) && near(b[9], 100) && near(b[11 - 0], 25300) && near(b[12], 2530000));
   assert.ok(near(b[10], snap.totals.current_balance));
   const h = js(snap.blocks.PhieuDoiSoat.history);
-  assert.deepEqual(h.map((r) => r[0]), ['STRIPE #1', 'PAYPAL #1', 'Payout', 'HOLD_RELEASE']);
+  assert.deepEqual(h.map((r) => r[0]), ['STRIPE #1 · UNPAID', 'PAYPAL #1 · PARTIAL', 'Payout', 'HOLD_RELEASE']);
   assert.ok(near(h[2][7], 100), 'payout deducted once');
   assert.ok(near(h[3][10], 5) && near(h[3][11], snap.totals.seller_hold));
   assert.ok(!JSON.stringify(snap.blocks).includes('999'), 'DRAFT payout never published');
@@ -271,4 +273,36 @@ test('template fixture formats: Tỷ lệ VNS is a 0.00% cell in DoiSoat_GD and 
   for (let r = 7; r <= 1006; r += 333) assert.equal(nf[cellsOf('DoiSoat_GD')[r + ',12'].s], '0.00%', 'DoiSoat_GD L' + r);
   for (let r = 11; r <= 21; r++) assert.equal(nf[cellsOf('PhieuDoiSoat')[r + ',6'].s], '0.00%', 'PhieuDoiSoat F' + r);
   assert.notEqual(nf[cellsOf('PhieuDoiSoat')['11,7'].s], '0.00%', 'only the rate column is a percentage');
+});
+
+test('16-17 Section D: PAYPAL #1 · PAID / PAYPAL #2 · PARTIAL / STRIPE #1 · UNPAID from allocations; payouts deducted once', () => {
+  const spec = multiSpec();
+  spec.txs.push({ id: 'P3', seller: 'CUS002', order: 104, created: '2026-10-06T15:00:00Z', leg: { fee: 4, rate: 0.08, settlement: 'ST-2' } });
+  spec.settlements.push({ settlement_id: 'ST-2', payment_source: 'PAYPAL', source_settlement_number: 2, period_start_date: D('2026-10-05T04:00:00Z'),
+    period_end_date: D('2026-10-09T04:00:00Z'), source_payment_date: D('2026-10-10T04:00:00Z') });
+  // Dues: PAYPAL #1 = 82 + 41 = 123, PAYPAL #2 = 82, STRIPE #1 = 170.
+  spec.payouts = [{ seller_payout_id: 'SP-A', seller_id: 'CUS002', payout_date: D('2026-10-11T04:00:00Z'), currency: 'USD', amount: 150, status: 'CONFIRMED',
+    payment_method: 'Bank', reference: 'W1' }, { seller_payout_id: 'SP-D', seller_id: 'CUS002', payout_date: D('2026-10-12T04:00:00Z'), currency: 'USD',
+    amount: 40, status: 'DRAFT' }];
+  const a = (pid, st, amt) => ({ allocation_id: H.sellerAllocationId_(pid, st), seller_payout_id: pid, seller_id: 'CUS002', settlement_id: st,
+    payment_source: 'PAYPAL', currency: 'USD', allocated_amount: amt });
+  spec.allocations = [a('SP-A', 'ST-1', 123), a('SP-A', 'ST-2', 27), a('SP-D', 'ST-2', 40)];
+  const snap = build(spec).CUS002;
+  const h = js(snap.blocks.PhieuDoiSoat.history);
+  assert.deepEqual(h.map((r) => r[0]), ['STRIPE #1 · UNPAID', 'PAYPAL #1 · PAID', 'PAYPAL #2 · PARTIAL', 'Payout']);
+  const row = (label) => h.find((r) => r[0] === label);
+  assert.deepEqual([row('PAYPAL #1 · PAID')[4], row('PAYPAL #1 · PAID')[7], row('PAYPAL #1 · PAID')[8]], [123, 123, 0], 'due / allocated / remaining');
+  assert.deepEqual([row('PAYPAL #2 · PARTIAL')[4], row('PAYPAL #2 · PARTIAL')[7], row('PAYPAL #2 · PARTIAL')[8]], [82, 27, 55], 'DRAFT allocation not counted');
+  assert.deepEqual([row('STRIPE #1 · UNPAID')[7], row('STRIPE #1 · UNPAID')[8]], [0, 170]);
+  // Running balance: + due per settlement, - the actual payout once; allocations move nothing.
+  const pay = row('Payout');
+  assert.deepEqual([pay[5], pay[7], pay[8]], [375, 150, 225]);
+  assert.ok(near(pay[8], snap.totals.current_balance), 'ledger ends at the Seller Balances current balance');
+  assert.ok(near(snap.blocks.PhieuDoiSoat.b[9], 150) && near(snap.blocks.PhieuDoiSoat.b[10], 225), 'section B deducts the payout once');
+  const month = js(snap.blocks.TongHop_Thang.rows).find((r) => r[14] !== 0);
+  assert.equal(month[14], 150, 'TongHop_Thang Đã payout seller = actual effective payouts, not allocation totals');
+  const broken = multiSpec();
+  broken.payouts = [{ seller_payout_id: 'SP-X', seller_id: 'CUS002', payout_date: D('2026-10-11T04:00:00Z'), currency: 'USD', amount: 10, status: 'SENT' }];
+  assert.match(js(H.buildSellerOutputs_({ ...makeMaster(D, broken), sellers: broken.sellers, dateKeyOf: NY }).errors).join(),
+    /Seller Payout Allocations: Seller Payout SP-X \(SENT\): allocated 0 of 10/, 'unallocated effective payout fails closed');
 });

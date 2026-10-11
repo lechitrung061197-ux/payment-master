@@ -175,7 +175,8 @@ test('readSellerBalancesFreshness_: current only when the stored table equals th
     columns: js(H.getColumnNames_('Seller Balances')) }).rows;
   const fresh = { current: true, reason: null };
   const run = (balances, extra) => {
-    const ss = fakeSpreadsheet({ Sellers: SELLERS, 'Settlement Items': items, 'Seller Balances': balances, Adjustments: [], 'Seller Payouts': [], ...extra });
+    const ss = fakeSpreadsheet({ Sellers: SELLERS, 'Settlement Items': items, 'Seller Balances': balances, Adjustments: [], 'Seller Payouts': [],
+      'Seller Payout Allocations': [], Settlements: [{ settlement_id: 'ST-1', payment_source: 'PAYPAL', source_settlement_number: 1 }], ...extra });
     install(ss);
     return js(H.readSellerBalancesFreshness_(ss, fresh));
   };
@@ -184,8 +185,19 @@ test('readSellerBalancesFreshness_: current only when the stored table equals th
   const stale = run(built.map((b) => ({ ...b, current_balance: b.current_balance + 1 })));
   assert.equal(stale.current, false);
   assert.match(stale.reason, /Seller Balances is stale; run normalizeSellerBalances first/);
-  const payout = run(built, { 'Seller Payouts': [{ seller_payout_id: 'SP-1', seller_id: 'CUS001', currency: 'USD', amount: 10, status: 'SENT' }] });
+  const sent = [{ seller_payout_id: 'SP-1', seller_id: 'CUS001', currency: 'USD', amount: 10, status: 'SENT' }];
+  const unallocated = run(built, { 'Seller Payouts': sent });
+  assert.equal(unallocated.current, false);
+  assert.match(unallocated.reason, /Seller Balances is invalid/, 'an effective payout without allocations fails closed');
+  const allocation = { allocation_id: H.sellerAllocationId_('SP-1', 'ST-1'), seller_payout_id: 'SP-1', seller_id: 'CUS001', settlement_id: 'ST-1',
+    payment_source: 'PAYPAL', currency: 'USD', allocated_amount: 10 };
+  const payout = run(built, { 'Seller Payouts': sent, 'Seller Payout Allocations': [allocation] });
   assert.equal(payout.current, false, 'a new SENT payout makes stored balances stale');
+  assert.match(payout.reason, /Seller Balances is stale/);
+  const rebuilt = H.buildSellerBalances_({ items, adjustments: [], payouts: sent, sellerIds: ['CUS001', 'CUS002'], existing: [], now: T1,
+    columns: js(H.getColumnNames_('Seller Balances')) }).rows;
+  assert.equal(run(rebuilt, { 'Seller Payouts': sent, 'Seller Payout Allocations': [allocation] }).current, true);
+  assert.ok(Math.abs(rebuilt[0].current_balance - (built[0].current_balance - 10)) < 1e-9, 'payout deducted once; the allocation adds nothing');
   const invalid = run(built, { Adjustments: [{ adjustment_id: 'A1', adjustment_type: 'HOLD_RELEASE', seller_id: 'CUS001', currency: 'USD', amount: -1, status: 'APPLIED' }] });
   assert.match(invalid.reason, /Seller Balances is invalid \(1 error/);
   install(fakeSpreadsheet({ Sellers: SELLERS }));

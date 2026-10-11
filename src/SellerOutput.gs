@@ -1,6 +1,6 @@
 /**
  * SellerOutput.gs
- * Seller output contract v2: the seller child spreadsheet is a clone of the seller template
+ * Seller output contract v3 (v2 + allocation-aware PhieuDoiSoat section D): the seller child spreadsheet is a clone of the seller template
  * (VNS_SELLER_PAYMENT_TEMPLATE, the UI authority) with exactly four visible tabs - DoiSoat_GD,
  * TongHop_Thang, PhieuDoiSoat, Dispute - plus one hidden system tab, _Sync.
  *
@@ -12,13 +12,16 @@
  * - Provider-agnostic: one seller reconciliation across payment sources; seller fee rates come from the
  *   frozen Payment Leg snapshots (Seller Terms by seller + payment_source + effective date).
  * - No provider trace = no provider economics; MATCHED != AVAILABLE; unknown economics are never estimated.
+ * - PhieuDoiSoat section D settlement rows are allocation-aware: due = frozen Settlement Items of the seller,
+ *   paid = effective Seller Payout Allocations, remaining = due - paid, label "<source> #<n> · UNPAID|PARTIAL|PAID".
+ *   Payout rows still show the actual money movement; allocations never move the running balance.
  *
  * Everything in this file is pure (unit-tested in Node); I/O lives in SellerSheets.gs.
  */
 
 const SELLER_OUTPUT = Object.freeze({
-  schemaVersion: 2,
-  checksumVersion: 'seller-output-v2',
+  schemaVersion: 3,
+  checksumVersion: 'seller-output-v3',
   syncTab: '_Sync',
   visibleTabs: Object.freeze(['DoiSoat_GD', 'TongHop_Thang', 'PhieuDoiSoat', 'Dispute']),
   legacyTabs: Object.freeze(['Summary', 'Transactions', 'Settlements', 'Payouts', 'Adjustments', 'Sync Info']),
@@ -121,9 +124,12 @@ function sellerDateOnly_(value, dateKeyOf) {
   return key ? new Date(key + 'T12:00:00Z') : '';
 }
 
-/** Provider-aware settlement label for PhieuDoiSoat section D, e.g. "PAYPAL #1" (sources can share numbers). */
-function sellerSettlementLabel_(settlement) {
-  return trimmedText_(settlement.payment_source) + ' #' + trimmedText_(settlement.source_settlement_number);
+/**
+ * Provider-aware settlement label for PhieuDoiSoat section D, e.g. "PAYPAL #1 · PAID" (sources can share numbers;
+ * the status is the derived allocation state of this seller's share).
+ */
+function sellerSettlementLabel_(settlement, status) {
+  return trimmedText_(settlement.payment_source) + ' #' + trimmedText_(settlement.source_settlement_number) + (status ? ' · ' + status : '');
 }
 
 function micro_(v) {
@@ -325,8 +331,8 @@ const SELLER_PHIEU_BLOCKS = Object.freeze(['info', 'sources', 'total', 'b', 'c',
  * Builds the seller output (all four tabs as owned-range blocks) for every requested seller.
  * @param {{sellers: Array<{seller_id: string, seller_name: string}>, transactions: Array<Object>, matches: Array<Object>,
  *          legs: Array<Object>, settlements: Array<Object>, balances: Array<Object>, payouts: Array<Object>,
- *          adjustments: Array<Object>, disputes: Array<Object>, sellerTerms: Array<Object>, masterSchemaVersion: number,
- *          dateKeyOf: function(*): string, digestHex?: Function}} input
+ *          adjustments: Array<Object>, disputes: Array<Object>, sellerTerms: Array<Object>, settlementItems: Array<Object>,
+ *          allocations: Array<Object>, masterSchemaVersion: number, dateKeyOf: function(*): string, digestHex?: Function}} input
  * @return {{snapshots: Object<string, Object>, errors: Array<string>}}
  */
 function buildSellerOutputs_(input) {
@@ -351,6 +357,10 @@ function buildSellerOutputs_(input) {
   const counted = SELLER_BALANCES.countedPayoutStatuses;
   const applied = SELLER_BALANCES.countedAdjustmentStatus;
   const snapshots = {};
+  // Settlement obligations / payment states: frozen Settlement Items + effective allocations (fail closed on any error).
+  const allocation = validateSellerPayoutAllocations_({ allocations: input.allocations || [], payouts: input.payouts, items: input.settlementItems || [],
+    settlements: input.settlements, digestHex: input.digestHex });
+  flattenAllocationErrors_(allocation.errors).forEach(function (e) { errors.push('Seller Payout Allocations: ' + e); });
 
   input.sellers.forEach(function (seller) {
     const sellerId = seller.seller_id;
@@ -525,14 +535,13 @@ function buildSellerOutputs_(input) {
     const check = [available.length === matched ? 'OK — ' + available.length + '/' + matched + ' matched đã vào Seller Balance'
       : 'Chưa — ' + available.length + '/' + matched + ' matched đã vào Seller Balance (còn lại chờ provider thanh toán)'];
     // Section D: chronological seller-only ledger (paid settlements, applied adjustments, effective payouts).
+    // Settlement rows: due = this seller's frozen Settlement Items, paid = effective allocations (allocation model).
     const events = [];
-    const settlementGroups = {};
-    available.forEach(function (x) { (settlementGroups[String(x.leg.settlement_id)] = settlementGroups[String(x.leg.settlement_id)] || []).push(x); });
-    Object.keys(settlementGroups).forEach(function (id) {
-      const list = settlementGroups[id];
-      const s = list[0].settlement;
-      events.push({ key: dk(s.source_payment_date), rank: 0, order: Number(s.source_settlement_number) || 0, kind: 'S', s: s,
-        amount: sumLegs(list, 'seller_available_amount'), hold: sumLegs(list, 'seller_hold_amount') });
+    allocation.states.filter(function (st) { return st.seller_id === sellerId; }).forEach(function (st) {
+      if (st.currency !== SELLER_OUTPUT.currency) { label('settlement obligation ' + st.settlement_id + ' is not ' + SELLER_OUTPUT.currency); return; }
+      const s = st.settlement;
+      events.push({ key: dk(s.source_payment_date), rank: 0, order: Number(s.source_settlement_number) || 0, kind: 'S', s: s, st: st,
+        amount: micro_(st.due_amount), hold: micro_(st.hold_amount), paid: micro_(st.paid_amount), remaining: micro_(st.remaining_amount) });
     });
     adjustments.forEach(function (a) {
       events.push({ key: dk(a.effective_date), rank: 1, order: String(a.adjustment_id), kind: 'A', a: a, amount: micro_(a.amount),
@@ -545,10 +554,12 @@ function buildSellerOutputs_(input) {
     const history = events.map(function (e) {
       const before = runBalance;
       if (e.kind === 'S') {
+        // Running balance: + due (allocations have no balance effect). H / I = this period's allocated paid / remaining.
         runBalance += e.amount;
         runHold += e.hold;
-        return [sellerSettlementLabel_(e.s), dateOnly(e.s.period_start_date), dateOnly(e.s.period_end_date), dateOnly(e.s.source_payment_date),
-          e.amount / 1e6, before / 1e6, (before + e.amount) / 1e6, 0, runBalance / 1e6, e.hold / 1e6, 0, runHold / 1e6,
+        return [sellerSettlementLabel_(e.s, e.st.payment_status), dateOnly(e.s.period_start_date), dateOnly(e.s.period_end_date),
+          dateOnly(e.s.source_payment_date), e.amount / 1e6, before / 1e6, (before + e.amount) / 1e6, e.paid / 1e6, e.remaining / 1e6, e.hold / 1e6, 0,
+          runHold / 1e6,
           dateOnly(e.s.hold_release_due_from_date), dateOnly(e.s.hold_release_due_to_date), '', '', ''];
       }
       if (e.kind === 'A') {
