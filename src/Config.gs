@@ -71,6 +71,8 @@ const ENUMS = Object.freeze({
   LEG_SETTLEMENT_STATUS: ['WAITING_SETTLEMENT', 'SETTLED', 'AVAILABLE'],
   SETTLEMENT_STATUS: ['DRAFT', 'LOCKED', 'VOID'],
   SELLER_PAYOUT_STATUS: ['DRAFT', 'SENT', 'CONFIRMED', 'VOID'],
+  // What a Seller Payout Allocation pays: a seller settlement obligation or a positive APPLIED adjustment.
+  SELLER_PAYOUT_ALLOCATION_TARGET_TYPE: ['SETTLEMENT', 'ADJUSTMENT'],
   ADJUSTMENT_TYPE: ['REFUND', 'DISPUTE', 'DISPUTE_FEE', 'MANUAL_ADJUSTMENT', 'HOLD_RELEASE'],
   ADJUSTMENT_STATUS: ['PENDING', 'APPLIED', 'VOID'],
   DISPUTE_STATUS: ['OPEN', 'UNDER_REVIEW', 'WON', 'LOST', 'CLOSED'],
@@ -532,15 +534,18 @@ const SCHEMA = Object.freeze([
   },
   {
     sheet: SHEETS.SELLER_PAYOUT_ALLOCATIONS,
-    description: 'Classification of a Seller Payout to seller settlement obligations (frozen Settlement Items of that ' +
-      'seller + settlement). allocation_id = SPA-<sha256(seller_payout_id|settlement_id)>; unique by seller_payout_id + ' +
-      'settlement_id. Allocations never change Seller Balances (only Seller Payouts do). Only SENT / CONFIRMED payouts ' +
-      'count as paid; DRAFT is provisional; VOID is ignored. An effective payout must be fully allocated.',
+    description: 'Classification of a Seller Payout to payout obligations: target_type SETTLEMENT (target_id = settlement_id; ' +
+      'due = frozen Settlement Items of that seller + settlement) or ADJUSTMENT (target_id = adjustment_id of a positive ' +
+      'APPLIED adjustment). allocation_id = SPA-<sha256(seller_payout_id|target_type|target_id)>; unique by seller_payout_id + ' +
+      'target_type + target_id. Allocations never change Seller Balances (only Seller Payouts do). Only SENT / CONFIRMED ' +
+      'payouts count as paid; DRAFT is provisional; VOID has no financial effect (rows must still be valid). An effective ' +
+      'payout must be fully allocated.',
     columns: [
       col_('allocation_id', T.ID),
       col_('seller_payout_id', T.ID),
       col_('seller_id', T.ID),
-      col_('settlement_id', T.ID),
+      col_('target_type', T.ENUM, ENUMS.SELLER_PAYOUT_ALLOCATION_TARGET_TYPE),
+      col_('target_id', T.ID),
       col_('payment_source', T.ENUM, ENUMS.PAYMENT_SOURCE),
       col_('currency', T.TEXT),
       col_('allocated_amount', T.AMOUNT4),

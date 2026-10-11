@@ -12,9 +12,10 @@
  * - Provider-agnostic: one seller reconciliation across payment sources; seller fee rates come from the
  *   frozen Payment Leg snapshots (Seller Terms by seller + payment_source + effective date).
  * - No provider trace = no provider economics; MATCHED != AVAILABLE; unknown economics are never estimated.
- * - PhieuDoiSoat section D settlement rows are allocation-aware: due = frozen Settlement Items of the seller,
- *   paid = effective Seller Payout Allocations, remaining = due - paid, label "<source> #<n> · UNPAID|PARTIAL|PAID".
- *   Payout rows still show the actual money movement; allocations never move the running balance.
+ * - PhieuDoiSoat section D is allocation-aware: settlement rows (due = frozen Settlement Items of the seller) and
+ *   positive APPLIED adjustment rows (due = amount) show effective allocations as paid, the remaining amount and a
+ *   label "<source> #<n> · UNPAID|PARTIAL|PAID" / "<adjustment_type> · ...". Negative adjustments stay plain debit
+ *   rows. Payout rows still show the actual money movement; allocations never move the running balance.
  *
  * Everything in this file is pure (unit-tested in Node); I/O lives in SellerSheets.gs.
  */
@@ -359,7 +360,7 @@ function buildSellerOutputs_(input) {
   const snapshots = {};
   // Settlement obligations / payment states: frozen Settlement Items + effective allocations (fail closed on any error).
   const allocation = validateSellerPayoutAllocations_({ allocations: input.allocations || [], payouts: input.payouts, items: input.settlementItems || [],
-    settlements: input.settlements, digestHex: input.digestHex });
+    settlements: input.settlements, adjustments: input.adjustments, digestHex: input.digestHex });
   flattenAllocationErrors_(allocation.errors).forEach(function (e) { errors.push('Seller Payout Allocations: ' + e); });
 
   input.sellers.forEach(function (seller) {
@@ -537,15 +538,18 @@ function buildSellerOutputs_(input) {
     // Section D: chronological seller-only ledger (paid settlements, applied adjustments, effective payouts).
     // Settlement rows: due = this seller's frozen Settlement Items, paid = effective allocations (allocation model).
     const events = [];
-    allocation.states.filter(function (st) { return st.seller_id === sellerId; }).forEach(function (st) {
+    allocation.states.filter(function (st) { return st.seller_id === sellerId && st.target_type === SELLER_ALLOCATIONS.settlementTarget; }).forEach(function (st) {
       if (st.currency !== SELLER_OUTPUT.currency) { label('settlement obligation ' + st.settlement_id + ' is not ' + SELLER_OUTPUT.currency); return; }
       const s = st.settlement;
       events.push({ key: dk(s.source_payment_date), rank: 0, order: Number(s.source_settlement_number) || 0, kind: 'S', s: s, st: st,
         amount: micro_(st.due_amount), hold: micro_(st.hold_amount), paid: micro_(st.paid_amount), remaining: micro_(st.remaining_amount) });
     });
+    const creditState = {};
+    allocation.states.filter(function (st) { return st.seller_id === sellerId && st.target_type === SELLER_ALLOCATIONS.adjustmentTarget; })
+      .forEach(function (st) { creditState[st.target_id] = st; });
     adjustments.forEach(function (a) {
       events.push({ key: dk(a.effective_date), rank: 1, order: String(a.adjustment_id), kind: 'A', a: a, amount: micro_(a.amount),
-        release: trimmedText_(a.adjustment_type) === 'HOLD_RELEASE' ? micro_(a.amount) : 0 });
+        release: trimmedText_(a.adjustment_type) === 'HOLD_RELEASE' ? micro_(a.amount) : 0, st: creditState[trimmedText_(a.adjustment_id)] || null });
     });
     payouts.forEach(function (p) { events.push({ key: dk(p.payout_date), rank: 2, order: String(p.seller_payout_id), kind: 'P', p: p, paid: micro_(p.amount) }); });
     events.sort(function (x, y) { return x.key < y.key ? -1 : x.key > y.key ? 1 : x.rank - y.rank || (x.order < y.order ? -1 : x.order > y.order ? 1 : 0); });
@@ -565,8 +569,15 @@ function buildSellerOutputs_(input) {
       if (e.kind === 'A') {
         runBalance += e.amount;
         runHold -= e.release;
-        return [trimmedText_(e.a.adjustment_type), dateOnly(e.a.effective_date), '', '', e.amount / 1e6, before / 1e6, runBalance / 1e6, 0,
-          runBalance / 1e6, 0, e.release / 1e6, runHold / 1e6, '', '', trimmedText_(e.a.adjustment_type), '', ''];
+        const type = trimmedText_(e.a.adjustment_type);
+        if (e.st) {
+          // Positive APPLIED credit = payout obligation: H / I = effective allocations to it / its remaining.
+          return [type + ' · ' + e.st.payment_status, dateOnly(e.a.effective_date), '', '', e.amount / 1e6, before / 1e6, runBalance / 1e6,
+            micro_(e.st.paid_amount) / 1e6, micro_(e.st.remaining_amount) / 1e6, 0, e.release / 1e6, runHold / 1e6, '', '', type, '', ''];
+        }
+        // Negative APPLIED adjustment: ordinary ledger debit, no payout status.
+        return [type, dateOnly(e.a.effective_date), '', '', e.amount / 1e6, before / 1e6, runBalance / 1e6, 0, runBalance / 1e6, 0, e.release / 1e6,
+          runHold / 1e6, '', '', type, '', ''];
       }
       runBalance -= e.paid;
       const ref = [trimmedText_(e.p.payment_method), trimmedText_(e.p.reference)].filter(Boolean).join(' / ');

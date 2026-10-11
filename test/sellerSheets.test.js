@@ -162,7 +162,7 @@ test('NO_CHANGE: zero writes and synced_at preserved; a change rewrites only the
   await sleep(1100);
   const spec = baseSpec();
   spec.payouts = [{ seller_payout_id: 'SP1', seller_id: 'CUS001', payout_date: D('2026-10-09T04:00:00Z'), currency: 'USD', amount: 10, status: 'SENT' }];
-  spec.allocations = [{ allocation_id: H.sellerAllocationId_('SP1', 'ST-1'), seller_payout_id: 'SP1', seller_id: 'CUS001', settlement_id: 'ST-1', payment_source: 'PAYPAL', currency: 'USD', allocated_amount: 10 }];
+  spec.allocations = [{ allocation_id: H.sellerAllocationId_('SP1', 'SETTLEMENT', 'ST-1'), seller_payout_id: 'SP1', seller_id: 'CUS001', target_type: 'SETTLEMENT', target_id: 'ST-1', payment_source: 'PAYPAL', currency: 'USD', allocated_amount: 10 }];
   installSync({ children: { [CHILD_A]: a, [CHILD_B]: b }, spec });
   const r2 = js(H.runSellerSheetsSync_());
   assert.deepEqual(r2.sellers.map((s) => s.status), ['SUCCESS', 'NO_CHANGE']);
@@ -204,7 +204,7 @@ test('a failed write before the _Sync commit is detected by verify; the old _Syn
   await sleep(1100);
   const spec = baseSpec();
   spec.payouts = [{ seller_payout_id: 'SP1', seller_id: 'CUS001', payout_date: D('2026-10-09T04:00:00Z'), currency: 'USD', amount: 10, status: 'CONFIRMED' }];
-  spec.allocations = [{ allocation_id: H.sellerAllocationId_('SP1', 'ST-1'), seller_payout_id: 'SP1', seller_id: 'CUS001', settlement_id: 'ST-1', payment_source: 'PAYPAL', currency: 'USD', allocated_amount: 10 }];
+  spec.allocations = [{ allocation_id: H.sellerAllocationId_('SP1', 'SETTLEMENT', 'ST-1'), seller_payout_id: 'SP1', seller_id: 'CUS001', target_type: 'SETTLEMENT', target_id: 'ST-1', payment_source: 'PAYPAL', currency: 'USD', allocated_amount: 10 }];
   installSync({ children: { [CHILD_A]: a }, spec, destinations: [dest({})] });
   for (const failTab of ['PhieuDoiSoat', '_Sync']) {
     a.failOn = (sheet) => sheet === failTab;

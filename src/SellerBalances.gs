@@ -201,10 +201,11 @@ function readSellerBalancesInputs_(ss, now) {
   const columns = getColumnNames_(SHEETS.SELLER_BALANCES);
   const sellerIds = readSellersDraft_(ss).parsed.sellers.map(function (s) { return s.seller_id; }).filter(function (id) { return id !== ''; });
   const payouts = readPlainTableObjects_(ss, SHEETS.SELLER_PAYOUTS);
-  const built = buildSellerBalances_({ items: items, adjustments: readPlainTableObjects_(ss, SHEETS.ADJUSTMENTS), payouts: payouts,
+  const adjustments = readPlainTableObjects_(ss, SHEETS.ADJUSTMENTS);
+  const built = buildSellerBalances_({ items: items, adjustments: adjustments, payouts: payouts,
     sellerIds: sellerIds, existing: current.rows, now: now, columns: columns });
   const allocation = validateSellerPayoutAllocations_({ allocations: readPlainTableObjects_(ss, SHEETS.SELLER_PAYOUT_ALLOCATIONS),
-    payouts: payouts, items: items, settlements: readSchemaTableObjects_(ss, SHEETS.SETTLEMENTS, settlementsTab_()).rows });
+    payouts: payouts, items: items, settlements: readSchemaTableObjects_(ss, SHEETS.SETTLEMENTS, settlementsTab_()).rows, adjustments: adjustments });
   built.errors.allocation_errors = flattenAllocationErrors_(allocation.errors).map(function (e) { return 'Seller Payout Allocations: ' + e; });
   return { current: current, columns: columns, built: built };
 }

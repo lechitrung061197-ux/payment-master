@@ -189,7 +189,7 @@ test('readSellerBalancesFreshness_: current only when the stored table equals th
   const unallocated = run(built, { 'Seller Payouts': sent });
   assert.equal(unallocated.current, false);
   assert.match(unallocated.reason, /Seller Balances is invalid/, 'an effective payout without allocations fails closed');
-  const allocation = { allocation_id: H.sellerAllocationId_('SP-1', 'ST-1'), seller_payout_id: 'SP-1', seller_id: 'CUS001', settlement_id: 'ST-1',
+  const allocation = { allocation_id: H.sellerAllocationId_('SP-1', 'SETTLEMENT', 'ST-1'), seller_payout_id: 'SP-1', seller_id: 'CUS001', target_type: 'SETTLEMENT', target_id: 'ST-1',
     payment_source: 'PAYPAL', currency: 'USD', allocated_amount: 10 };
   const payout = run(built, { 'Seller Payouts': sent, 'Seller Payout Allocations': [allocation] });
   assert.equal(payout.current, false, 'a new SENT payout makes stored balances stale');

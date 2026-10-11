@@ -187,7 +187,7 @@ test('ledgers: only SENT/CONFIRMED payouts and APPLIED adjustments count; sectio
   spec.payouts = [{ seller_payout_id: 'SP1', seller_id: 'CUS002', payout_date: D('2026-10-09T04:00:00Z'), currency: 'USD', amount: 100, status: 'SENT',
     payment_method: 'Bank', reference: 'R1', fx_rate: 25300, payout_currency: 'VND', payout_amount: 2530000 },
   { seller_payout_id: 'SP2', seller_id: 'CUS002', payout_date: D('2026-10-09T04:00:00Z'), currency: 'USD', amount: 999, status: 'DRAFT' }];
-  spec.allocations = [{ allocation_id: H.sellerAllocationId_('SP1', 'ST-1'), seller_payout_id: 'SP1', seller_id: 'CUS002', settlement_id: 'ST-1', payment_source: 'PAYPAL', currency: 'USD', allocated_amount: 100 }];
+  spec.allocations = [{ allocation_id: H.sellerAllocationId_('SP1', 'SETTLEMENT', 'ST-1'), seller_payout_id: 'SP1', seller_id: 'CUS002', target_type: 'SETTLEMENT', target_id: 'ST-1', payment_source: 'PAYPAL', currency: 'USD', allocated_amount: 100 }];
   spec.adjustments = [{ adjustment_id: 'A1', adjustment_type: 'HOLD_RELEASE', seller_id: 'CUS002', currency: 'USD', amount: 5, status: 'APPLIED',
     effective_date: D('2026-10-10T04:00:00Z') }, { adjustment_id: 'A2', adjustment_type: 'MANUAL_ADJUSTMENT', seller_id: 'CUS002', currency: 'USD',
     amount: 50, status: 'PENDING', effective_date: D('2026-10-10T04:00:00Z') }];
@@ -196,7 +196,7 @@ test('ledgers: only SENT/CONFIRMED payouts and APPLIED adjustments count; sectio
   assert.ok(near(b[4], 5) && near(b[9], 100) && near(b[11 - 0], 25300) && near(b[12], 2530000));
   assert.ok(near(b[10], snap.totals.current_balance));
   const h = js(snap.blocks.PhieuDoiSoat.history);
-  assert.deepEqual(h.map((r) => r[0]), ['STRIPE #1 · UNPAID', 'PAYPAL #1 · PARTIAL', 'Payout', 'HOLD_RELEASE']);
+  assert.deepEqual(h.map((r) => r[0]), ['STRIPE #1 · UNPAID', 'PAYPAL #1 · PARTIAL', 'Payout', 'HOLD_RELEASE · UNPAID'], 'positive credit shows its payout state');
   assert.ok(near(h[2][7], 100), 'payout deducted once');
   assert.ok(near(h[3][10], 5) && near(h[3][11], snap.totals.seller_hold));
   assert.ok(!JSON.stringify(snap.blocks).includes('999'), 'DRAFT payout never published');
@@ -284,7 +284,7 @@ test('16-17 Section D: PAYPAL #1 · PAID / PAYPAL #2 · PARTIAL / STRIPE #1 · U
   spec.payouts = [{ seller_payout_id: 'SP-A', seller_id: 'CUS002', payout_date: D('2026-10-11T04:00:00Z'), currency: 'USD', amount: 150, status: 'CONFIRMED',
     payment_method: 'Bank', reference: 'W1' }, { seller_payout_id: 'SP-D', seller_id: 'CUS002', payout_date: D('2026-10-12T04:00:00Z'), currency: 'USD',
     amount: 40, status: 'DRAFT' }];
-  const a = (pid, st, amt) => ({ allocation_id: H.sellerAllocationId_(pid, st), seller_payout_id: pid, seller_id: 'CUS002', settlement_id: st,
+  const a = (pid, st, amt) => ({ allocation_id: H.sellerAllocationId_(pid, 'SETTLEMENT', st), seller_payout_id: pid, seller_id: 'CUS002', target_type: 'SETTLEMENT', target_id: st,
     payment_source: 'PAYPAL', currency: 'USD', allocated_amount: amt });
   spec.allocations = [a('SP-A', 'ST-1', 123), a('SP-A', 'ST-2', 27), a('SP-D', 'ST-2', 40)];
   const snap = build(spec).CUS002;
@@ -305,4 +305,30 @@ test('16-17 Section D: PAYPAL #1 · PAID / PAYPAL #2 · PARTIAL / STRIPE #1 · U
   broken.payouts = [{ seller_payout_id: 'SP-X', seller_id: 'CUS002', payout_date: D('2026-10-11T04:00:00Z'), currency: 'USD', amount: 10, status: 'SENT' }];
   assert.match(js(H.buildSellerOutputs_({ ...makeMaster(D, broken), sellers: broken.sellers, dateKeyOf: NY }).errors).join(),
     /Seller Payout Allocations: Seller Payout SP-X \(SENT\): allocated 0 of 10/, 'unallocated effective payout fails closed');
+});
+
+test('N Section D: positive HOLD_RELEASE shows UNPAID / PARTIAL / PAID; negative adjustments stay plain debits; no double effect', () => {
+  for (const [paidAmount, status] of [[0, 'UNPAID'], [2, 'PARTIAL'], [5, 'PAID']]) {
+    const spec = multiSpec();
+    spec.adjustments = [{ adjustment_id: 'HR1', adjustment_type: 'HOLD_RELEASE', seller_id: 'CUS002', currency: 'USD', amount: 5, status: 'APPLIED',
+      payment_source: 'PAYPAL', effective_date: D('2026-10-10T04:00:00Z') },
+    { adjustment_id: 'RF1', adjustment_type: 'REFUND', seller_id: 'CUS002', currency: 'USD', amount: -3, status: 'APPLIED', payment_source: 'PAYPAL',
+      effective_date: D('2026-10-10T04:00:00Z'), internal_transaction_id: 'P1' }];
+    if (paidAmount > 0) {
+      spec.payouts = [{ seller_payout_id: 'SP-H', seller_id: 'CUS002', payout_date: D('2026-10-12T04:00:00Z'), currency: 'USD', amount: paidAmount, status: 'SENT' }];
+      spec.allocations = [{ allocation_id: H.sellerAllocationId_('SP-H', 'ADJUSTMENT', 'HR1'), seller_payout_id: 'SP-H', seller_id: 'CUS002',
+        target_type: 'ADJUSTMENT', target_id: 'HR1', payment_source: 'PAYPAL', currency: 'USD', allocated_amount: paidAmount }];
+    }
+    const snap = build(spec).CUS002;
+    const h = js(snap.blocks.PhieuDoiSoat.history);
+    const credit = h.find((r) => r[0].startsWith('HOLD_RELEASE'));
+    assert.equal(credit[0], 'HOLD_RELEASE · ' + status);
+    assert.deepEqual([credit[4], credit[7], credit[8], credit[10]], [5, paidAmount, 5 - paidAmount, 5], 'due / allocated / remaining / hold released');
+    assert.ok(near(credit[6] - credit[5], 5), 'credit adds its amount to the running balance once');
+    const refund = h.find((r) => r[0] === 'REFUND');
+    assert.deepEqual([refund[4], refund[7]], [-3, 0], 'negative adjustment: plain debit row, no payout status');
+    const last = h[h.length - 1];
+    assert.ok(near(last[0] === 'Payout' ? last[8] : last[6], snap.totals.current_balance), 'ledger ends at the Seller Balances current balance');
+    assert.ok(near(snap.totals.current_balance, 123 + 170 + 5 - 3 - paidAmount), 'payout deducted exactly once');
+  }
 });

@@ -683,36 +683,45 @@ without writing while any upstream step is stale.
 
 - **Seller Payout** = the actual money transfer. It is the only thing that reduces Seller Balances
   (`current_balance = settled + APPLIED adjustments − SENT/CONFIRMED payouts`, unchanged).
-- **Seller Payout Allocation** = classification of that transfer to seller settlement obligations
-  (tab `Seller Payout Allocations`: `allocation_id, seller_payout_id, seller_id, settlement_id,
+- **Seller Payout Allocation** = classification of that transfer to payout obligations (tab
+  `Seller Payout Allocations`: `allocation_id, seller_payout_id, seller_id, target_type, target_id,
   payment_source, currency, allocated_amount, created_at, notes`; schema v15). Allocations never reduce a
-  balance again and never create money. `allocation_id = SPA-<sha256(seller_payout_id|settlement_id)>`;
-  unique by `seller_payout_id + settlement_id` (one payout may pay several settlements, one settlement may be
-  paid by several payouts).
-- **Obligation** per `seller_id + settlement_id + currency` = SUM of that seller's frozen Settlement Items
-  `seller_available_amount` in that settlement — never provider totals, non-AVAILABLE legs, balances or
-  seller-sheet values. Another seller's share of the same provider settlement is never allocatable.
-- **Effective** = parent payout SENT / CONFIRMED. DRAFT allocations are provisional (do not count as paid);
-  VOID allocations are ignored. Every SENT / CONFIRMED payout must be fully allocated (± 0.00005); no payout
-  may be over-allocated; no obligation over-paid; references, seller, payment source and currency must
-  match exactly. Any violation fails closed: `normalizeSellerBalances` and its freshness check (and
-  therefore seller-sheet sync) stop until the allocations are fixed.
-- **Derived per seller + settlement** (never stored): `due_amount`, `paid_amount` (effective allocations),
+  balance again and never create money. `allocation_id = SPA-<sha256(seller_payout_id|target_type|target_id)>`;
+  unique by `seller_payout_id + target_type + target_id` (one payout may pay several obligations, one
+  obligation may be paid by several payouts).
+- **Payout obligations** (what a payout can pay):
+  1. `SETTLEMENT` / `target_id = settlement_id`: due = SUM of the seller's frozen Settlement Items
+     `seller_available_amount` in that settlement + currency — never provider totals, non-AVAILABLE legs,
+     balances or seller-sheet values; another seller's share is never allocatable; payment source must match.
+  2. `ADJUSTMENT` / `target_id = adjustment_id`: a seller credit — status `APPLIED` and amount `> 0`, of any
+     type (e.g. `HOLD_RELEASE`, positive `MANUAL_ADJUSTMENT`); due = amount. Seller and currency must match;
+     payment source must equal the adjustment's (blank for a manual credit — never invented).
+  Negative / zero adjustments (REFUND, DISPUTE, DISPUTE_FEE, negative manual), PENDING and VOID adjustments
+  reduce or do not affect the balance but are never payout targets.
+- **Effective** = parent payout SENT / CONFIRMED. DRAFT allocations are provisional (not paid). VOID
+  allocations have no financial effect, but every row (VOID included) must be structurally valid (id,
+  references, target type, seller, currency, payment source, positive amount, no duplicate). Every SENT /
+  CONFIRMED payout must be fully allocated (± 0.00005) across settlement and/or adjustment obligations; no
+  payout may be over-allocated; no obligation over-paid. Any violation fails closed: `normalizeSellerBalances`,
+  its freshness check and therefore seller-sheet sync stop until the allocations are fixed.
+- **Derived per obligation** (never stored): `due_amount`, `paid_amount` (effective allocations),
   `remaining_amount = due − paid`, and `UNPAID` (paid 0) / `PARTIAL` / `PAID` (paid = due).
-- **`autoAllocateSellerPayoutFIFO(payoutId)`**: for one DRAFT payout, writes allocation rows for the oldest
-  open obligations of the same seller + currency first (provider payment date, period end, settlement
-  number, id); open = due − effective payments − other DRAFT payouts' provisional claims. It never changes
-  the payout (status stays DRAFT), never touches existing rows (a payout that already has allocations →
-  `NO_CHANGE`, operator review), is idempotent, and refuses a payout larger than the open obligations.
-- **`verifySellerPayoutAllocations()`** (read-only): row counts (draft / effective / void), effective payouts
-  and how many are fully allocated, every error class, per-seller due / paid / remaining, status counts,
-  the per-settlement states and a report-only production regression.
+- **`autoAllocateSellerPayoutFIFO(payoutId)`**: for one DRAFT payout, writes allocation rows against the
+  open obligations of the same seller + currency, oldest first — settlements by provider payment date,
+  adjustments by effective date; ties: SETTLEMENT before ADJUSTMENT, settlement period end / number, then
+  target id. Open = due − effective payments − other DRAFT payouts' claims (existing manual rows reserve
+  capacity). It never changes the payout (status stays DRAFT), never touches existing rows (a payout that
+  already has allocations → `NO_CHANGE`, operator review), is idempotent, and refuses (writes nothing) when
+  the payout exceeds the open obligations or an open obligation has no date.
+- **`verifySellerPayoutAllocations()`** (read-only): row counts (draft / effective / void, per target type),
+  effective payouts and how many are fully allocated, every error class, `settlement_due / _paid /
+  _remaining`, `adjustment_due / _paid / _remaining`, `total_payoutable_due / total_paid / total_remaining`,
+  the same per seller, status counts (total and per target type), every obligation state and a report-only
+  production regression (HUI settlement obligations 2132.2706 + 905.1734 = 3037.444, no payouts, no credits).
 - **Workflow**: 1) create the Seller Payout as DRAFT; 2) `autoAllocateSellerPayoutFIFO` or enter
   allocations manually; 3) review them (`verifySellerPayoutAllocations`); 4) set the payout to SENT /
   CONFIRMED; 5) `normalizeSellerBalances`; 6) `syncSellerSheets`; 7) PhieuDoiSoat section D shows each
-  period as PAID / PARTIAL / UNPAID.
-- Payouts are allocated only to settlement obligations in this phase (no allocation to standalone
-  adjustments yet), so an effective payout can never exceed the seller's open settlement obligations.
+  settlement and seller credit as PAID / PARTIAL / UNPAID.
 
 ## Seller child sheets (Phase 2K, output contract v2)
 
@@ -736,7 +745,8 @@ one hidden system tab:
 **Output schema 3 (Phase 2L)** — PhieuDoiSoat section D, same template geometry: a settlement row shows
 `Phát sinh phải trả` = this seller's due (frozen Settlement Items), `Đã payout seller (USD)` = effective
 allocations to it, `Còn nợ` = remaining for that period, and the label `<source> #<n> · PAID | PARTIAL |
-UNPAID`; `Tổng phải trả` (G) carries the running balance. `Payout` rows still show each actual SENT /
+UNPAID`; a positive APPLIED adjustment row works the same way (`HOLD_RELEASE · UNPAID`, …: due = amount);
+negative adjustments stay plain debit rows; `Tổng phải trả` (G) carries the running balance. `Payout` rows still show each actual SENT /
 CONFIRMED transfer (running balance in `Còn nợ`). Allocations have no balance effect, so nothing is
 deducted twice; TongHop_Thang `Đã payout seller` and section B keep using actual Seller Payouts. Existing
 schema-2 children are upgraded in place by the next sync (owned content + `_Sync` only; no reclone, no
