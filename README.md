@@ -699,7 +699,10 @@ INACTIVE + blank ID  -> clone template -> INACTIVE + registered ID -> sync + ver
 ```
 
 1. Same Master freshness gates as `syncSellerSheets`; the seller must exist and have valid Seller
-   Terms; exactly one Seller Destinations row; an ACTIVE row is never cloned again.
+   Terms; exactly one Seller Destinations row; an ACTIVE row is never cloned again. A known seller
+   with no row gets one appended (`INACTIVE`, blank ID, note "Auto-created by seller sheet
+   provisioning") — never for unknown sellers, duplicate rows or an invalid Seller Destinations
+   config; the row is kept for a retry if a later step fails.
 2. Template / folder checks before any clone: both Settings values are Drive IDs; the template is an
    accessible Google Spreadsheet that is not the Payment Master, a provider source spreadsheet or a
    registered seller destination; the folder is accessible.

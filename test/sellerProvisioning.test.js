@@ -271,8 +271,82 @@ blocked('seller without valid Seller Terms', { master: master({ terms: ['CUS001'
 blocked('unknown seller', {}, /Unknown seller CUS999/, 'CUS999');
 blocked('stale Master', { gates: { current: false, gates: { seller_balances: false }, reasons: ['Seller Balances is stale'] } },
   /Payment Master is not current/);
-blocked('seller without a destination row', { master: master({ destinations: [{ seller_id: 'CUS002', seller_name_snapshot: 'HUI', spreadsheet_id: '', status: 'INACTIVE' }] }) },
-  /Expected exactly one Seller Destinations row for CUS001, found 0/);
+
+// ---- Auto-created destination row ---------------------------------------------------------------------------
+const rowsFor = (m, sellerId) => m.getSheetByName('Seller Destinations').grid.slice(1).filter((r) => r[0] === sellerId);
+const onlyCus002 = () => master({ destinations: [{ seller_id: 'CUS002', seller_name_snapshot: 'HUI', spreadsheet_id: '', status: 'INACTIVE', notes: 'seed' }] });
+function watchProvisioning(sellerId) {
+  const seen = {};
+  const getFile = context.DriveApp.getFileById;
+  context.DriveApp.getFileById = (id) => {
+    const f = getFile(id);
+    const mc = f.makeCopy;
+    f.makeCopy = (name, folder) => {
+      seen.atClone = rowsFor(env.master, sellerId).map((r) => r.slice());
+      const res = mc(name, folder);
+      env.children[res.getId()].onFirstWrite = () => { seen.atSync = rowsFor(env.master, sellerId).map((r) => r.slice()); };
+      return res;
+    };
+    return f;
+  };
+  return seen;
+}
+
+test('seller with valid Seller Terms but no destination row: one INACTIVE row is created and provisioning succeeds in one call', () => {
+  install({ master: onlyCus002() });
+  const seen = watchProvisioning('CUS001');
+  const r = js(H.runCreateSellerSheet_('CUS001'));
+  assert.equal(r.status, 'SUCCESS', r.error);
+  assert.equal(r.destination_row_created, true);
+  assert.equal(env.copies.length, 1);
+  assert.equal(seen.atClone.length, 1);
+  assert.deepEqual(seen.atClone[0].slice(0, 5), ['CUS001', 'DITECH', '', 'INACTIVE', 'Auto-created by seller sheet provisioning'], 'INACTIVE + blank before clone');
+  assert.deepEqual(seen.atSync[0].slice(2, 4), [r.spreadsheet_id, 'INACTIVE'], 'registered, still INACTIVE during sync');
+  const rows = rowsFor(env.master, 'CUS001');
+  assert.equal(rows.length, 1, 'exactly one row');
+  assert.deepEqual(rows[0].slice(0, 5), ['CUS001', 'DITECH', r.spreadsheet_id, 'ACTIVE', 'Auto-created by seller sheet provisioning']);
+  assert.equal(rowsFor(env.master, 'CUS002').length, 1, 'other rows untouched');
+});
+
+test('auto-created row stays INACTIVE and is reused when provisioning fails (before or after the clone)', () => {
+  install({ master: onlyCus002(), folderInaccessible: true });
+  const m = env.master;
+  const early = js(H.runCreateSellerSheet_('CUS001'));
+  assert.equal(early.status, 'FAILED');
+  assert.match(early.error, /seller_output_folder_id is not accessible/);
+  assert.deepEqual(rowsFor(m, 'CUS001').map((r) => r.slice(0, 4)), [['CUS001', 'DITECH', '', 'INACTIVE']]);
+  assert.equal(env.copies.length, 0);
+  install({ master: m, failCopies: true });
+  const late = js(H.runCreateSellerSheet_('CUS001'));
+  assert.equal(late.status, 'FAILED');
+  assert.equal(late.destination_row_created, false, 'the existing row is reused, not duplicated');
+  assert.deepEqual(rowsFor(m, 'CUS001').map((r) => r.slice(0, 4)), [['CUS001', 'DITECH', late.spreadsheet_id, 'INACTIVE']]);
+  env.children[late.spreadsheet_id].failWrites = false;
+  const retry = js(H.runCreateSellerSheet_('CUS001'));
+  assert.equal(retry.status, 'SUCCESS', retry.error);
+  assert.equal(retry.reused_existing_copy, true);
+  assert.equal(env.copies.length, 1);
+  assert.deepEqual(rowsFor(m, 'CUS001').map((r) => r.slice(2, 4)), [[late.spreadsheet_id, 'ACTIVE']]);
+});
+
+test('no row is auto-created for duplicate rows, unknown sellers or an invalid Seller Destinations config', () => {
+  install({ master: master({ destinations: [{ seller_id: 'CUS001', seller_name_snapshot: 'DITECH', spreadsheet_id: '', status: 'INACTIVE' },
+    { seller_id: 'CUS001', seller_name_snapshot: 'DITECH', spreadsheet_id: '', status: 'INACTIVE' }] }) });
+  const dup = js(H.runCreateSellerSheet_('CUS001'));
+  assert.equal(dup.status, 'FAILED');
+  assert.match(dup.error, /Seller Destinations is invalid.*CUS001: 2 rows/);
+  assert.equal(rowsFor(env.master, 'CUS001').length, 2);
+  assert.equal(env.copies.length, 0);
+  install({ master: onlyCus002() });
+  const unknown = js(H.runCreateSellerSheet_('CUS999'));
+  assert.match(unknown.error, /Unknown seller CUS999/);
+  assert.equal(env.master.getSheetByName('Seller Destinations').grid.slice(1).filter((r) => r[0] !== '').length, 1);
+  install({ master: master({ destinations: [{ seller_id: 'CUS002', seller_name_snapshot: 'HUI', spreadsheet_id: MASTER_ID, status: 'INACTIVE' }] }) });
+  const leak = js(H.runCreateSellerSheet_('CUS001'));
+  assert.match(leak.error, /Seller Destinations is invalid; no seller sheet written/);
+  assert.equal(rowsFor(env.master, 'CUS001').length, 0);
+  assert.equal(env.copies.length, 0);
+});
 
 test('a registered copy shared with another (INACTIVE) row is never reused', () => {
   const shared = 'SHARED_COPY_ID_000000000000000001';

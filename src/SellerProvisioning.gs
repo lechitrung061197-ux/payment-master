@@ -5,6 +5,9 @@
  *
  * Recoverable lifecycle of a Seller Destinations row:
  *   INACTIVE + blank ID -> clone template -> INACTIVE + registered ID -> sync + verify -> ACTIVE.
+ * - A known seller with valid Seller Terms but no Seller Destinations row gets exactly one INACTIVE row
+ *   (blank ID) appended first; this never happens for unknown sellers, duplicate rows or an invalid
+ *   (leak-risk) Seller Destinations config, and the row is kept for a retry if provisioning later fails.
  * - The copy's ID is registered immediately (still INACTIVE), so a failed sync/verification leaves a
  *   registered copy that the next createSellerSheet reuses; a second copy is never cloned and failed
  *   copies are never deleted automatically.
@@ -26,6 +29,7 @@ const SELLER_PROVISIONING = Object.freeze({
   driveIdPattern: /^[A-Za-z0-9_-]{20,}$/,
   spreadsheetMimeType: 'application/vnd.google-apps.spreadsheet',
   menuTitle: 'Seller Sheets',
+  autoCreatedNote: 'Auto-created by seller sheet provisioning',
 });
 
 /* ----------------------------- Pure helpers ----------------------------- */
@@ -125,6 +129,15 @@ function formatSellerVerifyAlert_(report, hiddenIds) {
 
 /* ---------------------------------- I/O --------------------------------- */
 
+/** Appends one Seller Destinations row after the last used row. */
+function appendSellerDestinationRow_(ss, obj) {
+  const sheet = ss.getSheetByName(SHEETS.SELLER_DESTINATIONS);
+  const columns = getColumnNames_(SHEETS.SELLER_DESTINATIONS);
+  const target = sheet.getLastRow() + 1;
+  if (sheet.getMaxRows() < target) sheet.insertRowsAfter(sheet.getMaxRows(), target - sheet.getMaxRows());
+  sheet.getRange(target, 1, 1, columns.length).setValues([objectToRow_(obj, columns)]);
+}
+
 function writeSellerDestinationCell_(ss, row, column, value) {
   const sheet = ss.getSheetByName(SHEETS.SELLER_DESTINATIONS);
   sheet.getRange(row, getColumnIndex_(SHEETS.SELLER_DESTINATIONS, column)).setValue(value);
@@ -157,7 +170,7 @@ function readCreateSellerSheetCandidates_() {
 function runCreateSellerSheet_(sellerId) {
   const id = trimmedText_(sellerId);
   const details = { seller_id: id, seller_name: '', spreadsheet_id: '', destination_status: '', sync_status: null, verified: false,
-    reused_existing_copy: false, created_copy: false, warnings: [] };
+    reused_existing_copy: false, created_copy: false, destination_row_created: false, warnings: [] };
   return withSellerSheetsLock_('SELLER_SHEET_CREATE_', id, details, function () {
     const ss = getSpreadsheet_();
     // 2. Master accounting freshness (same gates as syncSellerSheets).
@@ -169,9 +182,21 @@ function runCreateSellerSheet_(sellerId) {
     const terms = readSellerTermsValidity_(ss);
     if (!terms.current) throw new Error(terms.reason);
     if (!terms.terms.some(function (t) { return t.seller_id === id; })) throw new Error('Seller ' + id + ' has no valid Seller Terms row.');
-    // 4-5. Exactly one destination row, not ACTIVE.
-    const dest = readValidSellerDestinations_(ss, details);
-    const rows = dest.parsed.destinations.filter(function (d) { return d.seller_id === id; });
+    // 4-5. Exactly one destination row, not ACTIVE. A known seller without a row gets one INACTIVE row
+    // (only when the whole Seller Destinations config is valid; duplicates still fail).
+    let dest = readValidSellerDestinations_(ss, details);
+    let rows = dest.parsed.destinations.filter(function (d) { return d.seller_id === id; });
+    if (rows.length === 0) {
+      appendSellerDestinationRow_(ss, { seller_id: id, seller_name_snapshot: seller.seller_name, spreadsheet_id: '',
+        status: SELLER_DESTINATIONS.inactiveStatus, notes: SELLER_PROVISIONING.autoCreatedNote });
+      SpreadsheetApp.flush();
+      details.destination_row_created = true;
+      dest = readValidSellerDestinations_(ss, details);
+      rows = dest.parsed.destinations.filter(function (d) { return d.seller_id === id; });
+      if (rows.length !== 1 || rows[0].status !== SELLER_DESTINATIONS.inactiveStatus || rows[0].spreadsheet_id !== '') {
+        throw new Error('Auto-created Seller Destinations row for ' + id + ' could not be verified.');
+      }
+    }
     if (rows.length !== 1) {
       throw new Error('Expected exactly one Seller Destinations row for ' + id + ', found ' + rows.length +
         ' (add an INACTIVE row with a blank spreadsheet_id).');
