@@ -17,9 +17,17 @@
  * - Not yet RECONCILED: base values only, provider economics and settlement blank, WAITING_SETTLEMENT.
  * - Per-settlement aggregates of legs must equal the Settlements header (counts, gross, fee, net,
  *   provider fee, provider hold, derived transaction payout).
- * - Seller fields and refund/dispute fields stay blank (blank = not computed, not zero).
+ * - Seller economics (Phase 2I): the leg's internal Transaction (exact payment_source +
+ *   internal_transaction_id) must be MAPPED to a seller; seller_fee_rate comes from the Seller Terms
+ *   row in effect on the transaction's created date (Master timezone); seller_fee = net x rate
+ *   (unrounded). With actual provider economics: seller_hold_amount = provider_hold_amount (KH001
+ *   MIRROR_PROVIDER, 1:1), seller_hold_rate = hold / net, seller_available_amount = net - seller_fee -
+ *   seller_hold_amount. Without actual provider hold, seller hold / available stay blank (never estimated).
+ *   system_margin = seller_fee - provider_fee (reported, not stored).
+ * - Refund/dispute fields stay blank (blank = not computed, not zero).
  * - Upstream freshness gates: Transactions, Provider Transactions KH001, Payment Matches and
- *   Settlements KH001 must all be current. Writes only Payment Legs (SafeSwap) and Audit Log.
+ *   Settlements KH001 must all be current and Seller Terms valid. Writes only Payment Legs (SafeSwap)
+ *   and Audit Log.
  *
  * The first part of this file is pure (unit-tested in Node); the I/O part follows.
  */
@@ -51,6 +59,18 @@ const PAYMENT_LEGS_REGRESSION = Object.freeze({
   provider_transaction_payout_total: 8472.1254,
   provider_fee_rate_counts: { '7.00%': 168 },
   provider_hold_rate_counts: { '10.00%': 168 },
+  seller_fee_rate_counts: { '8.00%': 168 },
+  seller_hold_rate_counts: { '10.00%': 168 },
+  seller_fee_total: 816.5904,
+  seller_hold_total: 1020.738,
+  seller_available_total: 8370.0516,
+  system_margin_total: 102.0738,
+  by_seller: {
+    CUS001: { count: 43, net: 2340.73, seller_fee: 187.2584, seller_hold: 234.073, seller_available: 1919.3986, system_margin: 23.4073 },
+    CUS002: { count: 74, net: 3704.2, seller_fee: 296.336, seller_hold: 370.42, seller_available: 3037.444, system_margin: 37.042 },
+    CUS003: { count: 4, net: 313.13, seller_fee: 25.0504, seller_hold: 31.313, seller_available: 256.7666, system_margin: 3.1313 },
+    CUS004: { count: 47, net: 3849.32, seller_fee: 307.9456, seller_hold: 384.932, seller_available: 3156.4424, system_margin: 38.4932 },
+  },
 });
 
 /* ----------------------------- Pure helpers ----------------------------- */
@@ -66,7 +86,7 @@ function microsDiff_(a, b) {
 
 function emptyLegErrors_() {
   return { duplicate_leg_keys: [], missing_provider_transactions: [], unsupported: [], provider_amount_mismatches: [],
-    provider_economics_errors: [], settlement_resolution_errors: [], settlement_aggregate_errors: [] };
+    provider_economics_errors: [], settlement_resolution_errors: [], settlement_aggregate_errors: [], seller_economics_errors: [] };
 }
 
 function flattenLegErrors_(errors) {
@@ -76,9 +96,11 @@ function flattenLegErrors_(errors) {
 /**
  * Builds Payment Legs (objects, updated_at blank).
  * @param {{matches: Array<Object>, providerTransactions: Array<Object>, reconciledValues: Array<Array<*>>,
- *          settlements: Array<Object>, providerDateKeyOf: function(*): string,
- *          settlementDateKeyOf: function(*): string, digestHex?: Function}} input
+ *          settlements: Array<Object>, transactions: Array<Object>, sellerTerms: Array<Object>,
+ *          providerDateKeyOf: function(*): string, settlementDateKeyOf: function(*): string,
+ *          transactionDateKeyOf: function(*): string, digestHex?: Function}} input
  *   settlements: stored Settlements rows (objects, all providers); dates are Master date values.
+ *   sellerTerms: parsed Seller Terms (parseSellerTerms_().terms).
  */
 function buildPaymentLegs_(input) {
   const errors = emptyLegErrors_();
@@ -96,6 +118,9 @@ function buildPaymentLegs_(input) {
   keyCount(input.providerTransactions, 'external_transaction_id').forEach(function (k) { errors.duplicate_leg_keys.push('Provider Transactions key ' + k); });
   const ptById = {};
   input.providerTransactions.forEach(function (p) { ptById[String(p.provider_transaction_id)] = p; });
+  const txByKey = {};
+  (input.transactions || []).forEach(function (t) { txByKey[String(t.payment_source) + '|' + String(t.internal_transaction_id)] = t; });
+  const legSellers = {};
 
   // Raw KH001 Reconciled index (exact Transaction ID).
   let rc = null;
@@ -188,6 +213,30 @@ function buildPaymentLegs_(input) {
         leg.settlement_status = 'SETTLED';
       }
     }
+
+    // Seller economics: exact internal transaction -> seller -> effective Seller Terms.
+    const tx = txByKey[String(m.payment_source) + '|' + String(m.internal_transaction_id)];
+    if (!tx) { errors.seller_economics_errors.push(label + ': internal Transaction ' + m.internal_transaction_id + ' not found'); return; }
+    if (tx.ownership_status !== 'MAPPED' || trimmedText_(tx.seller_id) === '') {
+      errors.seller_economics_errors.push(label + ': internal Transaction ' + m.internal_transaction_id + ' is not assigned to a seller');
+      return;
+    }
+    const sellerId = trimmedText_(tx.seller_id);
+    let term;
+    try {
+      term = resolveSellerTerm_(input.sellerTerms || [], sellerId, input.transactionDateKeyOf(tx.created_at));
+    } catch (e) {
+      errors.seller_economics_errors.push(label + ': ' + e.message);
+      return;
+    }
+    leg.seller_fee_rate = term.seller_fee_rate;
+    if (isFiniteNumber_(leg.net_amount)) leg.seller_fee = leg.net_amount * term.seller_fee_rate;
+    if (isFiniteNumber_(leg.provider_hold_amount) && isFiniteNumber_(leg.seller_fee)) {
+      leg.seller_hold_amount = leg.provider_hold_amount; // KH001 MIRROR_PROVIDER: exact provider hold
+      leg.seller_hold_rate = leg.net_amount !== 0 ? leg.provider_hold_amount / leg.net_amount : '';
+      leg.seller_available_amount = leg.net_amount - leg.seller_fee - leg.seller_hold_amount;
+    }
+    legSellers[leg.payment_leg_id] = sellerId;
     legs.push(leg);
   });
 
@@ -201,7 +250,7 @@ function buildPaymentLegs_(input) {
     return compareCanonicalValues_(a.payment_source, b.payment_source) ||
       compareCanonicalValues_(String(a.external_transaction_id), String(b.external_transaction_id));
   });
-  return { legs: legs, errors: errors, stats: { eligible_match_rows: eligible.length } };
+  return { legs: legs, errors: errors, legSellers: legSellers, stats: { eligible_match_rows: eligible.length } };
 }
 
 /** Aggregates legs per settlement_id and compares with the KH001 Settlements headers. */
@@ -256,8 +305,8 @@ function mergePaymentLegTimestamps_(freshLegs, existingLegs, now, columns) {
   return { legs: legs, errors: disappeared.map(function (id) { return 'Existing Payment Leg ' + id + ' is no longer produced'; }) };
 }
 
-/** Generic summary of Payment Legs (no snapshot-specific numbers). */
-function summarizePaymentLegs_(legs) {
+/** Generic summary of Payment Legs (no snapshot-specific numbers). legSellers: payment_leg_id -> seller_id. */
+function summarizePaymentLegs_(legs, legSellers) {
   const tally = function (keyOf) {
     return legs.reduce(function (acc, l) { const k = keyOf(l); acc[k] = (acc[k] || 0) + 1; return acc; }, {});
   };
@@ -288,7 +337,41 @@ function summarizePaymentLegs_(legs) {
     unreconciled_provider_rows: legs.length - withEconomics.length,
     provider_fee_rate_counts: tally(function (l) { return pct(l.provider_fee_rate); }),
     provider_hold_rate_counts: tally(function (l) { return pct(l.provider_hold_rate); }),
+    seller_fee_rate_counts: tally(function (l) { return pct(l.seller_fee_rate); }),
+    seller_hold_rate_counts: tally(function (l) { return pct(l.seller_hold_rate); }),
+    seller_fee_total: sumMicros('seller_fee'),
+    seller_hold_total: sumMicros('seller_hold_amount'),
+    seller_available_total: sumMicros('seller_available_amount'),
+    system_margin_total: withEconomics.reduce(function (acc, l) {
+      return acc + (isFiniteNumber_(l.seller_fee) ? Math.round((l.seller_fee - l.provider_fee) * 1e6) : 0);
+    }, 0) / 1e6,
+    seller_hold_mismatches: withEconomics.filter(function (l) {
+      return !isFiniteNumber_(l.seller_hold_amount) || microsDiff_(l.seller_hold_amount, l.provider_hold_amount) !== 0;
+    }).map(function (l) { return l.payment_leg_id; }),
+    seller_available_equation_errors: legs.filter(function (l) {
+      return isFiniteNumber_(l.seller_available_amount) &&
+        microsDiff_(l.seller_available_amount, l.net_amount - l.seller_fee - l.seller_hold_amount) !== 0;
+    }).map(function (l) { return l.payment_leg_id; }),
+    by_seller: summarizeLegsBySeller_(legs, legSellers || {}),
   };
+}
+
+/** Per seller: count, net, seller fee / hold / available, system margin (micro-unit sums). */
+function summarizeLegsBySeller_(legs, legSellers) {
+  const out = {};
+  const add = function (o, k, v) { o[k] += isFiniteNumber_(v) ? Math.round(v * 1e6) : 0; };
+  legs.forEach(function (l) {
+    const id = legSellers[l.payment_leg_id] || '(unknown)';
+    const o = out[id] = out[id] || { count: 0, net: 0, seller_fee: 0, seller_hold: 0, seller_available: 0, system_margin: 0 };
+    o.count++;
+    add(o, 'net', l.net_amount); add(o, 'seller_fee', l.seller_fee); add(o, 'seller_hold', l.seller_hold_amount);
+    add(o, 'seller_available', l.seller_available_amount);
+    if (isFiniteNumber_(l.seller_fee) && isFiniteNumber_(l.provider_fee)) o.system_margin += Math.round((l.seller_fee - l.provider_fee) * 1e6);
+  });
+  Object.keys(out).forEach(function (id) {
+    ['net', 'seller_fee', 'seller_hold', 'seller_available', 'system_margin'].forEach(function (k) { out[id][k] = out[id][k] / 1e6; });
+  });
+  return out;
 }
 
 function evaluatePaymentLegsRegression_(summary) {
@@ -301,7 +384,20 @@ function evaluatePaymentLegsRegression_(summary) {
   };
   add('payment_leg_rows', exp.payment_leg_rows, summary.payment_leg_rows, summary.payment_leg_rows === exp.payment_leg_rows);
   ['payment_source_counts', 'provider_counts', 'settlement_counts', 'status_counts', 'provider_fee_rate_counts',
-    'provider_hold_rate_counts'].forEach(function (k) { add(k, exp[k], summary[k], same(exp[k], summary[k])); });
+    'provider_hold_rate_counts', 'seller_fee_rate_counts', 'seller_hold_rate_counts'].forEach(function (k) {
+    add(k, exp[k], summary[k], same(exp[k], summary[k] || {}));
+  });
+  ['seller_fee_total', 'seller_hold_total', 'seller_available_total', 'system_margin_total'].forEach(function (k) {
+    add(k, exp[k], summary[k], Math.abs(summary[k] - exp[k]) < 0.00005);
+  });
+  Object.keys(exp.by_seller).forEach(function (id) {
+    const e = exp.by_seller[id];
+    const a = (summary.by_seller || {})[id] || {};
+    Object.keys(e).forEach(function (k) {
+      add('by_seller.' + id + '.' + k, e[k], a[k] === undefined ? null : a[k],
+        k === 'count' ? a[k] === e[k] : isFiniteNumber_(a[k]) && Math.abs(a[k] - e[k]) < 0.00005);
+    });
+  });
   [['gross_total', 0.005], ['processing_fee_total', 0.005], ['net_total', 0.005], ['provider_fee_total', 0.00005],
     ['provider_hold_total', 0.00005], ['provider_transaction_payout_total', 0.00005]].forEach(function (t) {
     add(t[0], exp[t[0]], summary[t[0]], Math.abs(summary[t[0]] - exp[t[0]]) < t[1]);
@@ -323,6 +419,7 @@ function readPaymentLegsUpstream_(ss) {
     provider_transactions: readProviderTransactionsFreshness_(ss),
     payment_matches: readPaymentMatchesFreshness_(ss),
     settlements: readKh001SettlementsFreshness_(ss),
+    seller_terms: readSellerTermsValidity_(ss),
   };
 }
 
@@ -333,13 +430,17 @@ function readPaymentLegsInputs_(ss) {
   const rcSheet = ss.getSheetByName(SHEETS.RAW_KH001_RECONCILED);
   if (!rcSheet) throw new Error('Raw tab "' + SHEETS.RAW_KH001_RECONCILED + '" not found.');
   const timeZone = String(getRequiredSetting_(readSettingsMap_(), KH001_SETTLEMENTS.timezoneSetting));
+  const transactions = readSchemaTableObjects_(ss, SHEETS.TRANSACTIONS, transactionsTab_());
   return buildPaymentLegs_({
     matches: matches.rows,
     providerTransactions: pt.rows,
     reconciledValues: readSheetGrid_(rcSheet).values,
     settlements: settlements.rows,
+    transactions: transactions.rows,
+    sellerTerms: readSellerTermsValidity_(ss).terms,
     providerDateKeyOf: function (v) { return providerDateKey_(v, timeZone); },
     settlementDateKeyOf: masterDateKey_,
+    transactionDateKeyOf: masterDateKey_,
   });
 }
 
@@ -366,8 +467,8 @@ function runPaymentLegsNormalizer_() {
     details.recovery_actions = recovery.actions;
 
     const upstream = readPaymentLegsUpstream_(ss);
-    Object.keys(upstream).forEach(function (k) { details[k + '_current'] = upstream[k].current; });
-    ['transactions', 'provider_transactions', 'payment_matches', 'settlements'].forEach(function (k) {
+    Object.keys(upstream).forEach(function (k) { details[k === 'seller_terms' ? 'seller_terms_valid' : k + '_current'] = upstream[k].current; });
+    ['transactions', 'provider_transactions', 'payment_matches', 'settlements', 'seller_terms'].forEach(function (k) {
       if (!upstream[k].current) throw new Error(upstream[k].reason);
     });
 
@@ -381,9 +482,10 @@ function runPaymentLegsNormalizer_() {
     throwIfLegErrors_('Payment Legs would disappear', merged.errors);
     const rows = merged.legs.map(function (o) { return objectToRow_(o, columns); });
     const expected = computeRawChecksum_(buildTableValues_(columns, rows));
-    const summary = summarizePaymentLegs_(merged.legs);
+    const summary = summarizePaymentLegs_(merged.legs, built.legSellers);
     ['payment_leg_rows', 'status_counts', 'settlement_counts', 'net_total', 'provider_fee_total', 'provider_hold_total',
-      'provider_transaction_payout_total'].forEach(function (k) { details[k] = summary[k]; });
+      'provider_transaction_payout_total', 'seller_fee_total', 'seller_hold_total', 'seller_available_total',
+      'system_margin_total'].forEach(function (k) { details[k] = summary[k]; });
     details.payment_legs_checksum = expected;
     if (expected === current.grid.checksum) {
       status = 'NO_CHANGE';
@@ -420,7 +522,9 @@ function buildPaymentLegsReport_() {
     unreconciled_provider_rows: 0, settlement_counts: {}, duplicate_leg_keys: [], missing_provider_transactions: [],
     unsupported_providers: [], provider_amount_mismatches: [], provider_economics_errors: [], settlement_resolution_errors: [],
     settlement_aggregate_errors: [], disappearing_payment_legs: [], transactions_current: false,
-    provider_transactions_current: false, payment_matches_current: false, settlements_current: false,
+    provider_transactions_current: false, payment_matches_current: false, settlements_current: false, seller_terms_valid: false,
+    seller_economics_errors: [], seller_fee_total: 0, seller_hold_total: 0, seller_available_total: 0, system_margin_total: 0,
+    seller_hold_mismatches: [], seller_available_equation_errors: [], by_seller: {},
     payment_legs_match: false, swap_state: null, pass: false, errors: [], warnings: [], regression: null,
   };
   try {
@@ -430,7 +534,7 @@ function buildPaymentLegsReport_() {
     if (report.swap_state !== 'NORMAL') report.errors.push('Payment Legs swap state is ' + report.swap_state);
     const upstream = readPaymentLegsUpstream_(ss);
     Object.keys(upstream).forEach(function (k) {
-      report[k + '_current'] = upstream[k].current;
+      report[k === 'seller_terms' ? 'seller_terms_valid' : k + '_current'] = upstream[k].current;
       if (!upstream[k].current) report.errors.push(upstream[k].reason);
     });
 
@@ -443,10 +547,14 @@ function buildPaymentLegsReport_() {
     report.provider_economics_errors = built.errors.provider_economics_errors;
     report.settlement_resolution_errors = built.errors.settlement_resolution_errors;
     report.settlement_aggregate_errors = built.errors.settlement_aggregate_errors;
+    report.seller_economics_errors = built.errors.seller_economics_errors;
     if (flattenLegErrors_(built.errors).length > 0) report.errors.push('Payment Legs input has ' + flattenLegErrors_(built.errors).length + ' error(s).');
 
-    const summary = summarizePaymentLegs_(built.legs);
+    const summary = summarizePaymentLegs_(built.legs, built.legSellers);
     Object.keys(summary).forEach(function (k) { if (k in report) report[k] = summary[k]; });
+    if (summary.seller_hold_mismatches.length + summary.seller_available_equation_errors.length > 0) {
+      report.errors.push('Seller economics invariants failed.');
+    }
 
     const columns = getColumnNames_(SHEETS.PAYMENT_LEGS);
     const current = readSchemaTableObjects_(ss, SHEETS.PAYMENT_LEGS, tab);

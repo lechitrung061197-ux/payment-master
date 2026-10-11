@@ -16,7 +16,8 @@ const Utilities = {
 };
 const context = vm.createContext({ Utilities });
 for (const f of ['Config', 'Utils', 'RawSnapshot', 'CanonicalTable', 'Kh001ProviderTransactions', 'Kh001ProviderEvents',
-  'Kh001Settlements', 'SellerMapping', 'EndpointKeyMigration', 'InternalTransactions', 'PaymentReconciliation', 'PaymentLegs']) {
+  'Kh001Settlements', 'SellerMapping', 'EndpointKeyMigration', 'InternalTransactions', 'PaymentReconciliation', 'SellerTerms',
+  'PaymentLegs']) {
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'src', f + '.gs'), 'utf8'), context, { filename: f + '.gs' });
 }
 const H = context;
@@ -63,6 +64,10 @@ function fixture(o) {
     settlements: o.settlements || [settlement(1, '2026-10-04', [r1, r2]), settlement(2, '2026-10-09', [r3])],
     providerDateKeyOf: (v) => H.providerDateKey_(v, 'America/Los_Angeles'),
     settlementDateKeyOf: (v) => H.providerDateKey_(v, 'America/New_York'),
+    transactions: o.transactions || ['TX1', 'TX2', 'TX3', 'MP', 'AM'].map((id) => ({ internal_transaction_id: id, payment_source: 'PAYPAL',
+      ownership_status: 'MAPPED', seller_id: 'SLR-000001', created_at: D('2026-10-02T15:00:00Z') })),
+    sellerTerms: o.sellerTerms || [{ seller_id: 'SLR-000001', seller_fee_rate: 0.08, effective_from: '2026-10-01', effective_to: '' }],
+    transactionDateKeyOf: (v) => H.providerDateKey_(v, 'America/New_York'),
   };
 }
 const build = (o) => H.buildPaymentLegs_(fixture(o));
@@ -192,11 +197,11 @@ test('settlement aggregate cross-check (count, amounts, unrounded provider fee/h
 });
 
 // ---- Blank fields / timestamps -------------------------------------------------------------------
-test('seller economics and refund/dispute fields stay blank; no Transactions fields', () => {
+test('refund/dispute fields stay blank; seller economics are computed (Phase 2I); no Transactions fields', () => {
   Object.values(legs(build())).forEach((l) => {
-    ['seller_fee_rate', 'seller_fee', 'seller_hold_rate', 'seller_hold_amount', 'seller_available_amount', 'refund_amount',
-      'dispute_amount', 'dispute_fee'].forEach((f) => assert.equal(l[f], '', f));
-    assert.notEqual(l.settlement_status, 'AVAILABLE');
+    ['refund_amount', 'dispute_amount', 'dispute_fee'].forEach((f) => assert.equal(l[f], '', f));
+    assert.equal(l.seller_fee_rate, 0.08);
+    assert.equal(l.seller_hold_amount, l.provider_hold_amount);
   });
   assert.equal(PL_COLUMNS.length, 26);
   assert.ok(!PL_COLUMNS.includes('status'), 'Payment Legs never carries Transactions.status');

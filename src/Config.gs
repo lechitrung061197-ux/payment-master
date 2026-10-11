@@ -9,7 +9,7 @@
 
 const APP = Object.freeze({
   NAME: 'Payment Master',
-  SCHEMA_VERSION: 10,
+  SCHEMA_VERSION: 11,
   LOCALE: 'en_US',
   TIMEZONE: 'America/New_York',
   DEFAULT_CURRENCY: 'USD',
@@ -97,6 +97,7 @@ const SELLER_ENDPOINT_SLOTS = 10;
 const SHEETS = Object.freeze({
   SETTINGS: 'Settings',
   SELLERS: 'Sellers',
+  SELLER_TERMS: 'Seller Terms',
   ENDPOINT_MAPPING: 'Endpoint Mapping',
   RAW_INTERNAL_TRANSACTIONS: 'Raw Internal Transactions',
   SOURCE_SYSTEM: 'Source System',
@@ -169,6 +170,22 @@ const SCHEMA = Object.freeze([
     ].concat(sellerEndpointColumns_(SELLER_ENDPOINT_SLOTS)).concat([
       col_('notes', T.TEXT),
     ]),
+  },
+  {
+    sheet: SHEETS.SELLER_TERMS,
+    description: 'Effective-dated seller FEE history (user-edited). One open-ended row per seller at most; periods ' +
+      'never overlap. A transaction uses the row with effective_from <= created date <= effective_to (blank = ' +
+      'open). To change a fee: close the old row (effective_to) and add a new row. Seller hold is NOT configured ' +
+      'here: KH001 seller hold mirrors the actual provider hold 1:1. Seeded once from Settings seller_fee_rate ' +
+      'only while this tab is empty.',
+    columns: [
+      col_('seller_id', T.ID),
+      col_('seller_name_snapshot', T.TEXT),
+      col_('seller_fee_rate', T.RATE),
+      col_('effective_from', T.DATE),
+      col_('effective_to', T.DATE),
+      col_('notes', T.TEXT),
+    ],
   },
   {
     sheet: SHEETS.ENDPOINT_MAPPING,

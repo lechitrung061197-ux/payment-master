@@ -46,6 +46,13 @@ function runSetup_() {
   const oldSchemaVersion = readSettingValue_(ss, 'schema_version');
   const renamedKeys = migrateSettingKeys_(ss, warnings);
   seedSettings_(ss);
+  // The only business data setup may write: the initial Seller Terms, and only while empty.
+  let sellerTermsSeeded = 0;
+  try {
+    sellerTermsSeeded = seedSellerTermsIfEmpty_(ss, warnings);
+  } catch (err) {
+    warnings.push('Seller Terms not seeded: ' + (err && err.message ? err.message : String(err)));
+  }
   SpreadsheetApp.flush();
 
   appendAuditLog_({
@@ -54,13 +61,14 @@ function runSetup_() {
     entityId: ss.getId(),
     oldStatus: oldSchemaVersion === null ? '' : 'SCHEMA_V' + oldSchemaVersion,
     newStatus: 'SCHEMA_V' + APP.SCHEMA_VERSION,
-    details: { migratedTabs: migratedTabs, renamedSettingKeys: renamedKeys, warnings: warnings },
+    details: { migratedTabs: migratedTabs, renamedSettingKeys: renamedKeys, sellerTermsSeeded: sellerTermsSeeded, warnings: warnings },
   });
 
   return {
     spreadsheetId: ss.getId(),
     migratedTabs: migratedTabs,
     renamedSettingKeys: renamedKeys,
+    sellerTermsSeeded: sellerTermsSeeded,
     warnings: warnings,
   };
 }

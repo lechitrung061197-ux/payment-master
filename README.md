@@ -50,7 +50,8 @@ src/
   SecurityRedaction.gs          Audit Log credential redaction + exposure check
   InternalTransactions.gs       Raw Internal Transactions -> Source System -> Transactions
   PaymentReconciliation.gs      Exact Transactions <-> Provider Transactions -> Payment Matches
-  PaymentLegs.gs                Confirmed matches -> Payment Legs (KH001 actual economics + settlement)
+  SellerTerms.gs                Effective-dated seller fee history (validation, resolution, initial seed)
+  PaymentLegs.gs                Confirmed matches -> Payment Legs (provider + seller economics, settlement)
   Main.gs           Public entry points
 test/               Node unit tests for pure helpers (npm test, not pushed)
 ```
@@ -83,6 +84,7 @@ from the Apps Script editor. `setupMaster` never deletes tabs or data rows:
 | --- | --- |
 | Settings | Key/value config. Provider-scoped keys: `provider_fee_rate.<PROVIDER>`, `provider_hold_rate.<PROVIDER>`; `default_seller_hold_rate` is legacy (not used for KH001) |
 | Sellers | User-managed desired mapping: 1 row = 1 seller, endpoint_<N>_name/key pairs |
+| Seller Terms | User-edited effective-dated seller fee history (seeded once while empty) |
 | Endpoint Mapping | System-managed effective-dated endpoint ownership history |
 | Raw Internal Transactions | Append-only internal CSV evidence: 16 raw CSV columns + 5 ingestion metadata columns |
 | Source System | Latest canonical snapshot per internal transaction (rebuilt from raw) |
@@ -589,6 +591,27 @@ payouts are later phases.
 - **Timestamps**: `updated_at` set on creation, preserved when the leg content is unchanged; a
   rerun is NO_CHANGE; a previously produced leg that disappears fails. SafeSwap under the lock.
 - Dashboard "Waiting settlement" counts `Payment Legs.settlement_status = WAITING_SETTLEMENT`.
+
+## Seller terms and seller economics (Phase 2I)
+
+- **Seller Terms** (`seller_id, seller_name_snapshot, seller_fee_rate, effective_from, effective_to,
+  notes`): effective-dated seller FEE history. Rules: seller exists in Sellers, non-blank name
+  snapshot, `0 <= rate < 1`, `effective_from` required, `effective_to` blank (open) or ≥ from, no
+  overlapping periods, at most one open row, no duplicate periods. A fee change closes the old row
+  and adds a new one, so earlier transactions keep their rate. `verifySellerTerms()` is read-only.
+- **Seed**: `setupMaster` seeds Seller Terms only while it has no data rows — one row per seller
+  with Settings `seller_fee_rate`, starting at the seller's earliest Endpoint Mapping
+  `effective_from` — and never reseeds or overwrites history. After that, rates come only from
+  Seller Terms.
+- **Seller economics in Payment Legs** (still the only Payment Legs writer): the leg's internal
+  Transaction (exact `payment_source + internal_transaction_id`) must be MAPPED to a seller; the
+  Seller Terms row in effect on the transaction's created date (America/New_York) gives
+  `seller_fee_rate`; `seller_fee = net × rate` (unrounded). With actual provider economics:
+  `seller_hold_amount = provider_hold_amount` (KH001 MIRROR_PROVIDER), `seller_hold_rate = hold / net`,
+  `seller_available_amount = net − seller_fee − seller_hold_amount`. Without an actual provider hold,
+  seller hold and available stay blank. `system_margin = seller_fee − provider_fee` is reported.
+- `normalizePaymentLegs()` additionally requires valid Seller Terms; `verifyPaymentLegs()` reports
+  `seller_terms_valid`, seller totals, per-seller totals and seller-economics invariant errors.
 
 ## Tests
 

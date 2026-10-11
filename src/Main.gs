@@ -268,3 +268,14 @@ function verifyPaymentLegs() {
   Logger.log(JSON.stringify(report, null, 2));
   return report;
 }
+
+/* ---------------------------------------------------------------------------
+ * Seller Terms (effective-dated seller fee history)
+ * ------------------------------------------------------------------------- */
+
+/** Read-only: validates Seller Terms (rates, dates, overlaps, sellers). */
+function verifySellerTerms() {
+  const report = buildSellerTermsReport_();
+  Logger.log(JSON.stringify(report, null, 2));
+  return report;
+}
