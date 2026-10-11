@@ -222,9 +222,10 @@ function dashboardMetrics_() {
 }
 
 /**
- * Dashboard skeleton. The layout is written only when the tab is empty; the formulas of the
- * known metric rows (matched by label in column A) are refreshed on every setup so they track
- * schema changes.
+ * Dashboard skeleton. The layout is written only when the tab is empty. For every known metric
+ * row (matched by label in column A) the formula (column B, when the metric has one) and the
+ * definition text (column C) are refreshed on every setup so they track schema changes;
+ * metrics without a formula keep their current value and unknown rows are never touched.
  */
 function ensureDashboard_(ss) {
   const sheet = ss.getSheetByName(SHEETS.DASHBOARD) || ss.insertSheet(SHEETS.DASHBOARD);
@@ -250,8 +251,9 @@ function ensureDashboard_(ss) {
   const labels = sheet.getRange(5, 1, lastRow - 4, 1).getValues().map(function (r) { return String(r[0]); });
   metrics.forEach(function (m) {
     const i = labels.indexOf(m[0]);
-    if (i < 0 || !m[1]) return;
-    sheet.getRange(5 + i, 2).setFormula(m[1]).setNumberFormat(FORMATS.INTEGER);
+    if (i < 0) return; // unknown / custom rows are never touched
+    if (m[1]) sheet.getRange(5 + i, 2).setFormula(m[1]).setNumberFormat(FORMATS.INTEGER);
+    sheet.getRange(5 + i, 3).setValue(m[2]);
   });
 }
 

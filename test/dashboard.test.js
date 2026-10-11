@@ -1,0 +1,60 @@
+// Regression test for Dashboard refresh in setup (src/Setup.gs ensureDashboard_).
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+
+const context = vm.createContext({});
+for (const f of ['Config', 'Utils', 'Setup']) {
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'src', f + '.gs'), 'utf8'), context, { filename: f + '.gs' });
+}
+const H = context;
+
+/** Minimal in-memory sheet: cells keyed "row,col"; formulas stored as strings. */
+function fakeDashboard(rows) {
+  const cells = {};
+  rows.forEach((r, i) => r.forEach((v, j) => { if (v !== '') cells[(i + 1) + ',' + (j + 1)] = v; }));
+  const lastRow = () => Math.max(0, ...Object.keys(cells).map((k) => Number(k.split(',')[0])));
+  const range = (r, c, nr, nc) => {
+    const rg = {
+      getValues: () => Array.from({ length: nr || 1 }, (_, i) => Array.from({ length: nc || 1 }, (_, j) => cells[(r + i) + ',' + (c + j)] ?? '')),
+      setValue: (v) => { cells[r + ',' + c] = v; return rg; },
+      setFormula: (f) => { cells[r + ',' + c] = f; return rg; },
+      setValues: (vals) => { vals.forEach((row, i) => row.forEach((v, j) => { cells[(r + i) + ',' + (c + j)] = v; })); return rg; },
+    };
+    ['setNumberFormat', 'setFontWeight', 'setFontSize', 'setFontColor', 'setBackground', 'setBorder'].forEach((f) => { rg[f] = () => rg; });
+    return rg;
+  };
+  const sheet = { getLastRow: lastRow, getRange: (r, c, nr, nc) => (typeof r === 'string' ? range(1, 1) : range(r, c, nr, nc)), setColumnWidth: () => {} };
+  return { cells, ss: { getSheetByName: () => sheet, insertSheet: () => sheet } };
+}
+
+test('existing Dashboard: known rows get refreshed formula + definition; null-formula values and custom rows untouched', () => {
+  const d = fakeDashboard([
+    ['Payment Master Dashboard'], [''], [''],
+    ['Metric', 'Value', 'Definition'],
+    ['Total transactions', "=COUNTA('Transactions'!A2:A)", 'Count of Transactions rows'],
+    ['Matched', "=COUNTIF('Transactions'!J2:J,\"MATCHED\")", 'Transactions.status = MATCHED'],
+    ['Available (USD)', 123.45, 'old definition'],
+    ['My custom metric', '=1+1', 'custom definition'],
+  ]);
+  H.ensureDashboard_(d.ss);
+  assert.equal(d.cells['6,2'], '=COUNTIF(INDIRECT("\'Payment Matches\'!G2:G"),"MATCHED")');
+  assert.equal(d.cells['6,3'], 'Payment Matches.reconciliation_status = MATCHED');
+  assert.equal(d.cells['5,2'], '=COUNTA(INDIRECT("\'Transactions\'!A2:A"))');
+  assert.equal(d.cells['7,2'], 123.45, 'metric without formula keeps its value');
+  assert.equal(d.cells['7,3'], 'Not implemented yet (later phase)', 'but its definition is refreshed');
+  assert.equal(d.cells['8,2'], '=1+1', 'custom row formula untouched');
+  assert.equal(d.cells['8,3'], 'custom definition', 'custom row definition untouched');
+});
+
+test('empty Dashboard: layout written once with current definitions', () => {
+  const d = fakeDashboard([]);
+  H.ensureDashboard_(d.ss);
+  assert.equal(d.cells['4,1'], 'Metric');
+  assert.equal(d.cells['6,1'], 'Matched');
+  assert.equal(d.cells['6,3'], 'Payment Matches.reconciliation_status = MATCHED');
+});
