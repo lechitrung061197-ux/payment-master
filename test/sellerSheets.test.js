@@ -340,3 +340,22 @@ test('18: an existing output-schema-2 child upgrades to schema 3 in place (no re
   assert.deepEqual(a.forbidden, []);
   assert.equal(js(H.buildSellerSheetsReport_()).pass, true);
 });
+
+test('Section D header: a child still showing "Còn nợ" is migrated to "Chưa payout" (one value cell, no formatting); a template must already have it', () => {
+  const a = freshChild(CHILD_A);
+  a.sheets.find((s) => s.name === 'PhieuDoiSoat').cells['49,9'].v = 'Còn nợ';
+  const style = a.sheets.find((s) => s.name === 'PhieuDoiSoat').cells['49,9'].s;
+  installSync({ children: { [CHILD_A]: a }, destinations: [dest({})] });
+  const r = js(H.runSellerSheetsSync_());
+  assert.equal(r.status, 'SUCCESS', JSON.stringify(r.sellers));
+  assert.equal(cellOf(a, 'PhieuDoiSoat', 49, 9).v, 'Chưa payout');
+  assert.equal(cellOf(a, 'PhieuDoiSoat', 49, 9).s, style);
+  assert.deepEqual(formatOps(a), []);
+  assert.equal(js(H.buildSellerSheetsReport_()).pass, true);
+  assert.equal(js(H.runSellerSheetsSync_()).status, 'NO_CHANGE');
+  const tpl = template();
+  tpl.sheets.find((s) => s.name === 'PhieuDoiSoat').cells['49,9'].v = 'Còn nợ';
+  const errors = js(H.validateSellerWorkbook_(H.readSellerWorkbook_(tpl.api), { mode: 'template', hiddenIds: [] })).errors.join();
+  assert.match(errors, /section D column I header is still "Còn nợ"; it must be "Chưa payout" \(update the seller template\)/);
+  assert.equal(TEMPLATE.sheets.find((s) => s.name === 'PhieuDoiSoat').cells['49,9'].v, 'Chưa payout', 'fixture reflects the new header');
+});

@@ -706,13 +706,31 @@ without writing while any upstream step is stale.
   its freshness check and therefore seller-sheet sync stop until the allocations are fixed.
 - **Derived per obligation** (never stored): `due_amount`, `paid_amount` (effective allocations),
   `remaining_amount = due − paid`, and `UNPAID` (paid 0) / `PARTIAL` / `PAID` (paid = due).
+- **Cash attribution ≠ accounting balance.** Allocations classify *cash payouts* only. Negative APPLIED
+  adjustments (REFUND, DISPUTE, DISPUTE_FEE, negative manual) are balance debits, never fake payouts, so an
+  obligation can keep a cash remainder while the balance is already 0 (settlement 100, refund −20, payout 80
+  → settlement PARTIAL with 20 "Chưa payout", Seller Balance 0). The remainder is **not** permission to pay.
+- **Temporal guards** (all fail closed; enforced by `verifySellerPayoutAllocations`, the Seller Balances
+  normalize / freshness guard and therefore the seller-sheet gate — manual allocations cannot bypass them):
+  - a SENT / CONFIRMED payout needs a valid `payout_date` (DRAFT may have none, but FIFO needs one);
+  - every non-VOID allocation target must be available on or before the payout date (settlement:
+    `Settlements.source_payment_date`; adjustment: `effective_date`) — no payment of a settlement before the
+    provider paid it, no payment of a future credit; a target without a date fails;
+  - **payable balance as of each effective payout date** (per seller + currency, micro units):
+    `Σ Settlement Items paid by that date + Σ APPLIED adjustments effective by that date − Σ SENT/CONFIRMED
+    payouts dated by that date` must stay ≥ 0 (± 0.00005); same-day payouts are checked together. The check is
+    chronological, so a later debit (e.g. a refund after a valid payout) never invalidates an earlier payout and
+    the current balance may legitimately become negative. APPLIED adjustments without a valid effective date
+    make this ambiguous and fail when the seller has effective payouts.
 - **`autoAllocateSellerPayoutFIFO(payoutId)`**: for one DRAFT payout, writes allocation rows against the
   open obligations of the same seller + currency, oldest first — settlements by provider payment date,
   adjustments by effective date; ties: SETTLEMENT before ADJUSTMENT, settlement period end / number, then
   target id. Open = due − effective payments − other DRAFT payouts' claims (existing manual rows reserve
-  capacity). It never changes the payout (status stays DRAFT), never touches existing rows (a payout that
-  already has allocations → `NO_CHANGE`, operator review), is idempotent, and refuses (writes nothing) when
-  the payout exceeds the open obligations or an open obligation has no date.
+  capacity). It needs a `payout_date`, considers only obligations available by that date, and also checks the
+  seller payable balance as of that date (this payout counted as effective): a payout above it fails even when
+  the open cash obligations are larger (settlement 100, refund −20 → 80 payable; DRAFT 80 passes, DRAFT 100
+  fails). It never changes the payout (status stays DRAFT), never touches existing rows (a payout that already
+  has allocations → `NO_CHANGE`, operator review), is idempotent, and writes nothing when it refuses.
 - **`verifySellerPayoutAllocations()`** (read-only): row counts (draft / effective / void, per target type),
   effective payouts and how many are fully allocated, every error class, `settlement_due / _paid /
   _remaining`, `adjustment_due / _paid / _remaining`, `total_payoutable_due / total_paid / total_remaining`,
@@ -742,11 +760,17 @@ one hidden system tab:
 | `Dispute` | Canonical Master disputes attributable to the seller (no buyer data, no internal notes); clean headers when none. |
 | `_Sync` (hidden) | `output_schema_version, seller_id, seller_name, master_schema_version, synced_at`, the four tab checksums and a combined checksum — the commit marker. No Master ID, tokens or PII. |
 
-**Output schema 3 (Phase 2L)** — PhieuDoiSoat section D, same template geometry: a settlement row shows
-`Phát sinh phải trả` = this seller's due (frozen Settlement Items), `Đã payout seller (USD)` = effective
-allocations to it, `Còn nợ` = remaining for that period, and the label `<source> #<n> · PAID | PARTIAL |
-UNPAID`; a positive APPLIED adjustment row works the same way (`HOLD_RELEASE · UNPAID`, …: due = amount);
-negative adjustments stay plain debit rows; `Tổng phải trả` (G) carries the running balance. `Payout` rows still show each actual SENT /
+**Output schema 3 (Phase 2L)** — PhieuDoiSoat section D, same template geometry, column I renamed
+**`Còn nợ` → `Chưa payout`**: a settlement row shows `Phát sinh phải trả` = this seller's due (frozen
+Settlement Items), `Đã payout seller (USD)` = effective allocations to it, `Chưa payout` = the cash of that
+obligation not yet allocated to an effective payout, and the label `<source> #<n> · PAID | PARTIAL | UNPAID`;
+a positive APPLIED adjustment row works the same way (`HOLD_RELEASE · UNPAID`, …: due = amount). Negative
+adjustment rows and `Payout` rows leave `Chưa payout` blank. `Tổng phải trả` (G) is the running balance
+after every row. `Chưa payout` is cash attribution, **not** the seller's debt: Section B `CÒN NỢ SAU THANH
+TOÁN (USD)` remains the authoritative accounting balance (example above: `PAYPAL #1 · PARTIAL` 100 / 80 /
+20, `REFUND` −20, `Payout` 80, Section B = 0). Existing children that still show `Còn nợ` are migrated by
+the next sync (that one header value cell only, no formatting); a template must already say `Chưa payout`
+(update the live template before provisioning new sellers). `Payout` rows still show each actual SENT /
 CONFIRMED transfer (running balance in `Còn nợ`). Allocations have no balance effect, so nothing is
 deducted twice; TongHop_Thang `Đã payout seller` and section B keep using actual Seller Payouts. Existing
 schema-2 children are upgraded in place by the next sync (owned content + `_Sync` only; no reclone, no

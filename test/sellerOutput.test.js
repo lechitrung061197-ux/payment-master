@@ -296,8 +296,8 @@ test('16-17 Section D: PAYPAL #1 · PAID / PAYPAL #2 · PARTIAL / STRIPE #1 · U
   assert.deepEqual([row('STRIPE #1 · UNPAID')[7], row('STRIPE #1 · UNPAID')[8]], [0, 170]);
   // Running balance: + due per settlement, - the actual payout once; allocations move nothing.
   const pay = row('Payout');
-  assert.deepEqual([pay[5], pay[7], pay[8]], [375, 150, 225]);
-  assert.ok(near(pay[8], snap.totals.current_balance), 'ledger ends at the Seller Balances current balance');
+  assert.deepEqual([pay[5], pay[6], pay[7], pay[8]], [375, 225, 150, ''], 'payout row: G = running balance after, I (Chưa payout) not applicable');
+  assert.ok(near(pay[6], snap.totals.current_balance), 'ledger ends at the Seller Balances current balance');
   assert.ok(near(snap.blocks.PhieuDoiSoat.b[9], 150) && near(snap.blocks.PhieuDoiSoat.b[10], 225), 'section B deducts the payout once');
   const month = js(snap.blocks.TongHop_Thang.rows).find((r) => r[14] !== 0);
   assert.equal(month[14], 150, 'TongHop_Thang Đã payout seller = actual effective payouts, not allocation totals');
@@ -326,9 +326,28 @@ test('N Section D: positive HOLD_RELEASE shows UNPAID / PARTIAL / PAID; negative
     assert.deepEqual([credit[4], credit[7], credit[8], credit[10]], [5, paidAmount, 5 - paidAmount, 5], 'due / allocated / remaining / hold released');
     assert.ok(near(credit[6] - credit[5], 5), 'credit adds its amount to the running balance once');
     const refund = h.find((r) => r[0] === 'REFUND');
-    assert.deepEqual([refund[4], refund[7]], [-3, 0], 'negative adjustment: plain debit row, no payout status');
-    const last = h[h.length - 1];
-    assert.ok(near(last[0] === 'Payout' ? last[8] : last[6], snap.totals.current_balance), 'ledger ends at the Seller Balances current balance');
+    assert.deepEqual([refund[4], refund[7], refund[8]], [-3, 0, ''], 'negative adjustment: plain debit row, no payout status, nothing "Chưa payout"');
+    assert.ok(near(h[h.length - 1][6], snap.totals.current_balance), 'G of the last row = Seller Balances current balance');
     assert.ok(near(snap.totals.current_balance, 123 + 170 + 5 - 3 - paidAmount), 'payout deducted exactly once');
   }
+});
+
+test('Section D example: settlement 100, refund -20, payout 80 -> PAYPAL #1 · PARTIAL with 20 "Chưa payout"; Section B balance 0', () => {
+  const spec = { sellers: [{ seller_id: 'CUS002', seller_name: 'HUI' }],
+    txs: [{ id: 'E1', seller: 'CUS002', order: 100, leg: { fee: 0, rate: 0, holdRate: 0, settlement: 'ST-1' } }],
+    adjustments: [{ adjustment_id: 'RF1', adjustment_type: 'REFUND', seller_id: 'CUS002', currency: 'USD', amount: -20, status: 'APPLIED',
+      payment_source: 'PAYPAL', internal_transaction_id: 'E1', effective_date: D('2026-10-07T04:00:00Z') }],
+    payouts: [{ seller_payout_id: 'SP-80', seller_id: 'CUS002', payout_date: D('2026-10-10T04:00:00Z'), currency: 'USD', amount: 80, status: 'SENT' }],
+    allocations: [{ allocation_id: H.sellerAllocationId_('SP-80', 'SETTLEMENT', 'ST-1'), seller_payout_id: 'SP-80', seller_id: 'CUS002',
+      target_type: 'SETTLEMENT', target_id: 'ST-1', payment_source: 'PAYPAL', currency: 'USD', allocated_amount: 80 }] };
+  const snap = build(spec).CUS002;
+  const h = js(snap.blocks.PhieuDoiSoat.history);
+  assert.deepEqual(h.map((r) => [r[0], r[4], r[6], r[7], r[8]]), [
+    ['PAYPAL #1 · PARTIAL', 100, 100, 80, 20],
+    ['REFUND', -20, 80, 0, ''],
+    ['Payout', 0, 0, 80, '']]);
+  assert.equal(snap.blocks.PhieuDoiSoat.b[10], 0, 'CÒN NỢ SAU THANH TOÁN = 0: the 20 is cash attribution, not debt');
+  assert.equal(snap.totals.current_balance, 0);
+  const headers = js(vm.runInContext('SELLER_TEMPLATE.phieuHeadersD', context));
+  assert.deepEqual([headers[6], headers[7], headers[8]], ['Tổng phải trả', 'Đã payout seller (USD)', 'Chưa payout']);
 });

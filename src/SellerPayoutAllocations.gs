@@ -15,6 +15,12 @@
  * - Only SENT / CONFIRMED payouts count as paid; DRAFT allocations are provisional; VOID allocations have no
  *   financial effect but must still be structurally valid. An effective payout must be fully allocated; no payout
  *   may be over-allocated; no obligation over-paid.
+ * - Temporal guards: an effective payout needs a valid payout_date; a target must be available (settlement
+ *   source_payment_date / adjustment effective_date) on or before the payout date; and the seller PAYABLE BALANCE as of
+ *   each effective payout date (Settlement Items paid by then + APPLIED adjustments effective by then - SENT/CONFIRMED
+ *   payouts dated by then, same-day payouts together) may never go below zero. Allocation remainders ("Chưa payout")
+ *   are cash attribution only, never permission to pay beyond the balance; later debits never invalidate an
+ *   earlier payout.
  * - Derived per obligation: due, paid, remaining and UNPAID / PARTIAL / PAID (never stored).
  * - autoAllocateSellerPayoutFIFO(payoutId) writes rows for one DRAFT payout across settlement and adjustment
  *   obligations (oldest first) and never touches the payout status or existing allocation rows.
@@ -57,7 +63,72 @@ function sellerAllocationId_(payoutId, targetType, targetId, digestHex) {
 function emptyAllocationErrors_() {
   return { obligation_errors: [], invalid_ids: [], invalid_targets: [], invalid_references: [], cross_seller_errors: [], currency_errors: [],
     payment_source_errors: [], invalid_amounts: [], duplicate_keys: [], overallocated_payouts: [], unallocated_effective_payouts: [],
-    overpaid_obligations: [] };
+    overpaid_obligations: [], invalid_payout_dates: [], target_date_errors: [], ambiguous_dates: [], insufficient_payable_balance: [] };
+}
+
+/** 'YYYY-MM-DD' of a valid date value, else null. */
+function sellerDateKeyOrNull_(value, dateKeyOf) {
+  if (!isDateValue_(value) || !isFinite(value.getTime())) return null;
+  try { return dateKeyOf(value) || null; } catch (err) { return null; }
+}
+
+/**
+ * Per seller|currency ledger timeline in micro units: credits (frozen Settlement Items by settlement payment date,
+ * APPLIED adjustments of any sign by effective date) and effective payouts (by payout date).
+ */
+function buildSellerPayableTimeline_(items, settlementById, adjustments, payouts, dateKeyOf) {
+  const lines = {};
+  const line = function (seller, currency) {
+    const k = seller + '|' + currency;
+    return lines[k] = lines[k] || { seller_id: seller, currency: currency, credits: [], payouts: [], undated: [] };
+  };
+  items.forEach(function (i) {
+    const s = settlementById[trimmedText_(i.settlement_id)];
+    if (!s || !isFiniteNumber_(i.seller_available_amount)) return;
+    const key = sellerDateKeyOrNull_(s.source_payment_date, dateKeyOf);
+    if (key) line(trimmedText_(i.seller_id), trimmedText_(i.currency)).credits.push({ key: key, micros: Math.round(i.seller_available_amount * 1e6) });
+  });
+  (adjustments || []).forEach(function (a) {
+    if (trimmedText_(a.status) !== SELLER_ALLOCATIONS.payoutableAdjustmentStatus || !isFiniteNumber_(a.amount)) return;
+    const l = line(trimmedText_(a.seller_id), trimmedText_(a.currency));
+    const key = sellerDateKeyOrNull_(a.effective_date, dateKeyOf);
+    if (key) l.credits.push({ key: key, micros: Math.round(a.amount * 1e6) });
+    else l.undated.push(trimmedText_(a.adjustment_id));
+  });
+  payouts.forEach(function (p) {
+    if (SELLER_ALLOCATIONS.effectiveStatuses.indexOf(trimmedText_(p.status)) < 0 || !isFiniteNumber_(p.amount)) return;
+    const key = sellerDateKeyOrNull_(p.payout_date, dateKeyOf);
+    if (key) line(trimmedText_(p.seller_id), trimmedText_(p.currency)).payouts.push({ key: key, micros: Math.round(p.amount * 1e6), id: trimmedText_(p.seller_payout_id) });
+  });
+  return lines;
+}
+
+/** Payable balance (micro units) of one timeline line as of a date key (inclusive; same-day payouts together). */
+function sellerPayableAsOf_(line, dateKey) {
+  const credits = line.credits.reduce(function (a, c) { return a + (c.key <= dateKey ? c.micros : 0); }, 0);
+  const paid = line.payouts.reduce(function (a, p) { return a + (p.key <= dateKey ? p.micros : 0); }, 0);
+  return credits - paid;
+}
+
+/** Errors for every effective payout date at which the seller payable balance would be negative. */
+function sellerPayableBalanceErrors_(line) {
+  const errors = [];
+  if (line.payouts.length === 0) return errors;
+  if (line.undated.length > 0) {
+    errors.push(line.seller_id + '|' + line.currency + ': APPLIED adjustment(s) without a valid effective_date (' + line.undated.join(', ') +
+      ') make the payable balance ambiguous');
+    return errors;
+  }
+  const dates = {};
+  line.payouts.forEach(function (p) { dates[p.key] = true; });
+  Object.keys(dates).sort().forEach(function (d) {
+    const balance = sellerPayableAsOf_(line, d);
+    if (balance < -SELLER_ALLOCATIONS.toleranceMicros) {
+      const ids = line.payouts.filter(function (p) { return p.key === d; }).map(function (p) { return p.id; });
+      errors.push(line.seller_id + '|' + line.currency + ' ' + d + ': payout(s) ' + ids.join(', ') + ' exceed the payable balance as of that date by ' + (-balance) / 1e6);
+    }
+  });
+  return errors;
 }
 
 function flattenAllocationErrors_(errors) {
@@ -140,7 +211,7 @@ function compareSellerObligations_(a, b) {
 /**
  * Validates every allocation (structure first, for every row - VOID included) and derives each obligation's state.
  * @param {{allocations: Array<Object>, payouts: Array<Object>, items: Array<Object>, settlements: Array<Object>,
- *          adjustments: Array<Object>, digestHex?: Function}} input
+ *          adjustments: Array<Object>, dateKeyOf?: function(*): string, digestHex?: Function}} input
  * @return {{errors: Object, obligations: Object, states: Array<Object>, summary: Object, payoutAllocated: Object}}
  */
 function validateSellerPayoutAllocations_(input) {
@@ -150,8 +221,10 @@ function validateSellerPayoutAllocations_(input) {
   const ob = buildSellerPayoutObligations_(input.items, input.settlements, input.adjustments);
   ob.errors.forEach(function (e) { errors.obligation_errors.push(e); });
   const obligations = ob.obligations;
+  const dateKeyOf = input.dateKeyOf || masterDateKey_;
   const settlementIds = {};
-  input.settlements.forEach(function (s) { settlementIds[String(s.settlement_id)] = true; });
+  const settlementById = {};
+  input.settlements.forEach(function (s) { settlementIds[String(s.settlement_id)] = true; settlementById[String(s.settlement_id)] = s; });
   const sharesInSettlement = {};
   Object.keys(obligations).forEach(function (k) {
     const o = obligations[k];
@@ -163,6 +236,9 @@ function validateSellerPayoutAllocations_(input) {
     if (id === '') return;
     if (payoutsById[id]) errors.invalid_references.push('Seller Payout ' + id + ' appears more than once');
     payoutsById[id] = p;
+    if (A.effectiveStatuses.indexOf(trimmedText_(p.status)) >= 0 && !sellerDateKeyOrNull_(p.payout_date, dateKeyOf)) {
+      errors.invalid_payout_dates.push('Seller Payout ' + id + ' (' + p.status + '): payout_date must be a valid date');
+    }
   });
 
   const seenKeys = {};
@@ -220,6 +296,13 @@ function validateSellerPayoutAllocations_(input) {
     } else {
       bad('invalid_targets', 'target_type must be ' + A.settlementTarget + ' or ' + A.adjustmentTarget + ' (found "' + a.target_type + '")');
     }
+    // A target must be available on or before the payout date (no payment of a future obligation).
+    if (o && status !== A.voidStatus) {
+      const targetKey = sellerDateKeyOrNull_(o.date, dateKeyOf);
+      const payoutKey = payout ? sellerDateKeyOrNull_(payout.payout_date, dateKeyOf) : null;
+      if (!targetKey) bad('target_date_errors', targetType + ' ' + targetId + ' has no valid availability date');
+      else if (payoutKey && targetKey > payoutKey) bad('target_date_errors', targetType + ' ' + targetId + ' is available on ' + targetKey + ', after the payout date ' + payoutKey);
+    }
     if (targetType === A.settlementTarget) summary.settlement_allocation_rows++;
     if (targetType === A.adjustmentTarget) summary.adjustment_allocation_rows++;
     // ---- financial effect (VOID: none)
@@ -250,6 +333,14 @@ function validateSellerPayoutAllocations_(input) {
     effectiveCount++;
     if (allocated < amount - tol) errors.unallocated_effective_payouts.push('Seller Payout ' + id + ' (' + status + '): allocated ' + allocated / 1e6 + ' of ' + amount / 1e6);
     else if (allocated <= amount + tol) fullyAllocated++;
+  });
+
+  // Temporal payable-balance guard (chronological; later debits never invalidate an earlier payout).
+  const timeline = buildSellerPayableTimeline_(input.items, settlementById, input.adjustments, input.payouts, dateKeyOf);
+  Object.keys(timeline).sort().forEach(function (k) {
+    sellerPayableBalanceErrors_(timeline[k]).forEach(function (e) {
+      (e.indexOf('ambiguous') >= 0 ? errors.ambiguous_dates : errors.insufficient_payable_balance).push(e);
+    });
   });
 
   const states = Object.keys(obligations).map(function (k) { return obligations[k]; }).sort(function (a, b) {
@@ -300,7 +391,8 @@ function validateSellerPayoutAllocations_(input) {
     t[s.payment_status] = (t[s.payment_status] || 0) + 1;
     return acc;
   }, {});
-  return { errors: errors, obligations: obligations, states: states, summary: summary, payoutAllocated: payoutAllocated };
+  return { errors: errors, obligations: obligations, states: states, summary: summary, payoutAllocated: payoutAllocated, timeline: timeline,
+    dateKeyOf: dateKeyOf };
 }
 
 /**
@@ -318,6 +410,18 @@ function planFifoAllocation_(payout, allocations, validation, payoutsById, now, 
   const tol = A.toleranceMicros;
   const sellerId = trimmedText_(payout.seller_id);
   const currency = trimmedText_(payout.currency);
+  const dateKeyOf = validation.dateKeyOf || masterDateKey_;
+  const payoutKey = sellerDateKeyOrNull_(payout.payout_date, dateKeyOf);
+  if (!payoutKey) return { status: 'FAILED', rows: [], error: 'Seller Payout ' + id + ' needs a valid payout_date for FIFO; nothing allocated.' };
+  // Payable balance guard: this payout treated as effective on its date must keep every payout date >= 0.
+  const line = validation.timeline[sellerId + '|' + currency] || { seller_id: sellerId, currency: currency, credits: [], payouts: [], undated: [] };
+  const simulated = { seller_id: sellerId, currency: currency, credits: line.credits, undated: line.undated,
+    payouts: line.payouts.concat([{ key: payoutKey, micros: Math.round(payout.amount * 1e6), id: id }]) };
+  const balanceErrors = sellerPayableBalanceErrors_(simulated);
+  if (balanceErrors.length > 0) {
+    return { status: 'FAILED', rows: [], error: 'Seller Payout ' + id + ' exceeds the seller payable balance (payable as of ' + payoutKey + ': ' +
+      sellerPayableAsOf_(line, payoutKey) / 1e6 + '); nothing allocated: ' + balanceErrors.join(' | ') };
+  }
   const claimed = {};
   allocations.forEach(function (a) {
     const parent = payoutsById[trimmedText_(a.seller_payout_id)];
@@ -327,8 +431,9 @@ function planFifoAllocation_(payout, allocations, validation, payoutsById, now, 
   });
   const open = Object.keys(validation.obligations).map(function (k) { return validation.obligations[k]; })
     .filter(function (o) { return o.seller_id === sellerId && o.currency === currency && o.due - (claimed[o.key] || 0) > tol; })
+    .filter(function (o) { const k = sellerDateKeyOrNull_(o.date, dateKeyOf); return !k || k <= payoutKey; }) // never a future obligation
     .sort(compareSellerObligations_);
-  const undated = open.filter(function (o) { return isBlankCell_(o.date); });
+  const undated = open.filter(function (o) { return !sellerDateKeyOrNull_(o.date, dateKeyOf); });
   if (undated.length > 0) {
     return { status: 'FAILED', rows: [], error: 'FIFO order is ambiguous: open obligation(s) without a date (' +
       undated.map(function (o) { return o.target_type + ' ' + o.target_id; }).join(', ') + '); set the date or allocate manually. Nothing allocated.' };
@@ -346,8 +451,8 @@ function planFifoAllocation_(payout, allocations, validation, payoutsById, now, 
     left -= take;
   });
   if (left > tol) {
-    return { status: 'FAILED', rows: [], error: 'Seller Payout ' + id + ' exceeds the open ' + currency + ' payout obligations of ' + sellerId + ' by ' + left / 1e6 +
-      '; nothing allocated (allocate manually or adjust the payout).' };
+    return { status: 'FAILED', rows: [], error: 'Seller Payout ' + id + ' exceeds the open ' + currency + ' payout obligations of ' + sellerId + ' available by ' +
+      payoutKey + ' by ' + left / 1e6 + '; nothing allocated (allocate manually or adjust the payout).' };
   }
   return { status: 'SUCCESS', rows: rows, error: null };
 }
@@ -434,7 +539,8 @@ function buildSellerPayoutAllocationsReport_() {
   const report = { allocation_rows: 0, draft_allocation_rows: 0, effective_allocation_rows: 0, void_allocation_rows: 0, settlement_allocation_rows: 0,
     adjustment_allocation_rows: 0, effective_payout_count: 0, fully_allocated_effective_payouts: 0, unallocated_effective_payouts: [],
     overallocated_payouts: [], overpaid_obligations: [], invalid_references: [], invalid_targets: [], cross_seller_errors: [], currency_errors: [],
-    payment_source_errors: [], duplicate_keys: [], invalid_ids: [], invalid_amounts: [], obligation_errors: [], settlement_due: 0, settlement_paid: 0,
+    payment_source_errors: [], duplicate_keys: [], invalid_ids: [], invalid_amounts: [], obligation_errors: [], invalid_payout_dates: [],
+    target_date_errors: [], ambiguous_dates: [], insufficient_payable_balance: [], settlement_due: 0, settlement_paid: 0,
     settlement_remaining: 0, adjustment_due: 0, adjustment_paid: 0, adjustment_remaining: 0, total_payoutable_due: 0, total_paid: 0,
     total_remaining: 0, per_seller_due: {}, per_seller_paid: {}, per_seller_remaining: {}, payment_status_counts: {},
     payment_status_counts_by_target: {}, obligation_states: [], pass: false, errors: [], warnings: [], regression: null };

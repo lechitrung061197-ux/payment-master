@@ -161,6 +161,7 @@ function writeSellerTab_(child, tab, layout, blocks) {
     return;
   }
   const v = sellerCellValue_;
+  if (L.legacyHeaderD) put(L.headerD, 9, [[SELLER_TEMPLATE.phieuHeadersD[8]]]); // one-time header migration (value only)
   put(L.seller, 2, [[v(blocks.info[0])]]);
   put(L.from, 2, [[v(blocks.info[1])]]);
   put(L.to, 2, [[v(blocks.info[2])]]);

@@ -13,7 +13,8 @@
  *   frozen Payment Leg snapshots (Seller Terms by seller + payment_source + effective date).
  * - No provider trace = no provider economics; MATCHED != AVAILABLE; unknown economics are never estimated.
  * - PhieuDoiSoat section D is allocation-aware: settlement rows (due = frozen Settlement Items of the seller) and
- *   positive APPLIED adjustment rows (due = amount) show effective allocations as paid, the remaining amount and a
+ *   positive APPLIED adjustment rows (due = amount) show effective allocations as paid, the cash not yet paid out
+ *   ("Chưa payout" - cash attribution, NOT the seller's accounting debt; Section B is the balance) and a
  *   label "<source> #<n> · UNPAID|PARTIAL|PAID" / "<adjustment_type> · ...". Negative adjustments stay plain debit
  *   rows. Payout rows still show the actual money movement; allocations never move the running balance.
  *
@@ -59,7 +60,9 @@ const SELLER_TEMPLATE = Object.freeze({
   phieuLabelsC: ['Khớp — Đã tính', 'Lệch số tiền', 'Thiếu trên cổng — Chưa tính — chờ xác minh', 'Thiếu trên hệ thống'],
   phieuCheckPrefix: 'Kiểm tra',
   phieuTitleD: 'D. LỊCH SỬ CHỐT',
-  phieuHeadersD: ['Lần', 'Từ ngày', 'Đến ngày', 'Ngày VNS nhận tiền', 'Phát sinh phải trả', 'Còn nợ lần trước', 'Tổng phải trả', 'Đã payout seller (USD)', 'Còn nợ', 'Hold giữ lần này', 'Hold được hoàn lần này', 'Số dư hold', 'Hold dự kiến release từ', '… đến ngày', 'Hình thức / chứng từ', 'Tỷ giá', 'Đã payout quy đổi'],
+  phieuHeadersD: ['Lần', 'Từ ngày', 'Đến ngày', 'Ngày VNS nhận tiền', 'Phát sinh phải trả', 'Còn nợ lần trước', 'Tổng phải trả', 'Đã payout seller (USD)', 'Chưa payout', 'Hold giữ lần này', 'Hold được hoàn lần này', 'Số dư hold', 'Hold dự kiến release từ', '… đến ngày', 'Hình thức / chứng từ', 'Tỷ giá', 'Đã payout quy đổi'],
+  // Section D column I before Phase 2L ("Còn nợ"): accepted only on existing children and migrated (one value cell).
+  phieuLegacyHeaderD9: 'Còn nợ',
   phieuPendingPrefix: 'Phát sinh sau lần chốt cuối',
   phieuStartLabel: 'Ngày bắt đầu hợp tác',
   disputeHeaders: ['Case type', 'Case ID', 'Transaction ID', 'Cổng thanh toán', 'Order ID', 'Case reason', 'Ngày mở case', 'Case status', 'Hạn phản hồi', 'Số tiền dispute', 'Currency', 'Dispute fee', 'Ảnh hưởng balance', 'Số ngày còn lại', 'Chứng từ yêu cầu', 'Link docs kháng', 'Trạng thái hồ sơ', 'Ghi chú'],
@@ -220,7 +223,9 @@ function locateSellerTabLayout_(tab, values, formulas) {
     L.checkRow = L.cRows[L.cRows.length - 1] + 1;
     if (sellerText_(gridCell_(values, L.checkRow, 1)).indexOf(T_.phieuCheckPrefix.normalize('NFC')) !== 0) return fail('section C check row is missing');
     L.headerD = findRows_(values, 1, function (t) { return t === T_.phieuHeadersD[0]; }, L.titleD + 1)[0];
-    if (!L.headerD || !rowMatches_(values, L.headerD, 1, T_.phieuHeadersD)) return fail('section D header does not match');
+    const legacyD = T_.phieuHeadersD.slice(0, 8).concat([T_.phieuLegacyHeaderD9]).concat(T_.phieuHeadersD.slice(9));
+    L.legacyHeaderD = !!L.headerD && !rowMatches_(values, L.headerD, 1, T_.phieuHeadersD) && rowMatches_(values, L.headerD, 1, legacyD);
+    if (!L.headerD || (!L.legacyHeaderD && !rowMatches_(values, L.headerD, 1, T_.phieuHeadersD))) return fail('section D header does not match');
     L.pendRow = one(prefixed(T_.phieuPendingPrefix, L.headerD + 1), 'row "' + T_.phieuPendingPrefix + '"');
     L.startRow = one(at(T_.phieuStartLabel, L.titleD), 'label "' + T_.phieuStartLabel + '"');
     if (!L.pendRow || !L.startRow) return { layout: null, errors: errors };
@@ -290,6 +295,10 @@ function validateSellerWorkbook_(wb, opts) {
       located = locateSellerTabLayout_(s.name, s.values, s.formulas || []);
       located.errors.forEach(function (e) { errors.push(e); });
       if (located.layout) layouts[s.name] = located.layout;
+      if (located.layout && located.layout.legacyHeaderD && (opts.mode === 'template' || opts.requireSync)) {
+        errors.push(s.name + ': section D column I header is still "' + SELLER_TEMPLATE.phieuLegacyHeaderD9 + '"; it must be "' +
+          SELLER_TEMPLATE.phieuHeadersD[8] + '"' + (opts.mode === 'template' ? ' (update the seller template)' : ' (run syncSellerSheets)'));
+      }
     }
     const approved = located.layout ? located.layout.approved : {};
     const seen = {};
@@ -575,13 +584,14 @@ function buildSellerOutputs_(input) {
           return [type + ' · ' + e.st.payment_status, dateOnly(e.a.effective_date), '', '', e.amount / 1e6, before / 1e6, runBalance / 1e6,
             micro_(e.st.paid_amount) / 1e6, micro_(e.st.remaining_amount) / 1e6, 0, e.release / 1e6, runHold / 1e6, '', '', type, '', ''];
         }
-        // Negative APPLIED adjustment: ordinary ledger debit, no payout status.
-        return [type, dateOnly(e.a.effective_date), '', '', e.amount / 1e6, before / 1e6, runBalance / 1e6, 0, runBalance / 1e6, 0, e.release / 1e6,
+        // Negative APPLIED adjustment: ordinary ledger debit, no payout status (and nothing "Chưa payout").
+        return [type, dateOnly(e.a.effective_date), '', '', e.amount / 1e6, before / 1e6, runBalance / 1e6, 0, '', 0, e.release / 1e6,
           runHold / 1e6, '', '', type, '', ''];
       }
       runBalance -= e.paid;
       const ref = [trimmedText_(e.p.payment_method), trimmedText_(e.p.reference)].filter(Boolean).join(' / ');
-      return ['Payout', dateOnly(e.p.payout_date), '', '', 0, before / 1e6, before / 1e6, e.paid / 1e6, runBalance / 1e6, 0, 0, runHold / 1e6, '', '',
+      // Actual transfer: G = running balance after it; I ("Chưa payout") does not apply to a payout row.
+      return ['Payout', dateOnly(e.p.payout_date), '', '', 0, before / 1e6, runBalance / 1e6, e.paid / 1e6, '', 0, 0, runHold / 1e6, '', '',
         ref, isFiniteNumber_(e.p.fx_rate) ? e.p.fx_rate : '', isFiniteNumber_(e.p.payout_amount) ? e.p.payout_amount : ''];
     });
     if (runBalance !== currentBalance || runHold !== holdBalance) label('PhieuDoiSoat section D does not reconcile to Seller Balances');
@@ -733,7 +743,7 @@ function compareSellerWorkbook_(snapshot, wb, opts) {
     if (!layout) { out.matches[tab] = false; out.changedTabs.push(tab); return; }
     const blocks = extractSellerTabBlocks_(tab, layout, byName[tab].values);
     out.actual[tab] = sellerTabChecksum_(tab, blocks);
-    out.matches[tab] = out.actual[tab] === snapshot.checksums[tab];
+    out.matches[tab] = out.actual[tab] === snapshot.checksums[tab] && !layout.legacyHeaderD;
     if (!out.matches[tab]) out.changedTabs.push(tab);
     if (tab === 'DoiSoat_GD') {
       out.counts.transaction_rows = blocks.rows.length;

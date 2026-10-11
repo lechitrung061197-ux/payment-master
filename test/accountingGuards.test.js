@@ -176,7 +176,8 @@ test('readSellerBalancesFreshness_: current only when the stored table equals th
   const fresh = { current: true, reason: null };
   const run = (balances, extra) => {
     const ss = fakeSpreadsheet({ Sellers: SELLERS, 'Settlement Items': items, 'Seller Balances': balances, Adjustments: [], 'Seller Payouts': [],
-      'Seller Payout Allocations': [], Settlements: [{ settlement_id: 'ST-1', payment_source: 'PAYPAL', source_settlement_number: 1 }], ...extra });
+      'Seller Payout Allocations': [], Settlements: [{ settlement_id: 'ST-1', payment_source: 'PAYPAL', source_settlement_number: 1,
+        source_payment_date: D('2026-10-06T04:00:00Z') }], ...extra });
     install(ss);
     return js(H.readSellerBalancesFreshness_(ss, fresh));
   };
@@ -185,7 +186,7 @@ test('readSellerBalancesFreshness_: current only when the stored table equals th
   const stale = run(built.map((b) => ({ ...b, current_balance: b.current_balance + 1 })));
   assert.equal(stale.current, false);
   assert.match(stale.reason, /Seller Balances is stale; run normalizeSellerBalances first/);
-  const sent = [{ seller_payout_id: 'SP-1', seller_id: 'CUS001', currency: 'USD', amount: 10, status: 'SENT' }];
+  const sent = [{ seller_payout_id: 'SP-1', seller_id: 'CUS001', currency: 'USD', amount: 10, status: 'SENT', payout_date: D('2026-10-10T04:00:00Z') }];
   const unallocated = run(built, { 'Seller Payouts': sent });
   assert.equal(unallocated.current, false);
   assert.match(unallocated.reason, /Seller Balances is invalid/, 'an effective payout without allocations fails closed');

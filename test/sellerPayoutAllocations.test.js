@@ -244,7 +244,7 @@ test('19: production regression with zero payouts (report only): dues equal the 
 // ---- ADJUSTMENT targets (positive APPLIED seller credits) --------------------------------------------------
 const HUI_ITEMS = [item('CUS002', 'ST-P1', 2132.2706, 260), item('CUS002', 'ST-P2', 905.1734, 110)];
 const adjustment = (id, type, amount, o) => ({ adjustment_id: id, adjustment_type: type, seller_id: 'CUS002', currency: 'USD', amount, status: 'APPLIED',
-  payment_source: '', effective_date: D('2026-10-20T04:00:00Z'), ...o });
+  payment_source: '', effective_date: D('2026-10-14T04:00:00Z'), ...o });
 const HOLD = adjustment('ADJ-HR', 'HOLD_RELEASE', 70.42, { payment_source: 'PAYPAL' });
 const hv = (allocations, payouts, adjustments) => H.validateSellerPayoutAllocations_({ allocations, payouts, items: HUI_ITEMS, settlements: SETTLEMENTS,
   adjustments: adjustments || [HOLD] });
@@ -300,7 +300,7 @@ test('D: FIFO pays the older settlements first, then the later HOLD_RELEASE', ()
   const undated = adjustment('ADJ-U', 'MANUAL_ADJUSTMENT', 10, { effective_date: '' });
   const u = js(H.planFifoAllocation_(small, [], hv([], [small], [undated]), { 'SP-S': small }, D('2026-10-21T00:00:00Z')));
   assert.deepEqual([u.status, u.rows], ['FAILED', []]);
-  assert.match(u.error, /FIFO order is ambiguous: open obligation\(s\) without a date \(ADJUSTMENT ADJ-U\)/);
+  assert.match(u.error, /APPLIED adjustment\(s\) without a valid effective_date \(ADJ-U\) make the payable balance ambiguous/);
 });
 
 test('E-H: positive MANUAL_ADJUSTMENT is payoutable; negative, zero, PENDING and VOID adjustments are not', () => {
@@ -349,4 +349,101 @@ test('M: VOID parent payout: valid rows have no financial effect, but malformed 
     assert.match(errs(hv([row], [voided])), re, 'VOID does not hide a malformed row: ' + label);
   }
   assert.match(errs(hv([alloc('SP-V', 'ST-P1', 10), alloc('SP-V', 'ST-P1', 10)], [voided])), /duplicate seller_payout_id/);
+});
+
+// ---- Temporal payable-balance guard ---------------------------------------------------------------------------
+const T_SETTLEMENTS = [{ settlement_id: 'ST-T', payment_source: 'PAYPAL', source_settlement_number: 1, period_end_date: D('2026-09-30T04:00:00Z'),
+  source_payment_date: D('2026-10-01T04:00:00Z') }];
+const T_ITEMS = [item('CUS002', 'ST-T', 100)];
+const day = (d) => D('2026-10-' + d + 'T04:00:00Z');
+const refund = (d, amount) => adjustment('RF-' + d, 'REFUND', amount || -20, { effective_date: day(d), payment_source: 'PAYPAL' });
+const credit = (d, amount) => adjustment('HR-' + d, 'HOLD_RELEASE', amount, { effective_date: day(d), payment_source: 'PAYPAL' });
+const tp = (id, amount, status, d) => payout(id, amount, status, { payout_date: d === null ? '' : day(d) });
+const tv = (allocations, payouts, adjustments) => H.validateSellerPayoutAllocations_({ allocations, payouts, items: T_ITEMS, settlements: T_SETTLEMENTS,
+  adjustments });
+const tAlloc = (pid, amount) => alloc(pid, 'ST-T', amount);
+const tBalance = (payouts, adjustments) => js(H.buildSellerBalances_({ items: T_ITEMS, adjustments, payouts, sellerIds: ['CUS002'], existing: [],
+  now: day(25), columns: js(H.getColumnNames_('Seller Balances')) }).rows)[0].current_balance;
+const tFifo = (p, allocations, payouts, adjustments) => {
+  const byId = {};
+  payouts.forEach((x) => { byId[x.seller_payout_id] = x; });
+  return js(H.planFifoAllocation_(p, allocations, tv(allocations, payouts, adjustments), byId, day(25)));
+};
+
+test('T-A: settlement 100, refund -20, payout 80 -> valid; balance 0; settlement PARTIAL with 20 "Chưa payout" (cash only)', () => {
+  const adj = [refund('05')];
+  const p = tp('SP-80', 80, 'SENT', '10');
+  const v = tv([tAlloc('SP-80', 80)], [p], adj);
+  assert.equal(errs(v), '');
+  assert.deepEqual([state(v, 'ST-T').payment_status, state(v, 'ST-T').paid_amount, state(v, 'ST-T').remaining_amount], ['PARTIAL', 80, 20]);
+  assert.ok(near(tBalance([p], adj), 0), 'Seller Balance 100 - 20 - 80 = 0 (no double count)');
+});
+
+test('T-B/C: FIFO refuses a payout above the payable balance as of its date; a second payout before new credit fails closed', () => {
+  const adj = [refund('05')];
+  const draft100 = tp('SP-100', 100, 'DRAFT', '10');
+  const b = tFifo(draft100, [], [draft100], adj);
+  assert.deepEqual([b.status, b.rows], ['FAILED', []]);
+  assert.match(b.error, /exceeds the seller payable balance \(payable as of 2026-10-10: 80\)/);
+  const draft80 = tp('SP-80', 80, 'DRAFT', '10');
+  assert.deepEqual(tFifo(draft80, [], [draft80], adj).rows.map((r) => [r.target_id, r.allocated_amount]), [['ST-T', 80]]);
+  const sent80 = tp('SP-80', 80, 'SENT', '10');
+  const draft20 = tp('SP-20', 20, 'DRAFT', '11');
+  assert.equal(tFifo(draft20, [tAlloc('SP-80', 80)], [sent80, draft20], adj).status, 'FAILED', 'FIFO: nothing payable on Oct 11');
+  const manual = tv([tAlloc('SP-80', 80), tAlloc('SP-20', 20)], [sent80, tp('SP-20', 20, 'SENT', '11')], adj);
+  assert.match(errs(manual), /CUS002\|USD 2026-10-11: payout\(s\) SP-20 exceed the payable balance as of that date by 20/,
+    'a manual allocation cannot bypass the guard even though 20 is "Chưa payout"');
+});
+
+test('T-D: a later HOLD_RELEASE +20 makes 20 payable again; FIFO allocates by obligation order within the payable balance', () => {
+  const adj = [refund('05'), credit('15', 20)];
+  const sent80 = tp('SP-80', 80, 'SENT', '10');
+  assert.ok(near(tBalance([sent80], adj), 20));
+  const draft = tp('SP-20', 20, 'DRAFT', '16');
+  const r = tFifo(draft, [tAlloc('SP-80', 80)], [sent80, draft], adj);
+  assert.equal(r.status, 'SUCCESS', r.error);
+  assert.deepEqual(r.rows.map((x) => [x.target_type, x.target_id, x.allocated_amount]), [['SETTLEMENT', 'ST-T', 20]], 'oldest obligation first');
+  const v = tv([tAlloc('SP-80', 80)].concat(r.rows), [sent80, { ...draft, status: 'SENT' }], adj);
+  assert.equal(errs(v), '');
+  assert.ok(near(tBalance([sent80, { ...draft, status: 'SENT' }], adj), 0));
+  assert.equal(tFifo(tp('SP-X', 20, 'DRAFT', '14'), [tAlloc('SP-80', 80)], [sent80, tp('SP-X', 20, 'DRAFT', '14')], adj).status, 'FAILED',
+    'before the HOLD_RELEASE date nothing is payable');
+});
+
+test('T-E/F/G: no payout before the settlement is paid or before an adjustment is effective; effective payouts need a payout_date', () => {
+  assert.match(errs(tv([tAlloc('SP-E', 50)], [payout('SP-E', 50, 'SENT', { payout_date: D('2026-09-30T04:00:00Z') })], [])),
+    /SETTLEMENT ST-T is available on 2026-10-01, after the payout date 2026-09-30/);
+  const adj = [credit('15', 20)];
+  assert.match(errs(tv([tAlloc('SP-F', 100), adjAlloc('SP-F', 'HR-15', 20, { payment_source: 'PAYPAL' })], [tp('SP-F', 120, 'SENT', '12')], adj)),
+    /ADJUSTMENT HR-15 is available on 2026-10-15, after the payout date 2026-10-12/);
+  for (const status of ['SENT', 'CONFIRMED']) {
+    assert.match(errs(tv([tAlloc('SP-G', 50)], [tp('SP-G', 50, status, null)], [])), new RegExp('Seller Payout SP-G \\(' + status + '\\): payout_date must be a valid date'));
+  }
+  assert.equal(errs(tv([tAlloc('SP-G', 50)], [tp('SP-G', 50, 'DRAFT', null)], [])), '', 'a DRAFT may exist without a payout date ...');
+  const noDate = tp('SP-G', 50, 'DRAFT', null);
+  assert.match(tFifo(noDate, [], [noDate], []).error, /needs a valid payout_date for FIFO/, '... but FIFO requires one');
+  const early = tp('SP-EA', 50, 'DRAFT', '30');
+  early.payout_date = D('2026-09-30T04:00:00Z');
+  assert.equal(tFifo(early, [], [early], []).status, 'FAILED', 'FIFO never allocates to an obligation available after the payout date');
+});
+
+test('T-H: a later refund never invalidates a historical payout; the current balance may go negative', () => {
+  const p = tp('SP-H', 100, 'CONFIRMED', '10');
+  const adj = [refund('20')];
+  const v = tv([tAlloc('SP-H', 100)], [p], adj);
+  assert.equal(errs(v), '');
+  assert.equal(state(v, 'ST-T').payment_status, 'PAID');
+  assert.ok(near(tBalance([p], adj), -20));
+});
+
+test('T-I/J: same-day payouts are checked together; VOID payouts have no balance effect but rows stay structurally validated', () => {
+  const both = tv([tAlloc('SP-1', 60), tAlloc('SP-2', 40)], [tp('SP-1', 60, 'SENT', '10'), tp('SP-2', 50, 'SENT', '10')], []);
+  assert.match(errs(both), /unallocated|allocated 40 of 50/);
+  const over = tv([tAlloc('SP-1', 60), adjAlloc('SP-2', 'HR-01', 50, { payment_source: 'PAYPAL' })],
+    [tp('SP-1', 60, 'SENT', '10'), tp('SP-2', 50, 'CONFIRMED', '10')], [credit('01', 50)].concat([refund('02', -60)]));
+  assert.match(errs(over), /2026-10-10: payout\(s\) SP-1, SP-2 exceed the payable balance as of that date by 20/, "90 payable (100 + 50 - 60), 110 paid the same day");
+  const voided = tp('SP-V', 5000, 'VOID', '02');
+  const v = tv([tAlloc('SP-V', 100)], [voided], []);
+  assert.equal(errs(v), '', 'VOID: no temporal / balance effect');
+  assert.match(errs(tv([alloc('SP-V', 'ST-T', 100, { allocation_id: 'SPA-bad' })], [voided], [])), /allocation_id must be/, 'still structurally validated');
 });
