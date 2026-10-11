@@ -7,7 +7,8 @@
  *   transactions keep their historical rate.
  * - Rules: seller_id exists in Sellers; seller_name_snapshot nonblank; 0 <= seller_fee_rate < 1;
  *   effective_from required; effective_to blank (open) or >= effective_from; per seller no overlapping
- *   periods, at most one open-ended row, no duplicate periods.
+ *   periods, at most one open-ended row, no duplicate periods; every seller with a seller_id has at
+ *   least one valid row (a missing seller is blocking, never auto-seeded once the tab has data).
  * - Resolution for (seller, date): exactly one row with effective_from <= date <= effective_to
  *   (blank = open); zero or several rows fail.
  * - Seed: only while the tab has no data rows, one row per seller with the Settings seller_fee_rate,
@@ -26,7 +27,8 @@ const SELLER_TERMS = Object.freeze({
 /* ----------------------------- Pure helpers ----------------------------- */
 
 function emptySellerTermErrors_() {
-  return { unknown_sellers: [], invalid_rates: [], invalid_dates: [], overlaps: [], duplicate_periods: [], invalid_rows: [] };
+  return { unknown_sellers: [], invalid_rates: [], invalid_dates: [], overlaps: [], duplicate_periods: [], invalid_rows: [],
+    missing_sellers: [] };
 }
 
 /**
@@ -90,7 +92,7 @@ function parseSellerTerms_(rows, sellers, dateKeyOf) {
     }
   });
   const missing = Object.keys(nameById).filter(function (id) { return !bySeller[id]; }).sort();
-  if (missing.length > 0) warnings.push('Sellers without Seller Terms: ' + missing.join(', '));
+  missing.forEach(function (id) { errors.missing_sellers.push(id + ': seller has no valid Seller Terms row; add an effective-dated term'); });
   if (mismatches.length > 0) warnings.push(mismatches.length + ' seller_name_snapshot value(s) differ from the current seller name.');
   return { terms: terms, errors: errors, warnings: warnings, missing_sellers: missing, snapshot_name_mismatches: mismatches };
 }
@@ -157,8 +159,10 @@ function readSellerTermsValidity_(ss) {
   try {
     const st = readSellerTerms_(ss);
     const errors = flattenSellerTermErrors_(st.parsed.errors);
-    return { current: errors.length === 0, terms: st.parsed.terms,
-      reason: errors.length === 0 ? null : 'Seller Terms is invalid (' + errors.length + ' error(s)); fix Seller Terms first.' };
+    const missing = st.parsed.missing_sellers;
+    return { current: errors.length === 0, terms: st.parsed.terms, missing_sellers: missing,
+      reason: errors.length === 0 ? null : 'Seller Terms is invalid (' + errors.length + ' error(s)' +
+        (missing.length > 0 ? '; sellers without terms: ' + missing.join(', ') : '') + '); fix Seller Terms first.' };
   } catch (err) {
     return { current: false, terms: [], reason: 'Seller Terms is invalid (' + (err && err.message ? err.message : String(err)) + ').' };
   }
@@ -213,8 +217,9 @@ function buildSellerTermsReport_() {
     report.missing_sellers = p.missing_sellers;
     report.snapshot_name_mismatches = p.snapshot_name_mismatches;
     ['unknown_sellers', 'invalid_rates', 'invalid_dates', 'overlaps', 'duplicate_periods', 'invalid_rows'].forEach(function (k) { report[k] = p.errors[k]; });
+    if (p.missing_sellers.length > 0) report.errors.push('Sellers without Seller Terms: ' + p.missing_sellers.join(', ') + '.');
     const errors = flattenSellerTermErrors_(p.errors);
-    if (errors.length > 0) report.errors.push('Seller Terms has ' + errors.length + ' error(s).');
+    if (errors.length > p.missing_sellers.length) report.errors.push('Seller Terms has ' + (errors.length - p.missing_sellers.length) + ' row error(s).');
     report.warnings = p.warnings;
   } catch (err) {
     report.errors.push(err && err.message ? err.message : String(err));

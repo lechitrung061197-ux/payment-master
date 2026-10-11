@@ -362,8 +362,10 @@ const SCHEMA = Object.freeze([
     description: 'One leg per CONFIRMED MATCHED Payment Match: payment_leg_id = PL-<sha256(payment_source|' +
       'external_transaction_id)>. Gross / processing fee / net come from Provider Transactions; KH001 ' +
       'provider_fee and provider_hold_amount are the actual DoiSoat values (rates are derived, never applied). ' +
-      'settlement_id comes from the provider settlement date. Seller and refund/dispute fields stay blank ' +
-      'until those phases (blank = not computed, not zero).',
+      'settlement_id comes from the provider settlement date; status is SETTLED, or AVAILABLE once the provider ' +
+      'has fully paid that settlement. Seller economics use the effective-dated Seller Terms rate on net ' +
+      '(seller_fee = net x rate); seller_hold_amount mirrors the actual provider hold; seller_available_amount = ' +
+      'net - seller_fee - seller_hold_amount. Refund/dispute fields stay blank (out of scope; blank = not computed, not zero).',
     columns: [
       col_('payment_leg_id', T.ID),
       col_('match_id', T.ID),
@@ -443,7 +445,7 @@ const SCHEMA = Object.freeze([
     sheet: SHEETS.SETTLEMENT_ITEMS,
     description: 'Immutable frozen accounting snapshot: one item per AVAILABLE Payment Leg (provider-paid settlement), ' +
       'settlement_item_id = SI-<sha256(settlement_id|payment_leg_id)>. Written only by normalizeSettlementItems; ' +
-      'existing items are never changed or removed and snapshot_at never changes. seller_hold_amount = ' +
+      'existing items are never changed or removed and snapshot_at (a valid datetime, required) never changes. seller_hold_amount = ' +
       'provider_hold_amount; seller_available_amount = net_amount - seller_fee - seller_hold_amount.',
     columns: [
       col_('settlement_item_id', T.ID),

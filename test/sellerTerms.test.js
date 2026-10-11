@@ -60,7 +60,7 @@ test('overlapping terms, several open rows and duplicate periods are rejected', 
   assert.throws(() => H.resolveSellerTerm_([...parse([term({})]).terms, ...parse([term({})]).terms], 'SLR-A', '2026-10-05'), /Several Seller Terms rows/);
 });
 
-test('unknown sellers, invalid rates and dates are rejected; missing sellers and name changes are warnings', () => {
+test('unknown sellers, invalid rates and dates are rejected; name changes are warnings', () => {
   const p = parse([term({ seller_id: 'SLR-X' }), term({ seller_fee_rate: 1 }), term({ seller_fee_rate: -0.01 }), term({ seller_fee_rate: '8%' }),
     term({ effective_from: '' }), term({ effective_from: '2026-10-10', effective_to: '2026-10-01' })]);
   const e = errs(p);
@@ -68,10 +68,23 @@ test('unknown sellers, invalid rates and dates are rejected; missing sellers and
   assert.equal(js(p.errors.invalid_rates).length, 3);
   assert.match(e, /effective_from is required/);
   assert.match(e, /effective_to 2026-10-01 is before effective_from 2026-10-10/);
-  const ok = parse([term({ seller_name_snapshot: 'Old name' })]);
+  const ok = parse([term({ seller_name_snapshot: 'Old name' }), term({ seller_id: 'SLR-B', seller_name_snapshot: 'Seller B' })]);
   assert.equal(errs(ok), '');
-  assert.deepEqual(js(ok.missing_sellers), ['SLR-B']);
   assert.equal(js(ok.snapshot_name_mismatches).length, 1);
+  assert.match(js(ok.warnings).join(), /seller_name_snapshot value\(s\) differ/);
+});
+
+test('every seller with a seller_id needs Seller Terms: a missing seller is a blocking error', () => {
+  const missing = parse([term({})]);
+  assert.deepEqual(js(missing.missing_sellers), ['SLR-B']);
+  assert.deepEqual(js(missing.errors.missing_sellers), ['SLR-B: seller has no valid Seller Terms row; add an effective-dated term']);
+  assert.match(errs(missing), /SLR-B: seller has no valid Seller Terms row/);
+  const onlyInvalid = parse([term({}), term({ seller_id: 'SLR-B', seller_name_snapshot: 'Seller B', seller_fee_rate: 2 })]);
+  assert.deepEqual(js(onlyInvalid.missing_sellers), ['SLR-B'], 'an invalid row does not count as coverage');
+  const complete = parse([term({}), term({ seller_id: 'SLR-B', seller_name_snapshot: 'Seller B' })]);
+  assert.equal(errs(complete), '');
+  assert.deepEqual(js(complete.missing_sellers), []);
+  assert.equal(errs(parse([term({})], [...sellers.slice(0, 1), { seller_id: '', seller_name: 'Draft without id' }])), '', 'blank seller_id needs no terms');
 });
 
 // ---- Seller economics in Payment Legs ------------------------------------------------------------

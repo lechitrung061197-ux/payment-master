@@ -7,7 +7,8 @@
  * - seller_id comes from the exact internal Transaction (payment_source + internal_transaction_id),
  *   which must be MAPPED.
  * - Existing items are carried forward unchanged (content and snapshot_at); only new AVAILABLE legs
- *   add items. A frozen item that would change or disappear fails (no silent rewrite, e.g. after a
+ *   add items, and only they receive snapshot_at (once). An existing item whose snapshot_at is blank or
+ *   not a valid datetime is a hard error and is never repaired automatically. A frozen item that would change or disappear fails (no silent rewrite, e.g. after a
  *   retroactive Seller Terms edit).
  * - Invariants per item: seller_hold_amount = provider_hold_amount; seller_available_amount =
  *   net - seller_fee - seller_hold_amount. Aggregate: provider transaction payout = seller available +
@@ -50,11 +51,16 @@ function settlementItemId_(settlementId, paymentLegId, digestHex) {
 
 function emptyItemErrors_() {
   return { duplicate_item_ids: [], duplicate_payment_leg_ids: [], missing_transactions: [], seller_identity_errors: [],
-    snapshot_mismatches: [], disappearing_items: [], equation_errors: [] };
+    snapshot_mismatches: [], invalid_snapshot_at: [], disappearing_items: [], equation_errors: [] };
 }
 
 function flattenItemErrors_(errors) {
   return Object.keys(errors).reduce(function (acc, k) { return acc.concat(errors[k]); }, []);
+}
+
+/** A frozen item's snapshot_at must be a real, valid datetime (Sheets returns Date for datetime cells). */
+function isValidSnapshotAt_(value) {
+  return isDateValue_(value) && isFinite(value.getTime());
 }
 
 /** Item content key (everything except snapshot_at). */
@@ -107,6 +113,10 @@ function buildSettlementItems_(input) {
 
   const items = [];
   input.existingItems.forEach(function (e) {
+    if (!isValidSnapshotAt_(e.snapshot_at)) {
+      errors.invalid_snapshot_at.push('Frozen item ' + e.settlement_item_id + ': snapshot_at ' +
+        (isBlankCell_(e.snapshot_at) ? 'is blank' : '"' + String(e.snapshot_at) + '" is not a valid datetime'));
+    }
     const fresh = candidates[String(e.payment_leg_id)];
     if (!fresh) { errors.disappearing_items.push('Frozen item ' + e.settlement_item_id + ' (leg ' + e.payment_leg_id + ') is no longer AVAILABLE'); return; }
     if (settlementItemContentKey_(fresh, columns) !== settlementItemContentKey_(e, columns)) {
@@ -298,7 +308,7 @@ function buildSettlementItemsReport_() {
     currency_counts: {}, gross_total: 0, processing_fee_total: 0, net_total: 0, provider_fee_total: 0, provider_hold_total: 0,
     provider_transaction_payout_total: 0, seller_fee_total: 0, seller_hold_total: 0, seller_available_total: 0, system_margin_total: 0,
     duplicate_item_ids: [], duplicate_payment_leg_ids: [], missing_transactions: [], seller_identity_errors: [], snapshot_mismatches: [],
-    disappearing_items: [], equation_errors: [], upstream: {}, target_match: false, swap_state: null, pass: false, errors: [], warnings: [],
+    invalid_snapshot_at: [], disappearing_items: [], equation_errors: [], upstream: {}, target_match: false, swap_state: null, pass: false, errors: [], warnings: [],
     regression: null };
   try {
     const ss = getSpreadsheet_();

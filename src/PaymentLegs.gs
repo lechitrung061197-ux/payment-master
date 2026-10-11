@@ -1,7 +1,8 @@
 /**
  * PaymentLegs.gs
  * Payment Legs: one leg per CONFIRMED MATCHED Payment Match, with KH001 actual provider
- * economics and canonical settlement membership. No seller economics, refunds or disputes.
+ * economics, canonical settlement membership / provider-paid availability and effective-dated seller
+ * economics (Seller Terms; seller hold mirrors the actual provider hold). No refunds or disputes.
  *
  * - Eligible: Payment Matches with reconciliation_status = MATCHED and match_status = CONFIRMED.
  *   Only provider KH001 / PAYPAL is supported; any other eligible provider/source fails.

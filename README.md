@@ -559,8 +559,9 @@ settlement items, balances or payouts, and `Transactions.status` is not changed
 ## Payment Legs (Phase 2H)
 
 Entry points: `normalizePaymentLegs()` and read-only `verifyPaymentLegs()`. Writes only
-Payment Legs and Audit Log; seller economics, refunds/disputes, Settlement Items, balances and
-payouts are later phases.
+Payment Legs and Audit Log. Provider economics and settlement availability are described here;
+seller economics (Phase 2I) and provider-paid `AVAILABLE` (Phase 2J) are described below.
+Refunds/disputes and payout allocation are still out of scope.
 
 - **Eligible**: Payment Matches with `reconciliation_status = MATCHED` and `match_status =
   CONFIRMED` (MISSING_*, AMOUNT_MISMATCH, REJECTED, REVERSED create none). Only KH001 / PAYPAL
@@ -584,11 +585,13 @@ payouts are later phases.
 - **Settlement aggregates**: per settlement, leg count and sums of gross / processing fee / net
   (< 0.005) and provider fee / hold / derived transaction payout (< 0.00005) must equal the
   Settlements header. A settled provider payment without a confirmed match therefore fails.
-- Seller fields (`seller_fee_rate`, `seller_fee`, `seller_hold_rate`, `seller_hold_amount`,
-  `seller_available_amount`) and `refund_amount` / `dispute_amount` / `dispute_fee` stay blank
-  (not computed, not zero). `Transactions.status` is not changed.
+- **Seller fields** come from the effective-dated Seller Terms rate (`seller_fee = net × rate`);
+  `seller_hold_amount` mirrors the actual provider hold and `seller_available_amount = net −
+  seller_fee − seller_hold_amount` (Phase 2I). `refund_amount` / `dispute_amount` / `dispute_fee`
+  stay blank (out of scope; not computed, not zero). `Transactions.status` is not changed.
 - **Gates**: Transactions, Provider Transactions KH001, Payment Matches and Settlements KH001
-  must all be current (shared read-only freshness helpers) before any write.
+  must all be current (shared read-only freshness helpers), Seller Terms must be valid (every
+  seller covered) and fresh legs must agree with frozen Settlement Items before any write.
 - **Timestamps**: `updated_at` set on creation, preserved when the leg content is unchanged; a
   rerun is NO_CHANGE; a previously produced leg that disappears fails. SafeSwap under the lock.
 - Dashboard "Waiting settlement" counts `Payment Legs.settlement_status = WAITING_SETTLEMENT`.
@@ -598,7 +601,9 @@ payouts are later phases.
 - **Seller Terms** (`seller_id, seller_name_snapshot, seller_fee_rate, effective_from, effective_to,
   notes`): effective-dated seller FEE history. Rules: seller exists in Sellers, non-blank name
   snapshot, `0 <= rate < 1`, `effective_from` required, `effective_to` blank (open) or ≥ from, no
-  overlapping periods, at most one open row, no duplicate periods. A fee change closes the old row
+  overlapping periods, at most one open row, no duplicate periods, and every seller with a
+  `seller_id` must have at least one valid row (a missing seller blocks Payment Legs and everything
+  downstream; once the tab has data it is never auto-seeded — add the term manually). A fee change closes the old row
   and adds a new one, so earlier transactions keep their rate. `verifySellerTerms()` is read-only.
 - **Seed**: `setupMaster` seeds Seller Terms only while it has no data rows — one row per seller
   with Settings `seller_fee_rate`, starting at the seller's earliest Endpoint Mapping
@@ -628,7 +633,9 @@ without writing while any upstream step is stale.
 - **Settlement Items** (`normalizeSettlementItems()` / read-only `verifySettlementItems()`): one
   item per AVAILABLE leg, `settlement_item_id = SI-<sha256(settlement_id|payment_leg_id)>`;
   `seller_id` comes from the leg's exact internal Transaction (must be MAPPED). Items are
-  **frozen**: an existing item is kept byte-for-byte (`snapshot_at` set once, on creation); an
+  **frozen**: an existing item is kept byte-for-byte (`snapshot_at` set once, on creation, and it
+  must stay a valid datetime — a blank or invalid `snapshot_at` on an existing item fails
+  normalize and verify (`invalid_snapshot_at`) and is never repaired automatically); an
   item whose fresh leg would differ in any frozen field, is no longer AVAILABLE, or disappears is a
   hard error, as are duplicate item ids or payment legs. Per item `seller_hold = provider_hold`
   and `seller_available = net − seller_fee − seller_hold`; in total

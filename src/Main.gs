@@ -252,7 +252,8 @@ function verifyPaymentReconciliation() {
 }
 
 /* ---------------------------------------------------------------------------
- * Payment Legs (KH001 actual provider economics + settlement membership; no seller economics)
+ * Payment Legs (KH001 actual provider economics, settlement availability, effective-dated seller
+ * economics from Seller Terms with seller hold mirroring the provider hold; refunds/disputes out of scope)
  * ------------------------------------------------------------------------- */
 
 /** Rebuilds Payment Legs from confirmed Payment Matches, Provider Transactions, DoiSoat and Settlements. */

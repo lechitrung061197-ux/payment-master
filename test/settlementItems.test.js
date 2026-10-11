@@ -158,3 +158,19 @@ test('Settlement Items regression report (report only) and its accounting identi
   assert.ok(Math.abs(exp.provider_transaction_payout_total - exp.seller_available_total - exp.system_margin_total) < 1e-9);
   assert.equal(H.evaluateSettlementItemsRegression_(js(H.summarizeSettlementItems_(items(availableLegs()).items))).pass, false);
 });
+
+test('existing frozen items need a valid snapshot_at: blank or invalid is a hard error, never repaired', () => {
+  const first = js(items(availableLegs()).items).map((x) => ({ ...x, snapshot_at: D(x.snapshot_at) }));
+  const ok = items(availableLegs(), first, T2);
+  assert.equal(ierrs(ok), '');
+  ok.items.forEach((x) => assert.equal(x.snapshot_at.getTime(), T1.getTime(), 'valid snapshot_at preserved exactly'));
+  const blank = items(availableLegs(), first.map((x, i) => (i === 0 ? { ...x, snapshot_at: '' } : x)), T2);
+  assert.deepEqual(js(blank.errors.invalid_snapshot_at), ['Frozen item ' + first[0].settlement_item_id + ': snapshot_at is blank']);
+  assert.equal(blank.newItems, 0, 'not re-created as a new item');
+  assert.equal(blank.items.find((x) => x.settlement_item_id === first[0].settlement_item_id).snapshot_at, '', 'not repaired');
+  const text = items(availableLegs(), first.map((x, i) => (i === 1 ? { ...x, snapshot_at: '2026-10-12 08:00' } : x)), T2);
+  assert.match(ierrs(text), /snapshot_at "2026-10-12 08:00" is not a valid datetime/);
+  const nan = items(availableLegs(), first.map((x, i) => (i === 1 ? { ...x, snapshot_at: D('not a date') } : x)), T2);
+  assert.match(ierrs(nan), /is not a valid datetime/);
+  assert.equal(ierrs(items(availableLegs(), [], T2)), '', 'new items receive snapshot_at = now');
+});
