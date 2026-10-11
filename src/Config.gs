@@ -727,6 +727,9 @@ const DEFAULT_SETTINGS = Object.freeze([
   ['source.KH001.reconciled_sheet', 'DoiSoat_GD', 'STRING', 'KH001 source tab mirrored to Raw KH001 Reconciled.'],
   ['source.KH001.settlements_sheet', 'PhieuDoiSoat', 'STRING', 'KH001 source tab mirrored to Raw KH001 Settlements.'],
   ['source.KH001.disputes_sheet', 'Dispute', 'STRING', 'KH001 source tab mirrored to Raw KH001 Disputes.'],
+  ['seller_template_spreadsheet_id', '', 'STRING',
+    'Google Sheet cloned by createSellerSheet for a new seller (layout / branding only; Master owns the six managed tabs).'],
+  ['seller_output_folder_id', '', 'STRING', 'Drive folder that receives seller sheets created by createSellerSheet.'],
   ['source.INTERNAL.naive_timestamp_timezone', '', 'STRING',
     'Timezone for internal CSV timestamps without an offset (e.g. "2026-10-01 12:00:00"). Blank = such ' +
     'timestamps are rejected. Timestamps with Z or an offset never use it.'],

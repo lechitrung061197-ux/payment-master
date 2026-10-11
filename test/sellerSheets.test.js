@@ -117,11 +117,13 @@ function fixture() {
     seller_hold_balance: legs[0].seller_hold_amount, adjustments: 0, current_balance: availA },
   { seller_id: 'CUS002', currency: 'USD', settled_amount: availB, available_amount: availB - 50, paid_amount: 50,
     seller_hold_balance: legs[4].seller_hold_amount, adjustments: 0, current_balance: availB - 50 }];
-  const payouts = [{ seller_payout_id: 'SP-B1', seller_id: 'CUS002', payout_date: D('2026-10-08T04:00:00Z'), currency: 'USD', amount: 50, fx_rate: '',
-    payout_currency: '', payout_amount: '', payment_method: 'Bank', reference: 'REF-1', status: 'SENT', notes: 'internal note' }];
-  const adjustments = [{ adjustment_id: 'ADJ-A1', adjustment_type: 'MANUAL_ADJUSTMENT', seller_id: 'CUS001', provider: 'KH001', payment_source: 'PAYPAL',
-    external_event_id: 'EVT-1', internal_transaction_id: 'A-AVAIL', payment_leg_id: 'PL-A-AVAIL', settlement_id: ST1, dispute_id: '',
-    currency: 'USD', amount: 0, effective_date: D('2026-10-07T04:00:00Z'), status: 'PENDING', reason: 'review', created_at: '', created_by: 'ops' }];
+  const payout = (id, status, amount) => ({ seller_payout_id: id, seller_id: 'CUS002', payout_date: D('2026-10-08T04:00:00Z'), currency: 'USD', amount,
+    fx_rate: '', payout_currency: '', payout_amount: '', payment_method: 'Bank', reference: 'REF-' + id, status, notes: 'internal note' });
+  const payouts = [payout('SP-B1', 'SENT', 30), payout('SP-B2', 'DRAFT', 999), payout('SP-B3', 'VOID', 888), payout('SP-B4', 'CONFIRMED', 20)];
+  const adjustment = (id, status) => ({ adjustment_id: id, adjustment_type: 'MANUAL_ADJUSTMENT', seller_id: 'CUS001', provider: 'KH001', payment_source: 'PAYPAL',
+    external_event_id: 'EVT-' + id, internal_transaction_id: 'A-AVAIL', payment_leg_id: 'PL-A-AVAIL', settlement_id: ST1, dispute_id: '',
+    currency: 'USD', amount: 0, effective_date: D('2026-10-07T04:00:00Z'), status, reason: 'review', created_at: '', created_by: 'ops' });
+  const adjustments = [adjustment('ADJ-A1', 'APPLIED'), adjustment('ADJ-A2', 'PENDING'), adjustment('ADJ-A3', 'VOID')];
   return { transactions, matches, legs, settlements, balances, payouts, adjustments, masterSchemaVersion: 13 };
 }
 const SNAP_SELLERS = [{ seller_id: 'CUS001', seller_name: 'DITECH' }, { seller_id: 'CUS002', seller_name: 'HUI' }];
@@ -144,7 +146,7 @@ test('seller isolation: each seller sees only its own transactions, settlements,
   assert.deepEqual(b, ['B-AVAIL', 'B-MISSING']);
   assert.ok(!a.some((id) => b.includes(id)) && !a.includes('U-UNASSIGNED') && !b.includes('U-UNASSIGNED'));
   assert.deepEqual(rowsOf(s.CUS001, 'Payouts'), []);
-  assert.deepEqual(rowsOf(s.CUS002, 'Payouts').map((p) => p.seller_payout_id), ['SP-B1']);
+  assert.deepEqual(rowsOf(s.CUS002, 'Payouts').map((p) => p.seller_payout_id), ['SP-B1', 'SP-B4']);
   assert.deepEqual(rowsOf(s.CUS002, 'Adjustments'), []);
   assert.deepEqual(rowsOf(s.CUS001, 'Adjustments').map((x) => x.adjustment_id), ['ADJ-A1']);
   const st = rowsOf(s.CUS002, 'Settlements');
@@ -207,7 +209,7 @@ test('privacy: no forbidden column in any output tab; endpoint tokens, customers
   const s = snaps();
   for (const snap of Object.values(s)) {
     const text = JSON.stringify(snap.values);
-    assert.ok(!/glk_/.test(text) && !/buyer@example.com/.test(text) && !/internal note/.test(text) && !/EVT-1/.test(text) && !/"ops"/.test(text));
+    assert.ok(!/glk_/.test(text) && !/buyer@example.com/.test(text) && !/internal note/.test(text) && !/EVT-/.test(text) && !/"ops"/.test(text));
     assert.ok(!text.includes(String(fixture().legs[0].provider_fee)), 'provider fee value absent');
     assert.deepEqual(js(H.findCredentialsInSnapshot_(snap)), []);
   }
@@ -215,6 +217,30 @@ test('privacy: no forbidden column in any output tab; endpoint tokens, customers
   leaky.transactions[0].store_domain = 'glk_abc.secret';
   const snap = H.buildSellerSnapshots_({ ...leaky, sellers: SNAP_SELLERS }).snapshots.CUS001;
   assert.equal(js(H.findCredentialsInSnapshot_(snap)).length, 1);
+});
+
+test('ledger filter: only SENT/CONFIRMED payouts and APPLIED adjustments are published; others never affect output', () => {
+  const base = snaps();
+  assert.deepEqual(rowsOf(base.CUS002, 'Payouts').map((p) => [p.seller_payout_id, p.status]), [['SP-B1', 'SENT'], ['SP-B4', 'CONFIRMED']]);
+  assert.deepEqual(rowsOf(base.CUS001, 'Adjustments').map((a) => [a.adjustment_id, a.status]), [['ADJ-A1', 'APPLIED']]);
+  const text = JSON.stringify([base.CUS001.values, base.CUS002.values]);
+  assert.ok(!/SP-B2|SP-B3|ADJ-A2|ADJ-A3|DRAFT|PENDING|VOID/.test(text));
+  // Adding / editing non-effective rows changes nothing seller-visible.
+  const f = fixture();
+  f.payouts.push({ seller_payout_id: 'SP-A9', seller_id: 'CUS001', payout_date: D('2026-10-09T04:00:00Z'), currency: 'USD', amount: 1, status: 'DRAFT' });
+  f.payouts.find((p) => p.seller_payout_id === 'SP-B3').amount = 1;
+  f.adjustments.push({ adjustment_id: 'ADJ-A9', adjustment_type: 'HOLD_RELEASE', seller_id: 'CUS001', currency: 'USD', amount: 5, status: 'PENDING' });
+  const same = snaps(f);
+  assert.deepEqual(js(same.CUS001.checksums), js(base.CUS001.checksums));
+  assert.deepEqual(js(same.CUS002.checksums), js(base.CUS002.checksums));
+  // ...until they become financially effective.
+  f.payouts.find((p) => p.seller_payout_id === 'SP-A9').status = 'SENT';
+  f.adjustments.find((a) => a.adjustment_id === 'ADJ-A9').status = 'APPLIED';
+  const eff = snaps(f).CUS001;
+  assert.notEqual(eff.checksums.payouts_checksum, base.CUS001.checksums.payouts_checksum);
+  assert.notEqual(eff.checksums.adjustments_checksum, base.CUS001.checksums.adjustments_checksum);
+  assert.deepEqual(rowsOf(eff, 'Payouts').map((p) => p.seller_payout_id), ['SP-A9']);
+  assert.deepEqual(rowsOf(eff, 'Adjustments').map((a) => a.adjustment_id).sort(), ['ADJ-A1', 'ADJ-A9']);
 });
 
 test('integrity errors: transaction without a Payment Matches row or leg pointing to an unknown settlement', () => {
@@ -232,7 +258,7 @@ test('checksums are deterministic and the combined checksum covers the five cont
   assert.deepEqual(js(a), js(b));
   assert.equal(a.combined_checksum, H.sellerCombinedChecksum_(a));
   const f = fixture();
-  f.payouts.push({ seller_payout_id: 'SP-A1', seller_id: 'CUS001', payout_date: D('2026-10-09T04:00:00Z'), currency: 'USD', amount: 1, status: 'DRAFT' });
+  f.payouts.push({ seller_payout_id: 'SP-A1', seller_id: 'CUS001', payout_date: D('2026-10-09T04:00:00Z'), currency: 'USD', amount: 1, status: 'SENT' });
   const c = snaps(f).CUS001.checksums;
   assert.notEqual(c.payouts_checksum, a.payouts_checksum);
   assert.notEqual(c.combined_checksum, a.combined_checksum);
@@ -392,7 +418,7 @@ test('unchanged sync is NO_CHANGE: nothing written, last_content_sync_at preserv
   assert.equal(tabValue(a, 'Summary', 'last_content_sync_at').getTime(), stamp1);
   await new Promise((res) => setTimeout(res, 1100));
   const f = fixture();
-  f.payouts.push({ seller_payout_id: 'SP-A1', seller_id: 'CUS001', payout_date: D('2026-10-09T04:00:00Z'), currency: 'USD', amount: 5, status: 'DRAFT' });
+  f.payouts.push({ seller_payout_id: 'SP-A1', seller_id: 'CUS001', payout_date: D('2026-10-09T04:00:00Z'), currency: 'USD', amount: 5, status: 'CONFIRMED' });
   installSync({ children: { [CHILD_A]: a, [CHILD_B]: b }, fixture: f });
   const r3 = js(H.runSellerSheetsSync_());
   assert.equal(r3.status, 'SUCCESS');

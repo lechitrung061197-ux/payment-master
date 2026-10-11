@@ -337,3 +337,61 @@ function verifySellerSheets() {
   Logger.log(JSON.stringify(report, null, 2));
   return report;
 }
+
+/** Provisions one seller child sheet from the template (clone or reuse -> register -> sync -> verify -> ACTIVE). */
+function createSellerSheet(sellerId) {
+  const result = runCreateSellerSheet_(sellerId);
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** Syncs exactly one ACTIVE seller child sheet (same guards as syncSellerSheets; never touches another seller). */
+function syncSellerSheet(sellerId) {
+  const result = runSingleSellerSheetSync_(sellerId);
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/* ---------------------------------------------------------------------------
+ * Master menu
+ * ------------------------------------------------------------------------- */
+
+/** Simple trigger: adds the "Seller Sheets" menu to the Master spreadsheet. */
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu(SELLER_PROVISIONING.menuTitle)
+    .addItem('Create Seller Sheet', 'menuCreateSellerSheet')
+    .addItem('Sync All Seller Sheets', 'menuSyncSellerSheets')
+    .addItem('Verify Seller Sheets', 'menuVerifySellerSheets')
+    .addToUi();
+}
+
+/** Menu: asks for a seller ID, runs createSellerSheet and shows the outcome. */
+function menuCreateSellerSheet() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.prompt('Create Seller Sheet', buildCreateSellerSheetPromptText_(readCreateSellerSheetCandidates_()), ui.ButtonSet.OK_CANCEL);
+  if (response.getSelectedButton() !== ui.Button.OK) return null;
+  const sellerId = String(response.getResponseText()).trim();
+  if (sellerId === '') {
+    ui.alert('Create Seller Sheet', 'No seller ID entered; nothing was created.', ui.ButtonSet.OK);
+    return null;
+  }
+  const result = createSellerSheet(sellerId);
+  ui.alert('Create Seller Sheet', formatCreateSellerSheetAlert_(result, sellerAlertHiddenIds_()), ui.ButtonSet.OK);
+  return result;
+}
+
+/** Menu: syncSellerSheets with a summary alert. */
+function menuSyncSellerSheets() {
+  const result = syncSellerSheets();
+  const ui = SpreadsheetApp.getUi();
+  ui.alert('Sync All Seller Sheets', formatSellerSyncAlert_(result, sellerAlertHiddenIds_()), ui.ButtonSet.OK);
+  return result;
+}
+
+/** Menu: verifySellerSheets (read-only) with a summary alert. */
+function menuVerifySellerSheets() {
+  const report = verifySellerSheets();
+  const ui = SpreadsheetApp.getUi();
+  ui.alert('Verify Seller Sheets', formatSellerVerifyAlert_(report, sellerAlertHiddenIds_()), ui.ButtonSet.OK);
+  return report;
+}

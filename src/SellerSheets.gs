@@ -17,6 +17,8 @@
  *   marker), and the child is reread and verified before SUCCESS is reported.
  * - Unknown economics are never estimated: rows without actual provider/seller economics keep
  *   their financial fields blank and are counted as unknown_economics_transactions.
+ * - Payouts / Adjustments tabs publish only financially effective rows (SENT / CONFIRMED payouts,
+ *   APPLIED adjustments); DRAFT, PENDING and VOID rows never reach a seller sheet.
  *
  * The first part of this file is pure (unit-tested in Node); the I/O part follows.
  */
@@ -275,11 +277,15 @@ function buildSellerSnapshots_(input) {
     });
     settlementRows.sort(compareByKeys_(['period_end_date', 'settlement_id', 'currency']));
 
-    const payoutRows = input.payouts.filter(own).map(function (p) {
+    // Seller-visible ledgers show only financially effective rows (the same statuses Seller Balances
+    // counts): SENT / CONFIRMED payouts and APPLIED adjustments. DRAFT / PENDING / VOID stay in Master only.
+    const effectivePayout = function (p) { return SELLER_BALANCES.countedPayoutStatuses.indexOf(trimmedText_(p.status)) >= 0; };
+    const effectiveAdjustment = function (a) { return trimmedText_(a.status) === SELLER_BALANCES.countedAdjustmentStatus; };
+    const payoutRows = input.payouts.filter(own).filter(effectivePayout).map(function (p) {
       return { seller_payout_id: p.seller_payout_id, payout_date: p.payout_date, currency: p.currency, amount: p.amount, fx_rate: p.fx_rate,
         payout_currency: p.payout_currency, payout_amount: p.payout_amount, payment_method: p.payment_method, reference: p.reference, status: p.status };
     }).sort(compareByKeys_(['payout_date', 'seller_payout_id']));
-    const adjustmentRows = input.adjustments.filter(own).map(function (a) {
+    const adjustmentRows = input.adjustments.filter(own).filter(effectiveAdjustment).map(function (a) {
       return { adjustment_id: a.adjustment_id, adjustment_type: a.adjustment_type, internal_transaction_id: a.internal_transaction_id,
         settlement_id: a.settlement_id, currency: a.currency, amount: a.amount, effective_date: a.effective_date, status: a.status, reason: a.reason };
     }).sort(compareByKeys_(['effective_date', 'adjustment_id']));
@@ -647,53 +653,53 @@ function syncOneSellerSheet_(dest, snapshot, masterId) {
   return result;
 }
 
-/** Syncs every ACTIVE Seller Destination under the script lock. Never throws. */
-function runSellerSheetsSync_() {
+/** Valid Seller Destinations or a thrown error: any config ambiguity is a leak risk (nothing is written). */
+function readValidSellerDestinations_(ss, details) {
+  const dest = readSellerDestinations_(ss);
+  const destErrors = flattenDestinationErrors_(dest.parsed.errors);
+  if (details) details.warnings = dest.parsed.warnings.slice();
+  if (destErrors.length > 0) {
+    throw new Error('Seller Destinations is invalid; no seller sheet written (' + destErrors.length + ' error(s)): ' +
+      destErrors.slice(0, SELLER_OUTPUT.maxReportedErrors).join(' | '));
+  }
+  return dest;
+}
+
+/** Master freshness gate shared by every seller-sheet writer. Throws when any layer is stale. */
+function assertSellerSheetsGates_(ss, details) {
+  const gates = readSellerSheetsGates_(ss);
+  details.gates = gates.gates;
+  if (!gates.current) throw new Error('Payment Master is not current; no seller sheet written: ' + gates.reasons.join(' | '));
+}
+
+/** Snapshots for the given sellers; integrity problems or endpoint-token-like values fail before any write. */
+function buildCheckedSellerSnapshots_(ss, sellers) {
+  const built = buildSellerSnapshotsFromMaster_(ss, sellers);
+  if (built.errors.length > 0) {
+    throw new Error('Seller snapshot is invalid; no seller sheet written (' + built.errors.length + ' error(s)): ' +
+      built.errors.slice(0, SELLER_OUTPUT.maxReportedErrors).join(' | '));
+  }
+  const leaks = [];
+  sellers.forEach(function (s) { findCredentialsInSnapshot_(built.snapshots[s.seller_id]).forEach(function (h) { leaks.push(h); }); });
+  if (leaks.length > 0) throw new Error('Seller output contains endpoint tokens/credentials; no seller sheet written: ' + leaks.slice(0, 10).join(' | '));
+  return built.snapshots;
+}
+
+/** Runs fn(details) under the script lock and audits '<auditPrefix><status>'. Never throws. */
+function withSellerSheetsLock_(auditPrefix, entityId, details, fn) {
   const lock = LockService.getScriptLock();
   const locked = lock.tryLock(CANONICAL_LOCK_TIMEOUT_MS);
-  const details = { active_destinations: 0, sellers: [], warnings: [] };
   let status = 'FAILED';
   try {
     if (!locked) throw new Error('Could not acquire script lock within ' + CANONICAL_LOCK_TIMEOUT_MS + ' ms.');
-    const ss = getSpreadsheet_();
-    // 1. Destination config: any ambiguity is a leak risk -> nothing is written anywhere.
-    const dest = readSellerDestinations_(ss);
-    const destErrors = flattenDestinationErrors_(dest.parsed.errors);
-    details.warnings = dest.parsed.warnings.slice();
-    if (destErrors.length > 0) {
-      throw new Error('Seller Destinations is invalid; no seller sheet written (' + destErrors.length + ' error(s)): ' +
-        destErrors.slice(0, SELLER_OUTPUT.maxReportedErrors).join(' | '));
-    }
-    const active = dest.parsed.active;
-    details.active_destinations = active.length;
-    if (active.length === 0) {
-      details.warnings.push('No ACTIVE Seller Destinations; nothing to sync.');
-      status = 'NO_CHANGE';
-    } else {
-      // 2. Master freshness: never publish stale accounting.
-      const gates = readSellerSheetsGates_(ss);
-      details.gates = gates.gates;
-      if (!gates.current) throw new Error('Payment Master is not current; no seller sheet written: ' + gates.reasons.join(' | '));
-      // 3. Whole snapshot in memory; integrity / credential problems fail globally.
-      const built = buildSellerSnapshotsFromMaster_(ss, active.map(function (d) { return { seller_id: d.seller_id, seller_name: d.seller_name }; }));
-      if (built.errors.length > 0) {
-        throw new Error('Seller snapshot is invalid; no seller sheet written (' + built.errors.length + ' error(s)): ' +
-          built.errors.slice(0, SELLER_OUTPUT.maxReportedErrors).join(' | '));
-      }
-      const leaks = [];
-      active.forEach(function (d) { findCredentialsInSnapshot_(built.snapshots[d.seller_id]).forEach(function (h) { leaks.push(h); }); });
-      if (leaks.length > 0) throw new Error('Seller output contains endpoint tokens/credentials; no seller sheet written: ' + leaks.slice(0, 10).join(' | '));
-      // 4. Per seller: a destination failure affects that seller only.
-      active.forEach(function (d) { details.sellers.push(syncOneSellerSheet_(d, built.snapshots[d.seller_id], ss.getId())); });
-      status = decideSellerSyncStatus_(details.sellers);
-    }
+    status = fn(details);
   } catch (err) {
     details.error = redactEndpointCredentials_(err && err.message ? err.message : String(err));
     status = 'FAILED';
   } finally {
-    details.status_counts = details.sellers.reduce(function (a, x) { a[x.status] = (a[x.status] || 0) + 1; return a; }, {});
+    if (details.sellers) details.status_counts = details.sellers.reduce(function (a, x) { a[x.status] = (a[x.status] || 0) + 1; return a; }, {});
     try {
-      appendAuditLog_({ action: 'SELLER_SHEETS_SYNC_' + status, entityType: 'SELLER_SHEETS', entityId: '', newStatus: status,
+      appendAuditLog_({ action: auditPrefix + status, entityType: 'SELLER_SHEETS', entityId: entityId || '', newStatus: status,
         details: redactDeep_(details) });
     } catch (auditErr) {
       Logger.log('Failed to write audit entry: %s', auditErr);
@@ -701,6 +707,40 @@ function runSellerSheetsSync_() {
     if (locked) lock.releaseLock();
   }
   return redactDeep_(Object.assign({ status: status }, details));
+}
+
+/** Syncs every ACTIVE Seller Destination under the script lock. Never throws. */
+function runSellerSheetsSync_() {
+  return withSellerSheetsLock_('SELLER_SHEETS_SYNC_', '', { active_destinations: 0, sellers: [], warnings: [] }, function (details) {
+    const ss = getSpreadsheet_();
+    const active = readValidSellerDestinations_(ss, details).parsed.active;
+    details.active_destinations = active.length;
+    if (active.length === 0) {
+      details.warnings.push('No ACTIVE Seller Destinations; nothing to sync.');
+      return 'NO_CHANGE';
+    }
+    assertSellerSheetsGates_(ss, details);
+    const snapshots = buildCheckedSellerSnapshots_(ss, active.map(function (d) { return { seller_id: d.seller_id, seller_name: d.seller_name }; }));
+    // A destination failure affects that seller only.
+    active.forEach(function (d) { details.sellers.push(syncOneSellerSheet_(d, snapshots[d.seller_id], ss.getId())); });
+    return decideSellerSyncStatus_(details.sellers);
+  });
+}
+
+/** Syncs exactly one ACTIVE seller destination (same guards as syncSellerSheets). Never throws. */
+function runSingleSellerSheetSync_(sellerId) {
+  const id = trimmedText_(sellerId);
+  return withSellerSheetsLock_('SELLER_SHEET_SYNC_', id, { seller_id: id, sellers: [], warnings: [] }, function (details) {
+    const ss = getSpreadsheet_();
+    const dest = readValidSellerDestinations_(ss, details);
+    const d = dest.parsed.destinations.filter(function (x) { return x.seller_id === id; })[0];
+    if (!d) throw new Error('Seller ' + (id || '(blank)') + ' has no Seller Destinations row.');
+    if (d.status !== SELLER_DESTINATIONS.activeStatus) throw new Error('Seller Destination for ' + id + ' is ' + d.status + '; only ACTIVE destinations are synced.');
+    assertSellerSheetsGates_(ss, details);
+    const snapshots = buildCheckedSellerSnapshots_(ss, [{ seller_id: d.seller_id, seller_name: d.seller_name }]);
+    details.sellers.push(syncOneSellerSheet_(d, snapshots[d.seller_id], ss.getId()));
+    return details.sellers[0].status;
+  });
 }
 
 /** Read-only verification of every ACTIVE seller child spreadsheet. Never writes. */

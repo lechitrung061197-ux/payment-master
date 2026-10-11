@@ -57,6 +57,7 @@ src/
   SellerBalances.gs             Derived per-seller balances (+ read-only freshness for downstream gates)
   SellerDestinations.gs         Seller child spreadsheet destinations (validation, initial seed)
   SellerSheets.gs               Seller child sheet projection: snapshot, sync, verify
+  SellerProvisioning.gs         Template-based seller sheet provisioning + Seller Sheets menu helpers
   Main.gs           Public entry points
 test/               Node unit tests for pure helpers (npm test, not pushed)
 ```
@@ -684,9 +685,41 @@ several rows, or a `spreadsheet_id` equal to the Payment Master (or the KH001 pr
 Warnings only: sellers without a destination row, name-snapshot differences, an ID shared with an
 INACTIVE row. A missing destination never affects accounting.
 
-**Add a seller destination**: create (or pick) a Google Sheet for that seller, share it as needed,
-copy its ID (the part of the URL between `/d/` and `/edit`), add or fill the seller's row in Seller
-Destinations, set `status = ACTIVE`, run `verifySellerDestinations`, then `syncSellerSheets`.
+**Add a seller destination** — automatically (recommended): set Settings
+`seller_template_spreadsheet_id` and `seller_output_folder_id`, then run **Seller Sheets → Create
+Seller Sheet** (or `createSellerSheet('CUS001')`). Manually: create a Google Sheet, paste its ID (the
+part of the URL between `/d/` and `/edit`) into the seller's row, set `status = ACTIVE`, run
+`verifySellerDestinations`, then `syncSellerSheets`.
+
+**Template provisioning** (`createSellerSheet(sellerId)`, under the script lock). Lifecycle of the
+seller's Seller Destinations row — intentionally recoverable:
+
+```
+INACTIVE + blank ID  -> clone template -> INACTIVE + registered ID -> sync + verify -> ACTIVE + registered ID
+```
+
+1. Same Master freshness gates as `syncSellerSheets`; the seller must exist and have valid Seller
+   Terms; exactly one Seller Destinations row; an ACTIVE row is never cloned again.
+2. Template / folder checks before any clone: both Settings values are Drive IDs; the template is an
+   accessible Google Spreadsheet that is not the Payment Master, a provider source spreadsheet or a
+   registered seller destination; the folder is accessible.
+3. An INACTIVE row that already has a `spreadsheet_id` is a retry: that copy is reused and nothing is
+   cloned. Otherwise the template is copied once into the folder as `Seller - <seller_id> -
+   <seller_name>` and its ID is written to the row immediately (status stays INACTIVE).
+4. Seller-specific sync into the copy, then a full verification of the child output. Only when both
+   pass does the row become ACTIVE (and `seller_name_snapshot` current). On failure the ID stays
+   registered and the row INACTIVE; the next `createSellerSheet` reuses it. Copies are never deleted
+   automatically.
+
+The template is layout / branding only: after cloning, Master owns the six managed tabs; any other
+tab copied from the template (instructions, branding) is left untouched. A template must not contain
+accounting formulas used as a source of truth. `syncSellerSheet(sellerId)` syncs exactly one ACTIVE
+destination with the same guards and never touches another seller.
+
+**Menu**: `onOpen` adds **Seller Sheets** → Create Seller Sheet (prompts for the seller ID, lists
+INACTIVE sellers, shows the result and the sheet URL), Sync All Seller Sheets, Verify Seller Sheets.
+Alerts never show the Master, provider-source, template or folder IDs. The manifest therefore also
+requests the `drive` and `script.container.ui` scopes (re-authorization needed after deploy).
 
 **Sync order**: run the full Master chain first (`syncKh001Raw` → … → `normalizePaymentLegs` →
 `normalizeSettlementItems` → `normalizeSellerBalances`), then `syncSellerSheets`, then
@@ -713,7 +746,10 @@ tab is created, an existing one is replaced):
   reconciliation status if not MATCHED, else the leg's settlement status, else MATCHED.
 - `Settlements` — this seller's legs aggregated per settlement + currency (never provider-wide
   totals or other sellers' portions).
-- `Payouts`, `Adjustments` — this seller's rows (no internal notes / provider tracing fields).
+- `Payouts`, `Adjustments` — this seller's **financially effective** rows only: `SENT` / `CONFIRMED`
+  payouts and `APPLIED` adjustments (the statuses Seller Balances counts). DRAFT, PENDING and VOID
+  rows stay in Master and never reach a seller sheet (they do not change any child checksum until
+  they become effective). No internal notes / provider tracing fields.
 - `Sync Info` — one row: versions, `last_content_sync_at`, five tab checksums and a combined
   checksum.
 
