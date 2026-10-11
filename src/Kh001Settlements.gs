@@ -571,6 +571,27 @@ function evaluateKh001SettlementsRegression_(rowsWithKeys, totals) {
   };
 }
 
+/**
+ * Freshness of the stored KH001 Settlements partition against a fresh build: canonical
+ * partition checksum (stored order, excluding only normalized_at).
+ * @param {Array<Array<*>>} storedRows Settlements data rows (all providers)
+ */
+function checkKh001SettlementsFresh_(built, storedRows, columns, dateFromKey) {
+  const providerIdx = columns.indexOf('provider_id');
+  const kh001 = storedRows.filter(function (r) { return r[providerIdx] === KH001_SETTLEMENTS.providerId; });
+  const stored = tableChecksumExcluding_(buildTableValues_(columns, kh001), [columns.indexOf('normalized_at')]);
+  const problems = flattenSettlementErrors_(built.errors).length;
+  if (problems > 0) {
+    return { current: false, expected_checksum: null, stored_checksum: stored,
+      reason: 'Settlements KH001 is stale; run normalizeKh001Settlements first (settlement input has ' + problems + ' error(s)).' };
+  }
+  const expected = partitionChecksum_(built.rows.map(function (o) { return settlementObjectToRow_(o, columns, dateFromKey); }),
+    columns, ['provider_id', 'payment_source', 'source_settlement_number'], 'normalized_at');
+  const current = expected === stored;
+  return { current: current, expected_checksum: expected, stored_checksum: stored,
+    reason: current ? null : 'Settlements KH001 is stale; run normalizeKh001Settlements first.' };
+}
+
 /* ---------------------------------- I/O --------------------------------- */
 
 const SETTLEMENT_KEY_COLUMNS = ['provider_id', 'payment_source', 'source_settlement_number'];
@@ -603,6 +624,27 @@ function readKh001SettlementsInputs_(ss) {
     timeZone: timeZone,
     dependency: dep,
   };
+}
+
+/** Read-only freshness of the KH001 Settlements partition against current raw + Provider Transactions. */
+function readKh001SettlementsFreshness_(ss) {
+  const stale = 'Settlements KH001 is stale; run normalizeKh001Settlements first.';
+  try {
+    const input = readKh001SettlementsInputs_(ss);
+    if (!input.dependency.dependency.provider_transactions_current) {
+      return { current: false, expected_checksum: null, stored_checksum: null, reason: stale + ' (Provider Transactions KH001 is stale)' };
+    }
+    const built = buildKh001Settlements_(input.settlements.values, input.reconciled.values, input.dependency.index,
+      { timeZone: input.timeZone });
+    const state = detectSwapState_(ss, settlementsTab_()).state;
+    if (state !== 'NORMAL') throw new Error('Settlements swap state is ' + state);
+    const columns = getColumnNames_(SHEETS.SETTLEMENTS);
+    const rows = tableRowsFromGrid_(readSheetGrid_(ss.getSheetByName(SHEETS.SETTLEMENTS)).values, columns, SHEETS.SETTLEMENTS);
+    return checkKh001SettlementsFresh_(built, rows, columns, masterDateFromKey_);
+  } catch (err) {
+    return { current: false, expected_checksum: null, stored_checksum: null,
+      reason: stale + ' (' + (err && err.message ? err.message : String(err)) + ')' };
+  }
 }
 
 /** Normalizes KH001 settlement headers under the script lock. Never throws. */

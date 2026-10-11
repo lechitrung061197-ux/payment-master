@@ -50,6 +50,7 @@ src/
   SecurityRedaction.gs          Audit Log credential redaction + exposure check
   InternalTransactions.gs       Raw Internal Transactions -> Source System -> Transactions
   PaymentReconciliation.gs      Exact Transactions <-> Provider Transactions -> Payment Matches
+  PaymentLegs.gs                Confirmed matches -> Payment Legs (KH001 actual economics + settlement)
   Main.gs           Public entry points
 test/               Node unit tests for pure helpers (npm test, not pushed)
 ```
@@ -88,7 +89,7 @@ from the Apps Script editor. `setupMaster` never deletes tabs or data rows:
 | Source Payments | Raw provider events (payment, refund, dispute, hold, …), one row per event |
 | Transactions | Canonical internal transactions + effective-dated endpoint ownership |
 | Payment Matches | Exact internal ↔ provider reconciliation, one row per (payment_source, transaction id) |
-| Payment Legs | One row per matched external payment transaction, live economics |
+| Payment Legs | One leg per CONFIRMED MATCHED payment: provider amounts, KH001 actual fee/hold, settlement membership |
 | Settlements | Canonical provider settlement headers (provider economics only), all providers |
 | Settlement Items | Frozen per-leg snapshot inside a settlement |
 | Seller Balances | Per-seller balance across all providers |
@@ -552,6 +553,42 @@ settlement items, balances or payouts, and `Transactions.status` is not changed
 - Written as a whole table through SafeSwap under the script lock; requires Transactions and
   Provider Transactions in a NORMAL swap state. The Dashboard "Matched" metric counts
   Payment Matches with `reconciliation_status = MATCHED`.
+
+## Payment Legs (Phase 2H)
+
+Entry points: `normalizePaymentLegs()` and read-only `verifyPaymentLegs()`. Writes only
+Payment Legs and Audit Log; seller economics, refunds/disputes, Settlement Items, balances and
+payouts are later phases.
+
+- **Eligible**: Payment Matches with `reconciliation_status = MATCHED` and `match_status =
+  CONFIRMED` (MISSING_*, AMOUNT_MISMATCH, REJECTED, REVERSED create none). Only KH001 / PAYPAL
+  is supported; any other eligible provider/source fails.
+- **Identity**: `payment_leg_id = PL-<sha256(payment_source|external_transaction_id)>`; unique by
+  `payment_source + external_transaction_id`. The exact Provider Transactions row named by the
+  match must agree on source, id and provider. Base `currency`, `gross_amount`,
+  `processing_fee`, `net_amount` come from Provider Transactions; `created_at` = provider
+  `transaction_at`.
+- **Actual KH001 economics** (provider reconciliation RECONCILED): exactly one Raw KH001
+  Reconciled row (exact Transaction ID, status Khớp); DoiSoat gross / Phí PayPal / Net must equal
+  the provider values (< 0.005); `provider_fee` = `Phí thuê OP`, `provider_hold_amount` = `Hold`
+  (actual, authoritative, never computed from Settings); `provider_fee_rate` / `provider_hold_rate`
+  are derived (amount / net; blank when net = 0); `net − fee − hold` = `Thực nhận` (< 0.005);
+  fee and hold are non-negative. Not yet RECONCILED → base values only, provider economics and
+  settlement blank, `WAITING_SETTLEMENT` (no estimated hold).
+- **Settlement membership**: `Lần chốt (ngày)` (provider-timezone date key) resolves to exactly
+  one KH001 Settlements row by `period_end_date` → `settlement_id`, `settlement_status = SETTLED`;
+  blank → `WAITING_SETTLEMENT`; zero or several settlements → fail. `AVAILABLE` is never set here.
+- **Settlement aggregates**: per settlement, leg count and sums of gross / processing fee / net
+  (< 0.005) and provider fee / hold / derived transaction payout (< 0.00005) must equal the
+  Settlements header. A settled provider payment without a confirmed match therefore fails.
+- Seller fields (`seller_fee_rate`, `seller_fee`, `seller_hold_rate`, `seller_hold_amount`,
+  `seller_available_amount`) and `refund_amount` / `dispute_amount` / `dispute_fee` stay blank
+  (not computed, not zero). `Transactions.status` is not changed.
+- **Gates**: Transactions, Provider Transactions KH001, Payment Matches and Settlements KH001
+  must all be current (shared read-only freshness helpers) before any write.
+- **Timestamps**: `updated_at` set on creation, preserved when the leg content is unchanged; a
+  rerun is NO_CHANGE; a previously produced leg that disappears fails. SafeSwap under the lock.
+- Dashboard "Waiting settlement" counts `Payment Legs.settlement_status = WAITING_SETTLEMENT`.
 
 ## Tests
 

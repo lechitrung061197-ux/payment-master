@@ -9,7 +9,7 @@
 
 const APP = Object.freeze({
   NAME: 'Payment Master',
-  SCHEMA_VERSION: 9,
+  SCHEMA_VERSION: 10,
   LOCALE: 'en_US',
   TIMEZONE: 'America/New_York',
   DEFAULT_CURRENCY: 'USD',
@@ -342,10 +342,11 @@ const SCHEMA = Object.freeze([
   },
   {
     sheet: SHEETS.PAYMENT_LEGS,
-    description: 'One row per external payment transaction linked to an internal transaction. ' +
-      'Unique key: payment_source + external_transaction_id. Live (pre-settlement) economics. ' +
-      'refund_amount / dispute_amount / dispute_fee are source information only; their money ' +
-      'effect is recorded once, in Adjustments.',
+    description: 'One leg per CONFIRMED MATCHED Payment Match: payment_leg_id = PL-<sha256(payment_source|' +
+      'external_transaction_id)>. Gross / processing fee / net come from Provider Transactions; KH001 ' +
+      'provider_fee and provider_hold_amount are the actual DoiSoat values (rates are derived, never applied). ' +
+      'settlement_id comes from the provider settlement date. Seller and refund/dispute fields stay blank ' +
+      'until those phases (blank = not computed, not zero).',
     columns: [
       col_('payment_leg_id', T.ID),
       col_('match_id', T.ID),
@@ -354,21 +355,21 @@ const SCHEMA = Object.freeze([
       col_('provider', T.ID),
       col_('external_transaction_id', T.ID),
       col_('currency', T.TEXT),
-      col_('gross_amount', T.USD),
-      col_('processing_fee', T.USD),
-      col_('net_amount', T.USD),
+      col_('gross_amount', T.AMOUNT),
+      col_('processing_fee', T.AMOUNT),
+      col_('net_amount', T.AMOUNT),
       col_('provider_fee_rate', T.RATE),
-      col_('provider_fee', T.USD),
+      col_('provider_fee', T.AMOUNT4),
       col_('provider_hold_rate', T.RATE),
-      col_('provider_hold_amount', T.USD),
+      col_('provider_hold_amount', T.AMOUNT4),
       col_('seller_fee_rate', T.RATE),
-      col_('seller_fee', T.USD),
+      col_('seller_fee', T.AMOUNT4),
       col_('seller_hold_rate', T.RATE),
-      col_('seller_hold_amount', T.USD),
-      col_('seller_available_amount', T.USD),
-      col_('refund_amount', T.USD),
-      col_('dispute_amount', T.USD),
-      col_('dispute_fee', T.USD),
+      col_('seller_hold_amount', T.AMOUNT4),
+      col_('seller_available_amount', T.AMOUNT4),
+      col_('refund_amount', T.AMOUNT),
+      col_('dispute_amount', T.AMOUNT),
+      col_('dispute_fee', T.AMOUNT),
       col_('settlement_id', T.ID),
       col_('settlement_status', T.ENUM, ENUMS.LEG_SETTLEMENT_STATUS),
       col_('created_at', T.DATETIME),

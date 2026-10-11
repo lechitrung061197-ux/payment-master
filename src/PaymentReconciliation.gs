@@ -190,6 +190,24 @@ function mergeReconciliationTimestamps_(freshRows, existingRows, now, columns) {
   };
 }
 
+/**
+ * Freshness of stored Payment Matches against a fresh reconciliation build: same rows and
+ * content over the whole grid, ignoring only matched_at / matched_by / updated_at.
+ */
+function checkPaymentMatchesFresh_(built, storedValues, columns) {
+  const stamps = PAYMENT_RECONCILIATION.timestampColumns.map(function (c) { return columns.indexOf(c); });
+  const stored = tableChecksumExcluding_(storedValues, stamps);
+  const problems = flattenReconciliationErrors_(built.errors).length;
+  if (problems > 0) {
+    return { current: false, expected_checksum: null, stored_checksum: stored,
+      reason: 'Payment Matches is stale; run reconcilePayments first (reconciliation input has ' + problems + ' error(s)).' };
+  }
+  const expected = tableChecksumExcluding_(buildTableValues_(columns, built.rows.map(function (o) { return objectToRow_(o, columns); })), stamps);
+  const current = expected === stored;
+  return { current: current, expected_checksum: expected, stored_checksum: stored,
+    reason: current ? null : 'Payment Matches is stale; run reconcilePayments first.' };
+}
+
 /** Generic summary of reconciliation rows (no snapshot-specific numbers). */
 function summarizePaymentReconciliation_(rows, internalById) {
   const tally = function (list, keyOf) {
@@ -290,6 +308,18 @@ function readReconciliationInputs_(ss) {
   const internalById = {};
   internal.rows.forEach(function (r) { internalById[reconciliationKey_(r.payment_source, r.internal_transaction_id)] = r; });
   return { internal: internal, provider: provider, built: built, internalById: internalById };
+}
+
+/** Read-only freshness of Payment Matches against current Transactions + Provider Transactions. */
+function readPaymentMatchesFreshness_(ss) {
+  try {
+    const input = readReconciliationInputs_(ss);
+    const current = readSchemaTableObjects_(ss, SHEETS.PAYMENT_MATCHES, paymentMatchesTab_());
+    return checkPaymentMatchesFresh_(input.built, current.grid.values, getColumnNames_(SHEETS.PAYMENT_MATCHES));
+  } catch (err) {
+    return { current: false, expected_checksum: null, stored_checksum: null,
+      reason: 'Payment Matches is stale; run reconcilePayments first (' + (err && err.message ? err.message : String(err)) + ').' };
+  }
 }
 
 function throwIfReconciliationErrors_(label, list) {
@@ -403,9 +433,7 @@ function buildPaymentReconciliationReport_() {
     report.disappearing_match_ids = merged.errors;
     if (merged.errors.length > 0) report.errors.push('Existing Payment Matches rows are missing from the union.');
     if (merged.demoted.length > 0) report.warnings.push('Previously confirmed rows no longer MATCHED: ' + merged.demoted.join(', '));
-    const stamps = PAYMENT_RECONCILIATION.timestampColumns.map(function (c) { return columns.indexOf(c); });
-    const expected = tableChecksumExcluding_(buildTableValues_(columns, b.rows.map(function (o) { return objectToRow_(o, columns); })), stamps);
-    report.payment_matches_match = expected === tableChecksumExcluding_(current.grid.values, stamps);
+    report.payment_matches_match = checkPaymentMatchesFresh_(b, current.grid.values, columns).current;
     report.confirmed_without_matched_at = current.rows
       .filter(function (r) { return r.match_status === 'CONFIRMED' && (isBlankCell_(r.matched_at) || isBlankCell_(r.matched_by)); })
       .map(function (r) { return r.match_id; });

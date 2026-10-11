@@ -250,3 +250,21 @@ function verifyPaymentReconciliation() {
   Logger.log(JSON.stringify(report, null, 2));
   return report;
 }
+
+/* ---------------------------------------------------------------------------
+ * Payment Legs (KH001 actual provider economics + settlement membership; no seller economics)
+ * ------------------------------------------------------------------------- */
+
+/** Rebuilds Payment Legs from confirmed Payment Matches, Provider Transactions, DoiSoat and Settlements. */
+function normalizePaymentLegs() {
+  const result = runPaymentLegsNormalizer_();
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** Read-only: checks Payment Legs against a fresh build and its upstream inputs. */
+function verifyPaymentLegs() {
+  const report = buildPaymentLegsReport_();
+  Logger.log(JSON.stringify(report, null, 2));
+  return report;
+}

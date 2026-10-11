@@ -203,14 +203,14 @@ function dashboardMetrics_() {
   const col = function (sheetName, columnName) {
     return 'INDIRECT("' + dataColumnRef_(sheetName, columnName).replace(/"/g, '""') + '")';
   };
-  const txStatus = col(SHEETS.TRANSACTIONS, 'status');
   const disputeStatus = col(SHEETS.DISPUTES, 'dispute_status');
   const notYet = 'Not implemented yet (later phase)';
   return [
     ['Total transactions', '=COUNTA(' + col(SHEETS.TRANSACTIONS, 'internal_transaction_id') + ')', 'Count of Transactions rows'],
     ['Matched', '=COUNTIF(' + col(SHEETS.PAYMENT_MATCHES, 'reconciliation_status') + ',"MATCHED")',
       'Payment Matches.reconciliation_status = MATCHED'],
-    ['Waiting settlement', '=COUNTIF(' + txStatus + ',"WAITING_SETTLEMENT")', 'Transactions.status = WAITING_SETTLEMENT'],
+    ['Waiting settlement', '=COUNTIF(' + col(SHEETS.PAYMENT_LEGS, 'settlement_status') + ',"WAITING_SETTLEMENT")',
+      'Payment Legs.settlement_status = WAITING_SETTLEMENT'],
     ['Available (USD)', null, notYet],
     ['Seller balances (USD)', null, notYet],
     ['Provider settlements (USD)', null, notYet],
