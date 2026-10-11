@@ -63,7 +63,7 @@ function install(ss) {
 
 const SELLERS = [{ seller_id: 'CUS001', seller_name: 'Seller 1', status: 'ACTIVE', effective_from: D('2026-10-01T04:00:00Z') },
   { seller_id: 'CUS002', seller_name: 'Seller 2', status: 'ACTIVE', effective_from: D('2026-10-01T04:00:00Z') }];
-const term = (id, n) => ({ seller_id: id, seller_name_snapshot: 'Seller ' + n, seller_fee_rate: 0.08, effective_from: D('2026-10-01T04:00:00Z') });
+const term = (id, n) => ({ seller_id: id, payment_source: 'PAYPAL', seller_name_snapshot: 'Seller ' + n, seller_fee_rate: 0.08, effective_from: D('2026-10-01T04:00:00Z') });
 
 // ---- 1. Missing Seller Terms are blocking --------------------------------------------------------------
 test('a seller without Seller Terms: validity not current, verifySellerTerms fails, Payment Legs fails before any read/write', () => {

@@ -56,7 +56,8 @@ src/
   SettlementItems.gs            Frozen per-leg accounting snapshot of provider-paid (AVAILABLE) legs
   SellerBalances.gs             Derived per-seller balances (+ read-only freshness for downstream gates)
   SellerDestinations.gs         Seller child spreadsheet destinations (validation, initial seed)
-  SellerSheets.gs               Seller child sheet projection: snapshot, sync, verify
+  SellerOutput.gs               Seller output contract v2: template anchors, validation, model, checksums
+  SellerSheets.gs               Seller child sheet sync / verify (owned-range renderer, _Sync commit)
   SellerProvisioning.gs         Template-based seller sheet provisioning + Seller Sheets menu helpers
   Main.gs           Public entry points
 test/               Node unit tests for pure helpers (npm test, not pushed)
@@ -90,7 +91,7 @@ from the Apps Script editor. `setupMaster` never deletes tabs or data rows:
 | --- | --- |
 | Settings | Key/value config. Provider-scoped keys: `provider_fee_rate.<PROVIDER>`, `provider_hold_rate.<PROVIDER>`; `default_seller_hold_rate` is legacy (not used for KH001) |
 | Sellers | User-managed desired mapping: 1 row = 1 seller, endpoint_<N>_name/key pairs |
-| Seller Terms | User-edited effective-dated seller fee history (seeded once while empty) |
+| Seller Terms | User-edited effective-dated seller fee history per seller + payment_source (seeded once while empty) |
 | Seller Destinations | User-managed seller child spreadsheet IDs (ACTIVE / INACTIVE; seeded once while empty) |
 | Endpoint Mapping | System-managed effective-dated endpoint ownership history |
 | Raw Internal Transactions | Append-only internal CSV evidence: 16 raw CSV columns + 5 ingestion metadata columns |
@@ -605,21 +606,29 @@ Refunds/disputes and payout allocation are still out of scope.
 
 ## Seller terms and seller economics (Phase 2I)
 
-- **Seller Terms** (`seller_id, seller_name_snapshot, seller_fee_rate, effective_from, effective_to,
-  notes`): effective-dated seller FEE history. Rules: seller exists in Sellers, non-blank name
-  snapshot, `0 <= rate < 1`, `effective_from` required, `effective_to` blank (open) or ≥ from, no
-  overlapping periods, at most one open row, no duplicate periods, and every seller with a
+- **Seller Terms** (`seller_id, payment_source, seller_name_snapshot, seller_fee_rate, effective_from,
+  effective_to, notes`; schema v14): effective-dated seller FEE history **per seller + payment source**.
+  The applicable term is looked up by `seller_id + payment_source + transaction date` with an exact
+  `payment_source` match — never a fallback to another source (PAYPAL terms are never used for
+  STRIPE); no applicable term fails closed. Rules: seller exists in Sellers, `payment_source` required
+  (PAYMENT_SOURCE enum), non-blank name snapshot, `0 <= rate < 1`, `effective_from` required,
+  `effective_to` blank (open) or ≥ from; per seller + source no overlapping periods, at most one open
+  row, no duplicate periods; and every seller with a
   `seller_id` must have at least one valid row (a missing seller blocks Payment Legs and everything
   downstream; once the tab has data it is never auto-seeded — add the term manually). A fee change closes the old row
   and adds a new one, so earlier transactions keep their rate. `verifySellerTerms()` is read-only.
-- **Seed**: `setupMaster` seeds Seller Terms only while it has no data rows — one row per seller
+- **v13 → v14 migration** (`setupMaster`): when Seller Terms still has the v13 header, a
+  `payment_source` column is inserted after `seller_id` and every existing row gets `PAYPAL` (all terms
+  so far are PAYPAL activity); rates, dates, names and notes are preserved and frozen Payment Legs /
+  Settlement Items are never recalculated.
+- **Seed**: `setupMaster` seeds Seller Terms only while it has no data rows — one PAYPAL row per seller
   with Settings `seller_fee_rate`, starting at the seller's earliest Endpoint Mapping
   `effective_from` — and never reseeds or overwrites history. After that, rates come only from
   Seller Terms.
 - **Seller economics in Payment Legs** (still the only Payment Legs writer): the leg's internal
   Transaction (exact `payment_source + internal_transaction_id`) must be MAPPED to a seller; the
-  Seller Terms row in effect on the transaction's created date (America/New_York) gives
-  `seller_fee_rate`; `seller_fee = net × rate` (unrounded). With actual provider economics:
+  Seller Terms row of that seller and the leg's own `payment_source` in effect on the transaction's
+  created date (America/New_York) gives `seller_fee_rate` (frozen in the leg snapshot); `seller_fee = net × rate` (unrounded). With actual provider economics:
   `seller_hold_amount = provider_hold_amount` (KH001 MIRROR_PROVIDER), `seller_hold_rate = hold / net`,
   `seller_available_amount = net − seller_fee − seller_hold_amount`. Without an actual provider hold,
   seller hold and available stay blank. `system_margin = seller_fee − provider_fee` is reported.
@@ -668,11 +677,46 @@ without writing while any upstream step is stale.
   (`AMOUNT4` for unrounded economics); `setupMaster` on a v10 Master adds Seller Terms (seeded
   once) and leaves every data tab untouched.
 
-## Seller child sheets (Phase 2K)
+## Seller child sheets (Phase 2K, output contract v2)
 
-Seller child spreadsheets are **projections only**. Payment Master stays the sole accounting source
-of truth: child sheets hold values only (no formulas), never compute fee / hold / available /
-balance / eligibility, and are never read back into Master.
+Seller child spreadsheets are **output-only projections**. Payment Master stays the sole accounting
+source of truth: it computes and snapshots provider gross, processing fee, net, seller fee rate, seller
+fee, seller hold, seller amount, settlement / payout state and adjustments; the child only receives
+those values and is never read back into Master. No provider trace = no provider economics; no
+confirmed provider settlement = no seller available balance; MATCHED ≠ AVAILABLE.
+
+**Output contract (seller output schema version 2)** — exactly four visible tabs from the template plus
+one hidden system tab:
+
+| Tab | Content (owned ranges only) |
+| --- | --- |
+| `DoiSoat_GD` | One row per seller internal transaction (header row 6, data from row 7): status (Khớp / Lệch số tiền / Thiếu trên cổng), payment source, internal order data and, for MATCHED legs, provider gross, processing fee, net, frozen `seller_fee_rate`, seller fee, seller hold, settlement dates / status and seller amount. MISSING_PROVIDER rows keep every provider / seller / settlement field blank. |
+| `TongHop_Thang` | One row per month, all payment sources together: counts, distinct sources, gross / fee / net, `Phí VNS` = SUM of frozen leg `seller_fee` (never net × one rate), hold created / released / month-end balance, available (by provider payment date), disputes, effective payouts, adjustments, balance, known obligation. Rows are inserted before the `Logic:` footer when needed. |
+| `PhieuDoiSoat` | Seller + period; "Chưa đối soát / chưa tính" (internal order amount and count of transactions without provider economics) and "Hold đang giữ" (Seller Balances hold) — never added together; A: known economics per payment source (rate shown only when exactly one rate applies); B: seller-only payable from AVAILABLE legs, hold releases, refunds / disputes, APPLIED adjustments, effective payouts → current balance and hold; C: counts / internal amounts by reconciliation status; D: chronological seller-only ledger of paid settlements (seller share only), adjustments and SENT / CONFIRMED payouts. |
+| `Dispute` | Canonical Master disputes attributable to the seller (no buyer data, no internal notes); clean headers when none. |
+| `_Sync` (hidden) | `output_schema_version, seller_id, seller_name, master_schema_version, synced_at`, the four tab checksums and a combined checksum — the commit marker. No Master ID, tokens or PII. |
+
+**Template preflight** (`createSellerSheet` before cloning, every sync before writing): the four tabs
+exist and are visible; no other tab (RAW_KH / RAW_PP, the old Phase 2K tabs or anything unknown —
+never deleted automatically, validation fails instead); exact headers / anchors (DoiSoat_GD row 6,
+TongHop_Thang header + `Logic:` footer, PhieuDoiSoat labels of sections A–D, Dispute row 7); formulas
+only at the **approved presentation locations** — DoiSoat_GD summary `COUNTIF` row and `SUBTOTAL` row,
+Dispute summary row and the per-row "Số ngày còn lại" formula — and no formula referencing RAW_KH /
+RAW_PP, IMPORTRANGE / IMPORT*, another sheet, an endpoint token or a protected spreadsheet ID; no
+token, protected ID or e-mail address in any cell.
+
+**Renderer**: only explicit owned ranges are written, with `setValues` (blank padding clears stale
+rows); `sheet.clear()`, format calls and static titles / headers / approved formulas are never
+touched. Text that Sheets could reinterpret is written with a quote prefix. Date-only values are
+written at 12:00 UTC so the same calendar day shows in any template time zone. When a block outgrows
+the template capacity (DoiSoat_GD 1000 rows, TongHop_Thang months, PhieuDoiSoat A / D, Dispute),
+rows are inserted inside the block so presentation formula ranges, filters and conditional formats
+extend, and the template data-row format is copied onto the new rows.
+
+**Provider-agnostic**: one reconciliation across payment sources (no per-provider tabs, no code like
+"PayPal = 8%"): every rate comes from Seller Terms (seller + payment_source + effective date) via the
+frozen Payment Leg snapshot; PAYPAL and STRIPE rows share DoiSoat_GD, TongHop_Thang aggregates both,
+PhieuDoiSoat section A shows one row per source.
 
 **Destination configuration** — tab `Seller Destinations` (`seller_id, seller_name_snapshot,
 spreadsheet_id, status, notes`), user-managed. `setupMaster` seeds it once, while it has no data
@@ -705,7 +749,8 @@ INACTIVE + blank ID  -> clone template -> INACTIVE + registered ID -> sync + ver
    config; the row is kept for a retry if a later step fails.
 2. Template / folder checks before any clone: both Settings values are Drive IDs; the template is an
    accessible Google Spreadsheet that is not the Payment Master, a provider source spreadsheet or a
-   registered seller destination; the folder is accessible.
+   registered seller destination; the folder is accessible; the template satisfies the output
+   contract below (read-only check).
 3. An INACTIVE row that already has a `spreadsheet_id` is a retry: that copy is reused and nothing is
    cloned. Otherwise the template is copied once into the folder as `Seller - <seller_id> -
    <seller_name>` and its ID is written to the row immediately (status stays INACTIVE).
@@ -714,10 +759,12 @@ INACTIVE + blank ID  -> clone template -> INACTIVE + registered ID -> sync + ver
    registered and the row INACTIVE; the next `createSellerSheet` reuses it. Copies are never deleted
    automatically.
 
-The template is layout / branding only: after cloning, Master owns the six managed tabs; any other
-tab copied from the template (instructions, branding) is left untouched. A template must not contain
-accounting formulas used as a source of truth. `syncSellerSheet(sellerId)` syncs exactly one ACTIVE
-destination with the same guards and never touches another seller.
+The template (`seller_template_spreadsheet_id`, currently VNS_SELLER_PAYMENT_TEMPLATE) is the UI
+authority: it is validated against the output contract before any clone, cloned as-is (colors, fonts,
+borders, merges, conditional formats, filters, frozen panes, row heights, column widths, number
+formats, locale and time zone are all kept — nothing is rebuilt or forced), and after cloning Master
+writes only the owned ranges. `syncSellerSheet(sellerId)` syncs exactly one ACTIVE destination with
+the same guards and never touches another seller.
 
 **Menu**: `onOpen` adds **Seller Sheets** → Create Seller Sheet (prompts for the seller ID, lists
 INACTIVE sellers, shows the result and the sheet URL), Sync All Seller Sheets, Verify Seller Sheets.
@@ -725,57 +772,34 @@ Alerts never show the Master, provider-source, template or folder IDs. The manif
 requests the `drive` and `script.container.ui` scopes (re-authorization needed after deploy).
 
 **Sync order**: run the full Master chain first (`syncKh001Raw` → … → `normalizePaymentLegs` →
-`normalizeSettlementItems` → `normalizeSellerBalances`), then `syncSellerSheets`, then
-`verifySellerSheets`.
+`normalizeSettlementItems` → `normalizeSellerBalances`), then `syncSellerSheets` (or
+`syncSellerSheet(id)`), then `verifySellerSheets`.
 
 **Freshness gates**: before any child write, Transactions, Provider Transactions, Payment Matches,
 Settlements, Seller Terms, Payment Legs, Settlement Items and Seller Balances must all be current
 (Seller Balances via a read-only rebuild from Settlement Items, Adjustments and Seller Payouts,
-compared ignoring only `updated_at`). Stale Master → FAILED, nothing written.
-
-**Managed tabs** (the only child tabs ever touched; any other tab is left alone; a missing managed
-tab is created, an existing one is replaced):
-
-- `Summary` — one row per seller + currency: `current_balance`, `settled_hold_remaining`,
-  `paid_amount`, `adjustments` from Seller Balances; `pending_settlement_amount` /
-  `pending_hold_amount` = this seller's non-AVAILABLE Payment Legs with numeric
-  `seller_available_amount` / `seller_hold_amount`; `total_known_hold = settled_hold_remaining +
-  pending_hold_amount`; `total_known_obligation = current_balance + pending_settlement_amount +
-  total_known_hold` (known amounts only — nothing is estimated); transaction counts, including
-  `unknown_economics_transactions` (no actual seller economics yet).
-- `Transactions` — **all** of the seller's internal Transactions (also MISSING_PROVIDER), joined
-  exactly to Payment Matches → Payment Legs → Settlements. `available_to_payout` only for AVAILABLE
-  legs; rows without a leg keep every provider/seller/settlement field blank. `accounting_state` =
-  reconciliation status if not MATCHED, else the leg's settlement status, else MATCHED.
-- `Settlements` — this seller's legs aggregated per settlement + currency (never provider-wide
-  totals or other sellers' portions).
-- `Payouts`, `Adjustments` — this seller's **financially effective** rows only: `SENT` / `CONFIRMED`
-  payouts and `APPLIED` adjustments (the statuses Seller Balances counts). DRAFT, PENDING and VOID
-  rows stay in Master and never reach a seller sheet (they do not change any child checksum until
-  they become effective). No internal notes / provider tracing fields.
-- `Sync Info` — one row: versions, `last_content_sync_at`, five tab checksums and a combined
-  checksum.
+compared ignoring only `updated_at`). Stale Master → FAILED, nothing written. The seller model also
+reconciles itself to Seller Balances (TongHop_Thang, sections B and D) and fails closed otherwise.
 
 **Seller isolation / privacy**: ownership is the exact `Transactions.seller_id`; every other row
-reaches a seller only through that seller's own rows. Output never contains endpoint tokens or
-credentials, customer / payer data, provider fee / provider hold / system margin, fingerprints,
-import metadata, internal notes or the Master spreadsheet ID; any endpoint-token-like value fails the
-whole sync before any write.
+reaches a seller only through that seller's own rows; provider settlements show the seller's share
+only. Output never contains endpoint tokens or credentials, customer / buyer data, provider fee /
+provider hold / system margin, fingerprints, import metadata, internal notes or the Master ID; any
+token- or e-mail-like value fails the whole sync before any write. Payouts count only when SENT /
+CONFIRMED and adjustments only when APPLIED; DRAFT, PENDING and VOID rows never change seller output.
 
-**Idempotency**: the snapshot is built in memory with deterministic checksums. A child already
-matching it is `NO_CHANGE` — nothing is written and `last_content_sync_at` is kept. Otherwise one
-timestamp is used: changed data tabs are rewritten, then Summary, then **Sync Info last** (the commit
-marker, overwritten in one write). The child is reread and verified before `SUCCESS`. If a write
-fails before the commit, the old Sync Info remains and `verifySellerSheets` reports the child as
-stale/incomplete; the next sync repairs it. Sync sets the child spreadsheet time zone to
-America/New_York so dates match Master.
+**Idempotency / commit**: per-tab checksums of the canonical owned content (not formatting). Unchanged
+→ `NO_CHANGE`: zero writes, `synced_at` kept, presentation formulas untouched. Otherwise only changed
+tabs are written, then the hidden `_Sync` marker **last** (one write), and the child is reread and fully
+verified (contract, isolation, leaks, checksums) before `SUCCESS`. A failure before the commit leaves
+the old `_Sync`, so `verifySellerSheets` reports the child as stale / incomplete; the next sync repairs it.
 
 **Results**: per seller `SUCCESS` / `NO_CHANGE` / `FAILED`; overall `SELLER_SHEETS_SYNC_SUCCESS`,
-`_NO_CHANGE`, `_PARTIAL` (some sellers failed, e.g. an inaccessible sheet, others synced) or
-`_FAILED` (nothing synced, or a global gate/config failure), audited with per-seller details.
-`verifySellerSheets()` is read-only: per ACTIVE destination it checks access, the six tabs, headers,
-checksums, Sync Info, combined checksum, timestamp, isolation, forbidden columns, formulas and time
-zone, and reports a report-only production regression of the expected seller summaries.
+`_NO_CHANGE`, `_PARTIAL` or `_FAILED`, audited with per-seller details. `verifySellerSheets()` is
+read-only: per ACTIVE destination it checks access, the contract, each tab's checksum, `_Sync`,
+combined checksum, isolation and leaks, and reports a report-only production regression (CUS002 / HUI:
+143 transactions, 74 MATCHED, 69 MISSING_PROVIDER; balance 3037.444 + hold 370.420 + seller fee
+296.336 + processing fee 156.310 + missing-provider order amount 3501.760 = 7362.270 total order amount).
 
 ## Tests
 

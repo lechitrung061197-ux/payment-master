@@ -9,6 +9,8 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { makeSpreadsheet, cloneSpreadsheet, formatOps } = require('./helpers/sellerFakes');
+const { makeMaster } = require('./helpers/sellerMaster');
 
 const Utilities = {
   DigestAlgorithm: { SHA_256: 'SHA_256' },
@@ -62,7 +64,7 @@ function master(o) {
     ['seller_output_folder_id', o.folder === undefined ? FOLDER_ID : o.folder]].map(([key, value]) => ({ key, value, value_type: 'STRING' }));
   const sellers = [{ seller_id: 'CUS001', seller_name: 'DITECH', status: 'ACTIVE', effective_from: D('2026-10-01T04:00:00Z') },
     { seller_id: 'CUS002', seller_name: 'HUI', status: 'ACTIVE', effective_from: D('2026-10-01T04:00:00Z') }];
-  const terms = (o.terms || ['CUS001', 'CUS002']).map((id, i) => ({ seller_id: id, seller_name_snapshot: sellers[i].seller_name, seller_fee_rate: 0.08,
+  const terms = (o.terms || ['CUS001', 'CUS002']).map((id, i) => ({ seller_id: id, payment_source: 'PAYPAL', seller_name_snapshot: sellers[i].seller_name, seller_fee_rate: 0.08,
     effective_from: D('2026-10-01T04:00:00Z') }));
   const destinations = o.destinations || [
     { seller_id: 'CUS001', seller_name_snapshot: 'Old DITECH name', spreadsheet_id: '', status: 'INACTIVE', notes: 'seed' },
@@ -76,72 +78,31 @@ const destRow = (m, sellerId) => {
   return Object.fromEntries(cols.map((c, i) => [c, row[i]]));
 };
 
-// ---- child spreadsheets and Drive ----------------------------------------------------------------------
-function fakeChild(id, extraTabs) {
-  const sheets = [];
-  const child = { id, tz: 'America/Los_Angeles', sheets, writes: [], failWrites: false, onFirstWrite: null };
-  const mkSheet = (name) => {
-    let cells = {};
-    let rows = 1000;
-    let cols = 26;
-    const sh = {
-      name, cells: () => cells, getName: () => name, getMaxRows: () => rows, getMaxColumns: () => cols,
-      insertRowsAfter: (_a, n) => { rows += n; }, insertColumnsAfter: (_a, n) => { cols += n; },
-      deleteRows: (s, n) => { rows -= n; Object.keys(cells).forEach((k) => { if (+k.split(',')[0] >= s) delete cells[k]; }); },
-      deleteColumns: (s, n) => { cols -= n; Object.keys(cells).forEach((k) => { if (+k.split(',')[1] >= s) delete cells[k]; }); },
-      clear: () => { cells = {}; }, getFilter: () => null, setFrozenRows: () => {}, setColumnWidth: () => {},
-      getRange: (r, c, nr, nc) => {
-        nr = nr || 1; nc = nc || 1;
-        const rg = {
-          getValues: () => Array.from({ length: nr }, (_x, i) => Array.from({ length: nc }, (_y, j) => {
-            const v = cells[(r + i) + ',' + (c + j)];
-            return v === undefined ? '' : (v instanceof Object && v.getTime ? D(new Date(v.getTime()).toISOString()) : v);
-          })),
-          getFormulas: () => rg.getValues().map((row) => row.map((v) => (typeof v === 'string' && v.startsWith('=') ? v : ''))),
-          setValues: (v) => {
-            if (child.failWrites) throw new Error('Service Spreadsheets failed (simulated)');
-            if (child.onFirstWrite) { const f = child.onFirstWrite; child.onFirstWrite = null; f(); }
-            child.writes.push(name);
-            v.forEach((row, i) => row.forEach((x, j) => { cells[(r + i) + ',' + (c + j)] = x; }));
-            return rg;
-          },
-          setNumberFormat: () => rg, setFontWeight: () => rg, setBackground: () => rg, setBorder: () => rg, clearDataValidations: () => rg,
-          createFilter: () => ({}),
-        };
-        return rg;
-      },
-    };
-    return sh;
-  };
-  Object.assign(child, {
-    getId: () => id, getSpreadsheetTimeZone: () => child.tz, setSpreadsheetTimeZone: (t) => { child.tz = t; },
-    getSheetByName: (n) => sheets.find((s) => s.name === n) || null,
-    insertSheet: (n) => { const s = mkSheet(n); sheets.push(s); return s; },
-  });
-  for (const [tab, cells] of Object.entries(extraTabs || {})) {
-    const s = child.insertSheet(tab);
-    Object.assign(s.cells(), cells);
-  }
-  child.writes.length = 0;
-  return child;
-}
+// ---- child spreadsheets and Drive (template replica from test/fixtures/sellerTemplate.json) -------------------
+const makeDate = (ms) => vm.runInContext(`new Date(${ms})`, context);
+const NY = (v) => H.providerDateKey_(v, 'America/New_York');
+const templateSheet = () => makeSpreadsheet({ id: TEMPLATE_ID, makeDate });
+const fakeChild = (id) => cloneSpreadsheet(templateSheet(), id, makeDate);
 
 let env;
 function install(o) {
   o = o || {};
   const m = o.master || master();
-  env = { master: m, copies: [], opened: [], audit: [], children: o.children || {}, prompts: [], alerts: [], gateCalls: 0 };
-  const template = { mime: o.templateMime || 'application/vnd.google-apps.spreadsheet' };
-  const files = { [TEMPLATE_ID]: template, [DOC_ID]: { mime: 'application/vnd.google-apps.document' }, [MASTER_ID]: template, [SOURCE_ID]: template };
+  const tpl = o.template || templateSheet();
+  env = { master: m, copies: [], opened: [], audit: [], children: Object.assign({ [TEMPLATE_ID]: tpl }, o.children || {}), prompts: [], alerts: [], gateCalls: 0 };
+  const spreadsheetMime = { mime: o.templateMime || 'application/vnd.google-apps.spreadsheet' };
+  const files = { [TEMPLATE_ID]: spreadsheetMime, [DOC_ID]: { mime: 'application/vnd.google-apps.document' }, [MASTER_ID]: spreadsheetMime, [SOURCE_ID]: spreadsheetMime };
+  const accounting = makeMaster(D, fixtureSpec());
   Object.assign(context, {
     LockService: { getScriptLock: () => ({ tryLock: () => true, releaseLock: () => {} }) },
     getSpreadsheet_: () => m,
     appendAuditLog_: (e) => env.audit.push(e),
     readSellerSheetsGates_: () => { env.gateCalls++; return o.gates || { current: true, gates: {}, reasons: [] }; },
-    buildSellerSnapshotsFromMaster_: (_ss, sellers) => H.buildSellerSnapshots_({ ...fixture(), sellers }),
+    buildSellerSnapshotsFromMaster_: (_ss, sellers) => H.buildSellerOutputs_({ ...accounting, sellers, dateKeyOf: NY }),
     SpreadsheetApp: {
       flush: () => {},
-      openById: (id) => { env.opened.push(id); if (!env.children[id]) throw new Error('Requested entity was not found.'); return env.children[id]; },
+      CopyPasteType: { PASTE_FORMAT: 'PASTE_FORMAT', PASTE_FORMULA: 'PASTE_FORMULA' },
+      openById: (id) => { env.opened.push(id); if (!env.children[id]) throw new Error('Requested entity was not found.'); return env.children[id].api; },
     },
     DriveApp: {
       getFileById: (id) => {
@@ -152,8 +113,8 @@ function install(o) {
           makeCopy: (name, folder) => {
             const newId = 'COPY_' + String(env.copies.length + 1).padStart(27, '0');
             env.copies.push({ name, folderId: folder.getId(), id: newId });
-            const c = fakeChild(newId, { Brand: { '1,1': 'Seller handbook' }, Summary: { '1,1': 'old', '2,1': '=SUM(A1:A9)' } });
-            if (o.failCopies) c.failWrites = true;
+            const c = cloneSpreadsheet(env.children[id], newId, makeDate);
+            if (o.failCopies) c.failOn = () => true;
             env.children[newId] = c;
             return { getId: () => newId };
           },
@@ -167,23 +128,14 @@ function install(o) {
   });
 }
 
-// Minimal Master accounting fixture (snapshot input): one AVAILABLE + one MISSING_PROVIDER per seller.
-function fixture() {
-  const tx = (id, seller) => ({ internal_transaction_id: id, created_at: D('2026-10-02T15:00:00Z'), payment_source: 'PAYPAL', seller_id: seller,
-    store_domain: 'shop.com', order_id: 'O-' + id, order_amount: 104, currency: 'USD' });
-  const match = (id, status) => ({ match_id: 'PM-' + id, payment_source: 'PAYPAL', internal_transaction_id: id, external_transaction_id: status === 'MATCHED' ? id : '',
-    provider_id: status === 'MATCHED' ? 'KH001' : '', reconciliation_status: status, match_status: status === 'MATCHED' ? 'CONFIRMED' : '' });
-  const leg = (id) => ({ payment_leg_id: 'PL-' + id, match_id: 'PM-' + id, internal_transaction_id: id, payment_source: 'PAYPAL', provider: 'KH001',
-    external_transaction_id: id, currency: 'USD', gross_amount: 104, processing_fee: 4, net_amount: 100, seller_fee_rate: 0.08, seller_fee: 8,
-    seller_hold_amount: 10, seller_available_amount: 82, settlement_id: 'ST-1', settlement_status: 'AVAILABLE' });
+// Minimal Master accounting fixture: one AVAILABLE + one MISSING_PROVIDER per seller.
+function fixtureSpec() {
   return {
-    transactions: [tx('A1', 'CUS001'), tx('A2', 'CUS001'), tx('B1', 'CUS002'), tx('B2', 'CUS002')],
-    matches: [match('A1', 'MATCHED'), match('A2', 'MISSING_PROVIDER'), match('B1', 'MATCHED'), match('B2', 'MISSING_PROVIDER')],
-    legs: [leg('A1'), leg('B1')],
-    settlements: [{ settlement_id: 'ST-1', period_end_date: D('2026-10-04T04:00:00Z'), source_payment_date: D('2026-10-06T04:00:00Z') }],
-    balances: [{ seller_id: 'CUS001', currency: 'USD', current_balance: 82, seller_hold_balance: 10, paid_amount: 0, adjustments: 0 },
-      { seller_id: 'CUS002', currency: 'USD', current_balance: 82, seller_hold_balance: 10, paid_amount: 0, adjustments: 0 }],
-    payouts: [], adjustments: [], masterSchemaVersion: 13,
+    sellers: [{ seller_id: 'CUS001', seller_name: 'DITECH' }, { seller_id: 'CUS002', seller_name: 'HUI' }],
+    txs: [{ id: 'A1', seller: 'CUS001', order: 104, leg: { fee: 4, rate: 0.08, settlement: 'ST-1' } },
+      { id: 'A2', seller: 'CUS001', order: 104, status: 'MISSING_PROVIDER' },
+      { id: 'B1', seller: 'CUS002', order: 104, leg: { fee: 4, rate: 0.08, settlement: 'ST-1' } },
+      { id: 'B2', seller: 'CUS002', order: 104, status: 'MISSING_PROVIDER' }],
   };
 }
 
@@ -197,7 +149,7 @@ test('provisioning success: one copy in the output folder, correct name, ID regi
     const mc = f.makeCopy;
     f.makeCopy = (name, folder) => {
       const r = mc(name, folder);
-      env.children[r.getId()].onFirstWrite = () => { duringSync = destRow(env.master, 'CUS001'); };
+      env.children[r.getId()].beforeWrite = () => { duringSync = destRow(env.master, 'CUS001'); };
       return r;
     };
     return f;
@@ -212,9 +164,13 @@ test('provisioning success: one copy in the output folder, correct name, ID regi
   assert.deepEqual([r.seller_id, r.seller_name, r.destination_status, r.sync_status, r.verified, r.reused_existing_copy],
     ['CUS001', 'DITECH', 'ACTIVE', 'SUCCESS', true, false]);
   const child = env.children[r.spreadsheet_id];
-  assert.equal(child.getSheetByName('Brand').cells()['1,1'], 'Seller handbook', 'template custom tab untouched');
-  assert.equal(child.getSheetByName('Summary').getRange(1, 1, 1, 1).getValues()[0][0], 'seller_id', 'Master owns the managed tabs');
-  assert.deepEqual(child.getSheetByName('Summary').getRange(1, 1, 3, 26).getFormulas().flat().filter(Boolean), [], 'template formula replaced');
+  assert.deepEqual(child.sheets.map((x) => [x.name, x.hidden]), [['DoiSoat_GD', false], ['TongHop_Thang', false], ['PhieuDoiSoat', false], ['Dispute', false],
+    ['_Sync', true]], 'exactly the four template tabs + hidden _Sync');
+  assert.deepEqual([child.locale, child.tz], ['vi_VN', 'America/Los_Angeles'], 'template locale / time zone preserved');
+  assert.deepEqual(child.forbidden, []);
+  assert.deepEqual(formatOps(child), [], 'template UI not rebuilt');
+  assert.equal(child.sheets[2].cells['4,2'].v, 'DITECH (CUS001)');
+  assert.deepEqual(env.children[TEMPLATE_ID].log.filter((e) => e.op !== 'getValues'), [], 'template never modified');
   assert.equal(destRow(env.master, 'CUS002').status, 'INACTIVE', 'other seller untouched');
   assert.equal(env.audit[env.audit.length - 1].action, 'SELLER_SHEET_CREATE_SUCCESS');
 });
@@ -228,7 +184,7 @@ test('failed sync keeps the registered ID + INACTIVE; retry reuses the copy (no 
   assert.equal(r.verified, false);
   const row = destRow(env.master, 'CUS001');
   assert.deepEqual([row.spreadsheet_id, row.status], [r.spreadsheet_id, 'INACTIVE']);
-  env.children[r.spreadsheet_id].failWrites = false;
+  env.children[r.spreadsheet_id].failOn = null;
   const retry = js(H.runCreateSellerSheet_('CUS001'));
   assert.equal(retry.status, 'SUCCESS', retry.error);
   assert.equal(retry.reused_existing_copy, true);
@@ -284,7 +240,7 @@ function watchProvisioning(sellerId) {
     f.makeCopy = (name, folder) => {
       seen.atClone = rowsFor(env.master, sellerId).map((r) => r.slice());
       const res = mc(name, folder);
-      env.children[res.getId()].onFirstWrite = () => { seen.atSync = rowsFor(env.master, sellerId).map((r) => r.slice()); };
+      env.children[res.getId()].beforeWrite = () => { seen.atSync = rowsFor(env.master, sellerId).map((r) => r.slice()); };
       return res;
     };
     return f;
@@ -321,7 +277,7 @@ test('auto-created row stays INACTIVE and is reused when provisioning fails (bef
   assert.equal(late.status, 'FAILED');
   assert.equal(late.destination_row_created, false, 'the existing row is reused, not duplicated');
   assert.deepEqual(rowsFor(m, 'CUS001').map((r) => r.slice(0, 4)), [['CUS001', 'DITECH', late.spreadsheet_id, 'INACTIVE']]);
-  env.children[late.spreadsheet_id].failWrites = false;
+  env.children[late.spreadsheet_id].failOn = null;
   const retry = js(H.runCreateSellerSheet_('CUS001'));
   assert.equal(retry.status, 'SUCCESS', retry.error);
   assert.equal(retry.reused_existing_copy, true);
@@ -348,6 +304,24 @@ test('no row is auto-created for duplicate rows, unknown sellers or an invalid S
   assert.equal(env.copies.length, 0);
 });
 
+test('template contract is checked before any clone: unexpected / RAW / old tabs and data-row formulas block provisioning', () => {
+  for (const [label, mutate, re] of [['RAW tab', (t) => t.api.insertSheet('RAW_PP'), /provider raw tab/],
+    ['old Phase 2K tab', (t) => t.api.insertSheet('Summary'), /old Phase 2K tab/],
+    ['custom tab', (t) => t.api.insertSheet('Brand'), /unexpected visible tab "Brand"/],
+    ['data formula', (t) => t.api.getSheetByName('DoiSoat_GD').getRange(7, 16).setFormula('=O7*0.08'), /unexpected formula at R7C16/],
+    ['protected id', (t) => t.api.getSheetByName('PhieuDoiSoat').getRange(2, 3).setValue(SOURCE_ID), /protected spreadsheet ID/]]) {
+    const tpl = templateSheet();
+    mutate(tpl);
+    install({ template: tpl });
+    const r = js(H.runCreateSellerSheet_('CUS001'));
+    assert.equal(r.status, 'FAILED', label);
+    assert.match(r.error, /Seller template does not satisfy the seller output contract/);
+    assert.match(r.error, re);
+    assert.equal(env.copies.length, 0, 'nothing cloned: ' + label);
+    assert.ok(!r.error.includes(SOURCE_ID), 'protected IDs never echoed');
+  }
+});
+
 test('a registered copy shared with another (INACTIVE) row is never reused', () => {
   const shared = 'SHARED_COPY_ID_000000000000000001';
   install({ master: master({ destinations: [
@@ -356,7 +330,7 @@ test('a registered copy shared with another (INACTIVE) row is never reused', () 
   const r = js(H.runCreateSellerSheet_('CUS001'));
   assert.equal(r.status, 'FAILED');
   assert.match(r.error, /also registered for another seller; refusing to reuse it/);
-  assert.deepEqual(env.opened, []);
+  assert.deepEqual(env.opened, [TEMPLATE_ID], 'only the template is read; the shared copy is never opened');
 });
 
 // ---- syncSellerSheet ------------------------------------------------------------------------------------
@@ -371,8 +345,8 @@ test('syncSellerSheet syncs exactly one ACTIVE seller and never touches another;
   assert.equal(r.status, 'SUCCESS', r.error);
   assert.deepEqual(r.sellers.map((s) => s.seller_id), ['CUS001']);
   assert.deepEqual(env.opened.filter((x) => x === B), []);
-  assert.deepEqual(b.writes, []);
-  assert.ok(a.writes.includes('Sync Info'));
+  assert.deepEqual(b.log, []);
+  assert.ok(a.log.some((e) => e.op === 'setValues' && e.sheet === '_Sync'));
   assert.equal(env.audit[0].action, 'SELLER_SHEET_SYNC_SUCCESS');
   assert.equal(js(H.runSingleSellerSheetSync_('CUS001')).status, 'NO_CHANGE');
   install({ master: master(), children: {} });

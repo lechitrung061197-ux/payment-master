@@ -9,7 +9,7 @@
 
 const APP = Object.freeze({
   NAME: 'Payment Master',
-  SCHEMA_VERSION: 13,
+  SCHEMA_VERSION: 14,
   LOCALE: 'en_US',
   TIMEZONE: 'America/New_York',
   DEFAULT_CURRENCY: 'USD',
@@ -176,13 +176,16 @@ const SCHEMA = Object.freeze([
   },
   {
     sheet: SHEETS.SELLER_TERMS,
-    description: 'Effective-dated seller FEE history (user-edited). One open-ended row per seller at most; periods ' +
-      'never overlap. A transaction uses the row with effective_from <= created date <= effective_to (blank = ' +
-      'open). To change a fee: close the old row (effective_to) and add a new row. Seller hold is NOT configured ' +
-      'here: KH001 seller hold mirrors the actual provider hold 1:1. Seeded once from Settings seller_fee_rate ' +
-      'only while this tab is empty.',
+    description: 'Effective-dated seller FEE history per seller + payment_source (user-edited). payment_source is ' +
+      'required and matched exactly (never a fallback to another source). Per seller + source at most one ' +
+      'open-ended row and no overlapping periods. A transaction uses the row of its own payment_source with ' +
+      'effective_from <= created date <= effective_to (blank = open); none = fail closed. To change a fee: close ' +
+      'the old row (effective_to) and add a new row; frozen history never changes. Seller hold is NOT configured ' +
+      'here: KH001 seller hold mirrors the actual provider hold 1:1. Seeded once (PAYPAL) from Settings ' +
+      'seller_fee_rate only while this tab is empty.',
     columns: [
       col_('seller_id', T.ID),
+      col_('payment_source', T.ENUM, ENUMS.PAYMENT_SOURCE),
       col_('seller_name_snapshot', T.TEXT),
       col_('seller_fee_rate', T.RATE),
       col_('effective_from', T.DATE),
@@ -728,7 +731,7 @@ const DEFAULT_SETTINGS = Object.freeze([
   ['source.KH001.settlements_sheet', 'PhieuDoiSoat', 'STRING', 'KH001 source tab mirrored to Raw KH001 Settlements.'],
   ['source.KH001.disputes_sheet', 'Dispute', 'STRING', 'KH001 source tab mirrored to Raw KH001 Disputes.'],
   ['seller_template_spreadsheet_id', '', 'STRING',
-    'Google Sheet cloned by createSellerSheet for a new seller (layout / branding only; Master owns the six managed tabs).'],
+    'Seller template (UI authority) cloned by createSellerSheet: four visible tabs DoiSoat_GD, TongHop_Thang, PhieuDoiSoat, Dispute; Master writes only owned ranges.'],
   ['seller_output_folder_id', '', 'STRING', 'Drive folder that receives seller sheets created by createSellerSheet.'],
   ['source.INTERNAL.naive_timestamp_timezone', '', 'STRING',
     'Timezone for internal CSV timestamps without an offset (e.g. "2026-10-01 12:00:00"). Blank = such ' +

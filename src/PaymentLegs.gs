@@ -85,6 +85,25 @@ const PAYMENT_LEGS_REGRESSION = Object.freeze({
 
 /* ----------------------------- Pure helpers ----------------------------- */
 
+/**
+ * Seller economics of one leg (provider-agnostic): the Seller Terms row of the leg's own seller + exact
+ * payment_source in effect on the transaction date gives seller_fee_rate (fail closed when none);
+ * seller_fee = net x rate (unrounded). With an actual provider hold: seller hold mirrors it 1:1 and
+ * seller_available = net - seller_fee - seller_hold. Without it, hold / available stay blank (never estimated).
+ * @return {Object} seller_fee_rate, seller_fee, seller_hold_rate, seller_hold_amount, seller_available_amount
+ */
+function sellerEconomicsForLeg_(leg, terms, sellerId, dateKey) {
+  const term = resolveSellerTerm_(terms, sellerId, leg.payment_source, dateKey);
+  const out = { seller_fee_rate: term.seller_fee_rate, seller_fee: '', seller_hold_rate: '', seller_hold_amount: '', seller_available_amount: '' };
+  if (isFiniteNumber_(leg.net_amount)) out.seller_fee = leg.net_amount * term.seller_fee_rate;
+  if (isFiniteNumber_(leg.provider_hold_amount) && isFiniteNumber_(out.seller_fee)) {
+    out.seller_hold_amount = leg.provider_hold_amount; // KH001 MIRROR_PROVIDER: exact provider hold
+    out.seller_hold_rate = leg.net_amount !== 0 ? leg.provider_hold_amount / leg.net_amount : '';
+    out.seller_available_amount = leg.net_amount - out.seller_fee - out.seller_hold_amount;
+  }
+  return out;
+}
+
 function paymentLegId_(paymentSource, externalTransactionId, digestHex) {
   const digest = digestHex || sha256Hex_;
   return PAYMENT_LEGS.idPrefix + digest(String(paymentSource) + '|' + String(externalTransactionId));
@@ -234,19 +253,11 @@ function buildPaymentLegs_(input) {
       return;
     }
     const sellerId = trimmedText_(tx.seller_id);
-    let term;
     try {
-      term = resolveSellerTerm_(input.sellerTerms || [], sellerId, input.transactionDateKeyOf(tx.created_at));
+      Object.assign(leg, sellerEconomicsForLeg_(leg, input.sellerTerms || [], sellerId, input.transactionDateKeyOf(tx.created_at)));
     } catch (e) {
       errors.seller_economics_errors.push(label + ': ' + e.message);
       return;
-    }
-    leg.seller_fee_rate = term.seller_fee_rate;
-    if (isFiniteNumber_(leg.net_amount)) leg.seller_fee = leg.net_amount * term.seller_fee_rate;
-    if (isFiniteNumber_(leg.provider_hold_amount) && isFiniteNumber_(leg.seller_fee)) {
-      leg.seller_hold_amount = leg.provider_hold_amount; // KH001 MIRROR_PROVIDER: exact provider hold
-      leg.seller_hold_rate = leg.net_amount !== 0 ? leg.provider_hold_amount / leg.net_amount : '';
-      leg.seller_available_amount = leg.net_amount - leg.seller_fee - leg.seller_hold_amount;
     }
     legSellers[leg.payment_leg_id] = sellerId;
     legs.push(leg);

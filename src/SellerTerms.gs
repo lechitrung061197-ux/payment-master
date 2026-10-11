@@ -1,17 +1,19 @@
 /**
  * SellerTerms.gs
- * Effective-dated seller FEE history ("Seller Terms"): validation, historical resolution and
- * the one-time initial seed.
+ * Effective-dated seller FEE history ("Seller Terms") per seller + payment_source: validation,
+ * historical resolution, the one-time initial seed and the v13 -> v14 payment_source migration.
  *
  * - User-edited input. A fee change = close the old row (effective_to) and add a new row, so past
  *   transactions keep their historical rate.
- * - Rules: seller_id exists in Sellers; seller_name_snapshot nonblank; 0 <= seller_fee_rate < 1;
- *   effective_from required; effective_to blank (open) or >= effective_from; per seller no overlapping
- *   periods, at most one open-ended row, no duplicate periods; every seller with a seller_id has at
+ * - Rules: seller_id exists in Sellers; payment_source required (PAYMENT_SOURCE enum); seller_name_snapshot
+ *   nonblank; 0 <= seller_fee_rate < 1; effective_from required; effective_to blank (open) or >=
+ *   effective_from; per seller + payment_source no overlapping periods, at most one open-ended row, no
+ *   duplicate periods; every seller with a seller_id has at
  *   least one valid row (a missing seller is blocking, never auto-seeded once the tab has data).
- * - Resolution for (seller, date): exactly one row with effective_from <= date <= effective_to
- *   (blank = open); zero or several rows fail.
- * - Seed: only while the tab has no data rows, one row per seller with the Settings seller_fee_rate,
+ * - Resolution for (seller, payment_source, date): exactly one row of that exact source with
+ *   effective_from <= date <= effective_to (blank = open); zero or several rows fail closed. There is
+ *   never a fallback to another payment source (PAYPAL terms never apply to STRIPE).
+ * - Seed: only while the tab has no data rows, one PAYPAL row per seller with the Settings seller_fee_rate,
  *   starting at the seller's earliest Endpoint Mapping effective_from (fallback: earliest mapping
  *   date, then today). Never overwrites or reseeds history.
  * - Seller hold is NOT configured here: KH001 seller hold mirrors the actual provider hold 1:1.
@@ -21,6 +23,9 @@
 
 const SELLER_TERMS = Object.freeze({
   seedRateSetting: 'seller_fee_rate',
+  // Current activity is PAYPAL only: the seed and the v13 -> v14 migration assign this source.
+  seedPaymentSource: 'PAYPAL',
+  legacyHeaderV13: ['seller_id', 'seller_name_snapshot', 'seller_fee_rate', 'effective_from', 'effective_to', 'notes'],
   maxReportedErrors: 30,
 });
 
@@ -49,10 +54,13 @@ function parseSellerTerms_(rows, sellers, dateKeyOf) {
   rows.forEach(function (r, i) {
     const label = 'Seller Terms row ' + (r._row || i + 2);
     const sellerId = trimmedText_(r.seller_id);
+    const source = trimmedText_(r.payment_source).toUpperCase();
     const snapshot = trimmedText_(r.seller_name_snapshot);
     let bad = false;
     if (sellerId === '') { errors.invalid_rows.push(label + ': seller_id is blank'); bad = true; }
     else if (!Object.prototype.hasOwnProperty.call(nameById, sellerId)) { errors.unknown_sellers.push(label + ': unknown seller ' + sellerId); bad = true; }
+    if (source === '') { errors.invalid_rows.push(label + ': payment_source is blank (required)'); bad = true; }
+    else if (ENUMS.PAYMENT_SOURCE.indexOf(source) < 0) { errors.invalid_rows.push(label + ': unknown payment_source "' + r.payment_source + '"'); bad = true; }
     if (snapshot === '') { errors.invalid_rows.push(label + ': seller_name_snapshot is blank'); bad = true; }
     const rate = r.seller_fee_rate;
     if (!isFiniteNumber_(rate) || rate < 0 || rate >= 1) { errors.invalid_rates.push(label + ': seller_fee_rate must be a number with 0 <= rate < 1'); bad = true; }
@@ -66,14 +74,18 @@ function parseSellerTerms_(rows, sellers, dateKeyOf) {
     if (snapshot !== nameById[sellerId]) {
       mismatches.push(label + ': seller_name_snapshot "' + snapshot + '" differs from current name "' + nameById[sellerId] + '"');
     }
-    terms.push({ seller_id: sellerId, seller_name_snapshot: snapshot, seller_fee_rate: rate, effective_from: from, effective_to: to,
-      row: r._row || i + 2 });
+    terms.push({ seller_id: sellerId, payment_source: source, seller_name_snapshot: snapshot, seller_fee_rate: rate, effective_from: from,
+      effective_to: to, row: r._row || i + 2 });
   });
 
   const bySeller = {};
-  terms.forEach(function (t) { (bySeller[t.seller_id] = bySeller[t.seller_id] || []).push(t); });
-  Object.keys(bySeller).sort().forEach(function (id) {
-    const list = bySeller[id].slice().sort(function (a, b) {
+  const byKey = {};
+  terms.forEach(function (t) {
+    (bySeller[t.seller_id] = bySeller[t.seller_id] || []).push(t);
+    (byKey[t.seller_id + '/' + t.payment_source] = byKey[t.seller_id + '/' + t.payment_source] || []).push(t);
+  });
+  Object.keys(byKey).sort().forEach(function (id) {
+    const list = byKey[id].slice().sort(function (a, b) {
       return a.effective_from < b.effective_from ? -1 : a.effective_from > b.effective_from ? 1 : 0;
     });
     const periods = {};
@@ -101,13 +113,18 @@ function flattenSellerTermErrors_(errors) {
   return Object.keys(errors).reduce(function (acc, k) { return acc.concat(errors[k]); }, []);
 }
 
-/** The single Seller Terms row in effect for a seller on a date key; throws on zero or several. */
-function resolveSellerTerm_(terms, sellerId, dateKey) {
+/**
+ * The single Seller Terms row in effect for a seller + exact payment_source on a date key; throws on zero or
+ * several (fail closed; never falls back to another payment source).
+ */
+function resolveSellerTerm_(terms, sellerId, paymentSource, dateKey) {
+  const source = trimmedText_(paymentSource).toUpperCase();
   const matches = terms.filter(function (t) {
-    return t.seller_id === sellerId && t.effective_from <= dateKey && (t.effective_to === '' || dateKey <= t.effective_to);
+    return t.seller_id === sellerId && t.payment_source === source && t.effective_from <= dateKey &&
+      (t.effective_to === '' || dateKey <= t.effective_to);
   });
-  if (matches.length === 0) throw new Error('No Seller Terms row for ' + sellerId + ' on ' + dateKey);
-  if (matches.length > 1) throw new Error('Several Seller Terms rows for ' + sellerId + ' on ' + dateKey);
+  if (matches.length === 0) throw new Error('No Seller Terms row for ' + sellerId + ' / ' + (source || '(blank source)') + ' on ' + dateKey);
+  if (matches.length > 1) throw new Error('Several Seller Terms rows for ' + sellerId + ' / ' + source + ' on ' + dateKey);
   return matches[0];
 }
 
@@ -130,7 +147,7 @@ function planSellerTermsSeed_(sellers, rate, mappingRecords, todayKey) {
   return sellers.filter(function (s) { return s.seller_id !== ''; })
     .slice().sort(function (a, b) { return a.seller_id < b.seller_id ? -1 : a.seller_id > b.seller_id ? 1 : 0; })
     .map(function (s) {
-      return { seller_id: s.seller_id, seller_name_snapshot: s.seller_name, seller_fee_rate: rate,
+      return { seller_id: s.seller_id, payment_source: SELLER_TERMS.seedPaymentSource, seller_name_snapshot: s.seller_name, seller_fee_rate: rate,
         effective_from: earliest[s.seller_id] || globalEarliest || todayKey, effective_to: '', notes: 'Initial seed from Settings seller_fee_rate' };
     });
 }
@@ -169,6 +186,30 @@ function readSellerTermsValidity_(ss) {
 }
 
 /**
+ * Setup-only v13 -> v14 migration. When Seller Terms still has the exact v13 header, a payment_source column is
+ * inserted after seller_id and every existing data row gets PAYPAL (all terms so far are PAYPAL activity).
+ * Rates, dates, names and notes are preserved cell-for-cell; Payment Legs are not recalculated.
+ * @return {number} migrated data rows (0 when the tab is already v14 or missing)
+ */
+function migrateSellerTermsPaymentSource_(ss) {
+  const sheet = ss.getSheetByName(SHEETS.SELLER_TERMS);
+  if (!sheet || !arraysEqual_(readHeaderRow_(sheet), SELLER_TERMS.legacyHeaderV13)) return 0;
+  sheet.insertColumnsAfter(1, 1);
+  sheet.getRange(1, 2).setValue('payment_source');
+  const last = sheet.getLastRow();
+  if (last < 2) return 0;
+  let migrated = 0;
+  const values = sheet.getRange(2, 1, last - 1, SELLER_TERMS.legacyHeaderV13.length + 1).getValues();
+  const column = values.map(function (row) {
+    const hasData = row.some(function (v, i) { return i !== 1 && !isBlankCell_(v); });
+    if (hasData) migrated++;
+    return [hasData ? SELLER_TERMS.seedPaymentSource : ''];
+  });
+  sheet.getRange(2, 2, last - 1, 1).setNumberFormat('@').setValues(column);
+  return migrated;
+}
+
+/**
  * Setup-only: seeds Seller Terms when (and only when) it has no data rows.
  * @return {number} rows seeded
  */
@@ -202,7 +243,7 @@ function seedSellerTermsIfEmpty_(ss, warnings) {
 
 /** Read-only Seller Terms report. */
 function buildSellerTermsReport_() {
-  const report = { seller_count: 0, term_rows: 0, seller_term_counts: {}, open_term_counts: {}, missing_sellers: [], unknown_sellers: [],
+  const report = { seller_count: 0, term_rows: 0, seller_term_counts: {}, payment_source_counts: {}, open_term_counts: {}, missing_sellers: [], unknown_sellers: [],
     invalid_rates: [], invalid_dates: [], overlaps: [], duplicate_periods: [], invalid_rows: [], snapshot_name_mismatches: [],
     pass: false, errors: [], warnings: [] };
   try {
@@ -212,6 +253,8 @@ function buildSellerTermsReport_() {
     report.term_rows = st.rows.length;
     p.terms.forEach(function (t) {
       report.seller_term_counts[t.seller_id] = (report.seller_term_counts[t.seller_id] || 0) + 1;
+      const key = t.seller_id + '/' + t.payment_source;
+      report.payment_source_counts[key] = (report.payment_source_counts[key] || 0) + 1;
       if (t.effective_to === '') report.open_term_counts[t.seller_id] = (report.open_term_counts[t.seller_id] || 0) + 1;
     });
     report.missing_sellers = p.missing_sellers;

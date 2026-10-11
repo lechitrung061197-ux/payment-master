@@ -26,7 +26,7 @@ const NY = (v) => H.providerDateKey_(v, 'America/New_York');
 const PL_COLUMNS = js(H.getColumnNames_('Payment Legs'));
 
 const sellers = [{ seller_id: 'SLR-A', seller_name: 'Seller A' }, { seller_id: 'SLR-B', seller_name: 'Seller B' }];
-const term = (o) => ({ seller_id: 'SLR-A', seller_name_snapshot: 'Seller A', seller_fee_rate: 0.08, effective_from: '2026-10-01', effective_to: '', ...o });
+const term = (o) => ({ seller_id: 'SLR-A', payment_source: 'PAYPAL', seller_name_snapshot: 'Seller A', seller_fee_rate: 0.08, effective_from: '2026-10-01', effective_to: '', ...o });
 const parse = (rows, s) => H.parseSellerTerms_(rows, s || sellers, NY);
 const errs = (p) => js(H.flattenSellerTermErrors_(p.errors)).join(' | ');
 
@@ -47,17 +47,17 @@ test('effective-date resolution; a future fee change does not alter the prior tr
   const p = parse([term({ effective_to: '2026-10-31' }), term({ seller_fee_rate: 0.07, effective_from: '2026-11-01' }),
     term({ seller_id: 'SLR-B', seller_name_snapshot: 'Seller B', seller_fee_rate: 0.09 })]);
   assert.equal(errs(p), '');
-  assert.equal(H.resolveSellerTerm_(p.terms, 'SLR-A', '2026-10-31').seller_fee_rate, 0.08);
-  assert.equal(H.resolveSellerTerm_(p.terms, 'SLR-A', '2026-11-01').seller_fee_rate, 0.07);
-  assert.equal(H.resolveSellerTerm_(p.terms, 'SLR-B', '2026-10-15').seller_fee_rate, 0.09, 'different sellers, different rates');
-  assert.throws(() => H.resolveSellerTerm_(p.terms, 'SLR-A', '2026-09-30'), /No Seller Terms row for SLR-A on 2026-09-30/);
+  assert.equal(H.resolveSellerTerm_(p.terms, 'SLR-A', 'PAYPAL', '2026-10-31').seller_fee_rate, 0.08);
+  assert.equal(H.resolveSellerTerm_(p.terms, 'SLR-A', 'PAYPAL', '2026-11-01').seller_fee_rate, 0.07);
+  assert.equal(H.resolveSellerTerm_(p.terms, 'SLR-B', 'PAYPAL', '2026-10-15').seller_fee_rate, 0.09, 'different sellers, different rates');
+  assert.throws(() => H.resolveSellerTerm_(p.terms, 'SLR-A', 'PAYPAL', '2026-09-30'), /No Seller Terms row for SLR-A \/ PAYPAL on 2026-09-30/);
 });
 
 test('overlapping terms, several open rows and duplicate periods are rejected', () => {
-  assert.match(errs(parse([term({ effective_to: '2026-11-15' }), term({ effective_from: '2026-11-01', seller_fee_rate: 0.07 })])), /SLR-A: rows 2 and 3 overlap/);
-  assert.match(errs(parse([term({}), term({ effective_from: '2026-11-01' })])), /SLR-A: 2 open-ended rows/);
-  assert.match(errs(parse([term({}), term({})])), /SLR-A: duplicate period 2026-10-01..open/);
-  assert.throws(() => H.resolveSellerTerm_([...parse([term({})]).terms, ...parse([term({})]).terms], 'SLR-A', '2026-10-05'), /Several Seller Terms rows/);
+  assert.match(errs(parse([term({ effective_to: '2026-11-15' }), term({ effective_from: '2026-11-01', seller_fee_rate: 0.07 })])), /SLR-A\/PAYPAL: rows 2 and 3 overlap/);
+  assert.match(errs(parse([term({}), term({ effective_from: '2026-11-01' })])), /SLR-A\/PAYPAL: 2 open-ended rows/);
+  assert.match(errs(parse([term({}), term({})])), /SLR-A\/PAYPAL: duplicate period 2026-10-01..open/);
+  assert.throws(() => H.resolveSellerTerm_([...parse([term({})]).terms, ...parse([term({})]).terms], 'SLR-A', 'PAYPAL', '2026-10-05'), /Several Seller Terms rows/);
 });
 
 test('unknown sellers, invalid rates and dates are rejected; name changes are warnings', () => {
@@ -167,7 +167,7 @@ test('mapped seller required; missing Transaction, unknown term or no term fails
     /TX1: internal Transaction TX1 is not assigned to a seller/);
   assert.match(legErrs(buildLegs({ transactions: [tx('TX2', 'SLR-A')] })), /TX1: internal Transaction TX1 not found/);
   assert.match(legErrs(buildLegs({ transactions: [tx('TX1', 'SLR-Z'), tx('TX2', 'SLR-A')] })), /No Seller Terms row for SLR-Z/);
-  assert.match(legErrs(buildLegs({ transactions: [tx('TX1', 'SLR-A', '2026-09-01T12:00:00Z'), tx('TX2', 'SLR-A')] })), /No Seller Terms row for SLR-A on 2026-09-01/);
+  assert.match(legErrs(buildLegs({ transactions: [tx('TX1', 'SLR-A', '2026-09-01T12:00:00Z'), tx('TX2', 'SLR-A')] })), /No Seller Terms row for SLR-A \/ PAYPAL on 2026-09-01/);
 });
 
 test('provider economics absent -> seller fee only; no seller hold / available estimate', () => {

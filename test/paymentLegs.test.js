@@ -66,7 +66,7 @@ function fixture(o) {
     settlementDateKeyOf: (v) => H.providerDateKey_(v, 'America/New_York'),
     transactions: o.transactions || ['TX1', 'TX2', 'TX3', 'MP', 'AM'].map((id) => ({ internal_transaction_id: id, payment_source: 'PAYPAL',
       ownership_status: 'MAPPED', seller_id: 'SLR-000001', created_at: D('2026-10-02T15:00:00Z') })),
-    sellerTerms: o.sellerTerms || [{ seller_id: 'SLR-000001', seller_fee_rate: 0.08, effective_from: '2026-10-01', effective_to: '' }],
+    sellerTerms: o.sellerTerms || [{ seller_id: 'SLR-000001', payment_source: 'PAYPAL', seller_fee_rate: 0.08, effective_from: '2026-10-01', effective_to: '' }],
     transactionDateKeyOf: (v) => H.providerDateKey_(v, 'America/New_York'),
   };
 }

@@ -61,7 +61,7 @@ function legsFor(settlementExtra, terms) {
     settlements: [s],
     transactions: rows.map((r) => ({ internal_transaction_id: r[0], payment_source: 'PAYPAL', ownership_status: 'MAPPED', seller_id: 'SLR-A',
       created_at: D('2026-10-02T15:00:00Z') })),
-    sellerTerms: terms || [{ seller_id: 'SLR-A', seller_fee_rate: 0.08, effective_from: '2026-10-01', effective_to: '' }],
+    sellerTerms: terms || [{ seller_id: 'SLR-A', payment_source: 'PAYPAL', seller_fee_rate: 0.08, effective_from: '2026-10-01', effective_to: '' }],
     frozenItems: (settlementExtra && settlementExtra.__frozen) || [],
     providerDateKeyOf: (v) => H.providerDateKey_(v, 'America/Los_Angeles'),
     settlementDateKeyOf: NY,
@@ -132,7 +132,7 @@ test('Payment Legs guard: a fresh leg that diverges from its frozen item fails b
   const frozen = js(items(availableLegs()).items);
   const ok = legsFor({ ...paid({}), __frozen: frozen });
   assert.deepEqual(js(ok.errors.frozen_item_conflicts), []);
-  const retro = legsFor({ ...paid({}), __frozen: frozen }, [{ seller_id: 'SLR-A', seller_fee_rate: 0.07, effective_from: '2026-10-01', effective_to: '' }]);
+  const retro = legsFor({ ...paid({}), __frozen: frozen }, [{ seller_id: 'SLR-A', payment_source: 'PAYPAL', seller_fee_rate: 0.07, effective_from: '2026-10-01', effective_to: '' }]);
   assert.match(js(retro.errors.frozen_item_conflicts).join(), /fresh Payment Leg differs from the frozen item in seller_fee_rate, seller_fee, seller_available_amount/);
   const unpaid = legsFor({ __frozen: frozen });
   assert.match(js(unpaid.errors.frozen_item_conflicts).join(), /Payment Leg would become SETTLED/);

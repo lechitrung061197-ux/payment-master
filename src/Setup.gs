@@ -39,6 +39,8 @@ function runSetup_() {
   ss.setSpreadsheetTimeZone(APP.TIMEZONE);
 
   adoptDefaultSheet_(ss);
+  // v13 -> v14: Seller Terms gains payment_source (existing rows = PAYPAL) before the header check.
+  const sellerTermsMigrated = migrateSellerTermsPaymentSource_(ss);
   SCHEMA.forEach(function (table) { ensureTable_(ss, table, warnings, migratedTabs); });
   ensureRawTargetTabs_(ss);
   ensureDashboard_(ss);
@@ -68,7 +70,7 @@ function runSetup_() {
     entityId: ss.getId(),
     oldStatus: oldSchemaVersion === null ? '' : 'SCHEMA_V' + oldSchemaVersion,
     newStatus: 'SCHEMA_V' + APP.SCHEMA_VERSION,
-    details: { migratedTabs: migratedTabs, renamedSettingKeys: renamedKeys, sellerTermsSeeded: sellerTermsSeeded,
+    details: { migratedTabs: migratedTabs, renamedSettingKeys: renamedKeys, sellerTermsMigrated: sellerTermsMigrated, sellerTermsSeeded: sellerTermsSeeded,
       sellerDestinationsSeeded: sellerDestinationsSeeded, warnings: warnings },
   });
 
@@ -76,6 +78,7 @@ function runSetup_() {
     spreadsheetId: ss.getId(),
     migratedTabs: migratedTabs,
     renamedSettingKeys: renamedKeys,
+    sellerTermsMigrated: sellerTermsMigrated,
     sellerTermsSeeded: sellerTermsSeeded,
     sellerDestinationsSeeded: sellerDestinationsSeeded,
     warnings: warnings,

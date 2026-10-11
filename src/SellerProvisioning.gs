@@ -13,9 +13,10 @@
  *   copies are never deleted automatically.
  * - The destination becomes ACTIVE (and its name snapshot current) only after the seller-specific sync
  *   and a full verification of the child pass. An ACTIVE destination is never cloned again.
- * - The template is layout / branding only. After cloning, Master owns the six managed tabs; any other
- *   tab copied from the template is left untouched. A template must not hold accounting formulas used
- *   as a source of truth.
+ * - The template (seller_template_spreadsheet_id) is the UI authority and is cloned as-is (formatting,
+ *   locale, time zone). It must satisfy the seller output contract (SellerOutput.gs): exactly the four
+ *   visible tabs, exact anchors / headers, only approved presentation formulas, no RAW / old Phase 2K tabs,
+ *   no protected IDs or tokens. It is validated BEFORE any clone; Master then owns only the owned ranges.
  * - Same gates as syncSellerSheets (Master freshness, destination config, privacy/isolation), plus:
  *   the seller exists and has valid Seller Terms; the template is an accessible Google Spreadsheet that
  *   is not the Master, a provider source or a registered seller destination; the folder is accessible.
@@ -231,6 +232,12 @@ function runCreateSellerSheet_(sellerId) {
     } catch (err) {
       throw new Error(SELLER_PROVISIONING.folderSetting + ' is not accessible.');
     }
+    // Template contract (read-only) before any clone.
+    const hiddenIds = sellerHiddenIds_(ss);
+    const contract = validateSellerWorkbook_(readSellerWorkbook_(SpreadsheetApp.openById(templateId)), { mode: 'template', hiddenIds: hiddenIds });
+    if (contract.errors.length > 0) {
+      throw new Error('Seller template does not satisfy the seller output contract: ' + contract.errors.slice(0, 8).join(' | '));
+    }
     // 8-11. Reuse a registered copy, or clone once and register it immediately (still INACTIVE).
     let spreadsheetId = d.spreadsheet_id;
     if (spreadsheetId !== '') {
@@ -254,12 +261,12 @@ function runCreateSellerSheet_(sellerId) {
     details.spreadsheet_id = spreadsheetId;
     // 12. Seller-specific sync directly against the copy.
     const snapshot = buildCheckedSellerSnapshots_(ss, [{ seller_id: id, seller_name: seller.seller_name }])[id];
-    const sync = syncOneSellerSheet_({ seller_id: id, spreadsheet_id: spreadsheetId }, snapshot, ss.getId());
+    const sync = syncOneSellerSheet_({ seller_id: id, spreadsheet_id: spreadsheetId }, snapshot, { masterId: ss.getId(), hiddenIds: hiddenIds });
     details.sync_status = sync.status;
     details.written_tabs = sync.written_tabs;
     if (sync.status === 'FAILED') throw new Error('Seller sheet sync failed: ' + sync.error);
     // 13. Full verification of the child output.
-    const check = compareChildToSnapshot_(snapshot, readChildState_(SpreadsheetApp.openById(spreadsheetId)));
+    const check = compareSellerWorkbook_(snapshot, readSellerWorkbook_(SpreadsheetApp.openById(spreadsheetId)), { requireSync: true, hiddenIds: hiddenIds });
     if (check.errors.length > 0) throw new Error('Seller sheet verification failed: ' + check.errors.slice(0, 5).join(' | '));
     details.verified = true;
     // 14. Activate only if the row is still this seller's INACTIVE row with the registered copy.
