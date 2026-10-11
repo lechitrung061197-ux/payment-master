@@ -299,6 +299,26 @@ function evaluateInternalTxRegression_(summary, stats) {
     failed: checks.filter(function (c) { return !c.pass; }).map(function (c) { return c.name; }), checks: checks };
 }
 
+/**
+ * Freshness of stored Transactions: equal to the canonical result of the given build (current
+ * raw + current Endpoint Mapping) over the whole grid, ignoring only updated_at.
+ * @return {{current: boolean, expected_checksum: ?string, stored_checksum: string, reason: ?string}}
+ */
+function checkInternalTransactionsFresh_(built, storedValues, columns) {
+  const updatedIdx = [columns.indexOf('updated_at')];
+  const stored = tableChecksumExcluding_(storedValues, updatedIdx);
+  const problems = flattenInternalErrors_(built.errors).length;
+  if (problems > 0) {
+    return { current: false, expected_checksum: null, stored_checksum: stored,
+      reason: 'Transactions is stale; run normalizeInternalTransactions first (raw has ' + problems + ' error(s)).' };
+  }
+  const expected = tableChecksumExcluding_(buildTableValues_(columns,
+    built.transactions.map(function (o) { return objectToRow_(o, columns); })), updatedIdx);
+  const current = expected === stored;
+  return { current: current, expected_checksum: expected, stored_checksum: stored,
+    reason: current ? null : 'Transactions is stale; run normalizeInternalTransactions first.' };
+}
+
 /** Per-transaction content checksum, ignoring updated_at. */
 function internalTransactionContentKey_(row, columns) {
   const idx = columns.indexOf('updated_at');
@@ -348,6 +368,19 @@ function buildInternalFromSheets_(ss) {
     ownershipTimeZone: APP.TIMEZONE,
   });
   return { raw: raw, built: built, mappingChecksum: history.checksum };
+}
+
+/** Read-only freshness of Transactions against current raw + Endpoint Mapping. Never throws. */
+function readInternalTransactionsFreshness_(ss) {
+  try {
+    const input = buildInternalFromSheets_(ss);
+    const sheet = ss.getSheetByName(SHEETS.TRANSACTIONS);
+    if (!sheet) throw new Error('Transactions tab not found.');
+    return checkInternalTransactionsFresh_(input.built, readSheetGrid_(sheet).values, getColumnNames_(SHEETS.TRANSACTIONS));
+  } catch (err) {
+    return { current: false, expected_checksum: null, stored_checksum: null,
+      reason: 'Transactions is stale; run normalizeInternalTransactions first (' + (err && err.message ? err.message : String(err)) + ').' };
+  }
 }
 
 function throwIfInternalErrors_(errors) {
@@ -492,11 +525,8 @@ function buildInternalTransactionsReport_() {
     const ssColumns = getColumnNames_(SHEETS.SOURCE_SYSTEM);
     const ssExpected = computeRawChecksum_(buildTableValues_(ssColumns, b.sourceRows.map(function (o) { return objectToRow_(o, ssColumns); })));
     report.source_system_match = ssExpected === readSheetGrid_(ss.getSheetByName(SHEETS.SOURCE_SYSTEM)).checksum;
-    const txColumns = getColumnNames_(SHEETS.TRANSACTIONS);
-    const updatedIdx = txColumns.indexOf('updated_at');
-    const txExpected = tableChecksumExcluding_(buildTableValues_(txColumns,
-      b.transactions.map(function (o) { return objectToRow_(o, txColumns); })), [updatedIdx]);
-    report.transactions_match = txExpected === tableChecksumExcluding_(readSheetGrid_(ss.getSheetByName(SHEETS.TRANSACTIONS)).values, [updatedIdx]);
+    report.transactions_match = checkInternalTransactionsFresh_(b, readSheetGrid_(ss.getSheetByName(SHEETS.TRANSACTIONS)).values,
+      getColumnNames_(SHEETS.TRANSACTIONS)).current;
     if (!report.source_system_match) report.errors.push('Source System does not match raw (run normalizeInternalTransactions).');
     if (!report.transactions_match) report.errors.push('Transactions does not match raw (run normalizeInternalTransactions).');
 

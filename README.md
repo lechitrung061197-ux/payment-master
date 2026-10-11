@@ -541,6 +541,14 @@ settlement items, balances or payouts, and `Transactions.status` is not changed
   and preserved; `updated_at` changes only when the row content changes. A rerun with the same
   input is NO_CHANGE. An existing `match_id` missing from the fresh union fails (rows are never
   silently deleted); a previously confirmed row that is no longer MATCHED is reported.
+- **Upstream freshness gates** (before any write; a NORMAL swap state alone is not enough):
+  Transactions must equal the canonical result of current Raw Internal Transactions + Endpoint
+  Mapping (ignoring only `updated_at`), else FAILED "Transactions is stale; run
+  normalizeInternalTransactions first."; the KH001 partition of Provider Transactions must
+  equal the canonical result of the current KH001 raw tabs (`checkKh001ProviderTransactionsCurrent_`),
+  else FAILED "Provider Transactions KH001 is stale; run normalizeKh001ProviderTransactions first.".
+  The verifier reports `internal_transactions_current` / `provider_transactions_current` and
+  fails when either is false. Whole-table duplicate provider key validation still follows.
 - Written as a whole table through SafeSwap under the script lock; requires Transactions and
   Provider Transactions in a NORMAL swap state. The Dashboard "Matched" metric counts
   Payment Matches with `reconciliation_status = MATCHED`.

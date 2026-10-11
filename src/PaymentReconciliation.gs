@@ -14,6 +14,10 @@
  * - match_id = PM-<sha256(payment_source|id)>, stable across status changes. matched_at /
  *   matched_by are set the first time a row is CONFIRMED and preserved; updated_at changes only
  *   when row content changes. An existing match_id missing from the fresh union fails.
+ * - Upstream freshness gates (before any write): Transactions must equal the canonical result
+ *   of current Raw Internal Transactions + Endpoint Mapping, and the KH001 partition of Provider
+ *   Transactions must equal the canonical result of the current KH001 raw tabs. A NORMAL swap
+ *   state alone is not enough.
  * - Writes only Payment Matches (SafeSwap, whole table, under the script lock) and Audit Log.
  *   Transactions.status is NOT changed here.
  *
@@ -259,6 +263,26 @@ function readSchemaTableObjects_(ss, sheetName, tab) {
   return { grid: grid, rows: tableRowsFromGrid_(grid.values, columns, sheetName).map(function (r) { return rowToObject_(r, columns); }) };
 }
 
+/** Read-only freshness of the KH001 Provider Transactions partition against current KH001 raw. */
+function readProviderTransactionsFreshness_(ss) {
+  const stale = 'Provider Transactions KH001 is stale; run normalizeKh001ProviderTransactions first.';
+  try {
+    const sheet = ss.getSheetByName(SHEETS.RAW_KH001_PAYPAL);
+    if (!sheet) throw new Error('Raw tab "' + SHEETS.RAW_KH001_PAYPAL + '" not found.');
+    const dep = readProviderTransactionsDependency_(ss, readSheetGrid_(sheet)).dependency;
+    return { current: dep.provider_transactions_current, expected_checksum: dep.expected_checksum,
+      stored_checksum: dep.stored_checksum, reason: dep.provider_transactions_current ? null : stale };
+  } catch (err) {
+    return { current: false, expected_checksum: null, stored_checksum: null,
+      reason: stale + ' (' + (err && err.message ? err.message : String(err)) + ')' };
+  }
+}
+
+/** Both upstream canonical inputs must be current before reconciliation may write. */
+function readReconciliationUpstream_(ss) {
+  return { internal: readInternalTransactionsFreshness_(ss), provider: readProviderTransactionsFreshness_(ss) };
+}
+
 function readReconciliationInputs_(ss) {
   const internal = readSchemaTableObjects_(ss, SHEETS.TRANSACTIONS, transactionsTab_());
   const provider = readSchemaTableObjects_(ss, SHEETS.PROVIDER_TRANSACTIONS, providerTransactionsTab_());
@@ -289,6 +313,13 @@ function runPaymentReconciliation_() {
     const recovery = recoverSwapState_(ss, tab);
     details.initial_swap_state = recovery.state;
     details.recovery_actions = recovery.actions;
+
+    // Upstream freshness gates: nothing is written unless both canonical inputs are current.
+    const upstream = readReconciliationUpstream_(ss);
+    details.internal_transactions_current = upstream.internal.current;
+    details.provider_transactions_current = upstream.provider.current;
+    if (!upstream.internal.current) throw new Error(upstream.internal.reason);
+    if (!upstream.provider.current) throw new Error(upstream.provider.reason);
 
     const input = readReconciliationInputs_(ss);
     details.internal_rows = input.built.stats.internal_rows;
@@ -341,6 +372,7 @@ function buildPaymentReconciliationReport_() {
     missing_internal_rows: 0, status_counts: {}, payment_source_counts: {}, matched_amount: 0,
     missing_provider_internal_amount: 0, provider_only_amount: 0, duplicate_internal_keys: [], duplicate_provider_keys: [],
     currency_mismatches: [], amount_mismatches: [], disappearing_match_ids: [], confirmed_without_matched_at: [],
+    internal_transactions_current: false, provider_transactions_current: false,
     payment_matches_match: false, swap_state: null, pass: false, errors: [], warnings: [], regression: null,
   };
   try {
@@ -348,6 +380,11 @@ function buildPaymentReconciliationReport_() {
     const tab = paymentMatchesTab_();
     report.swap_state = detectSwapState_(ss, tab).state;
     if (report.swap_state !== 'NORMAL') report.errors.push('Payment Matches swap state is ' + report.swap_state);
+    const upstream = readReconciliationUpstream_(ss);
+    report.internal_transactions_current = upstream.internal.current;
+    report.provider_transactions_current = upstream.provider.current;
+    if (!upstream.internal.current) report.errors.push(upstream.internal.reason);
+    if (!upstream.provider.current) report.errors.push(upstream.provider.reason);
     const input = readReconciliationInputs_(ss);
     const b = input.built;
     report.internal_rows = b.stats.internal_rows;

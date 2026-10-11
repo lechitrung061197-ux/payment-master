@@ -12,6 +12,7 @@ const Utilities = {
   DigestAlgorithm: { SHA_256: 'SHA_256' },
   Charset: { UTF_8: 'UTF_8' },
   computeDigest: (_alg, text) => [...crypto.createHash('sha256').update(text, 'utf8').digest()].map((b) => (b > 127 ? b - 256 : b)),
+  formatDate: (date, timeZone) => new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date),
 };
 const context = vm.createContext({ Utilities });
 for (const f of ['Config', 'Utils', 'RawSnapshot', 'CanonicalTable', 'Kh001ProviderTransactions', 'Kh001ProviderEvents',
@@ -176,4 +177,87 @@ test('summary counts, amounts and regression report (report only)', () => {
   assert.deepEqual(s.missing_internal_provider_status, { Pending: 1 });
   assert.deepEqual(s.matched_seller_counts, { 'SLR-000001': 1 });
   assert.equal(H.evaluatePaymentReconciliationRegression_(s, b.stats).pass, false);
+});
+
+// ---- Upstream freshness gates ---------------------------------------------------------------
+const TX_COLUMNS = js(H.getColumnNames_('Transactions'));
+const SELLER_COLUMNS = js(H.getColumnNames_('Sellers'));
+const NY = 'America/New_York';
+function mappingFor(token, sellerId, from) {
+  const row = SELLER_COLUMNS.map(() => '');
+  const set = (c, v) => { row[SELLER_COLUMNS.indexOf(c)] = v; };
+  set('seller_id', sellerId); set('seller_name', 'Seller ' + sellerId); set('status', 'ACTIVE'); set('effective_from', from);
+  set('endpoint_1_name', 'Shop ' + token); set('endpoint_1_key', token);
+  const draft = H.parseSellersDraft_([SELLER_COLUMNS, row], (v) => H.providerDateKey_(v, NY));
+  return js(H.planSellerMappingPublish_(draft.sellers, [], 'T').newRecords);
+}
+function rawRow(o) {
+  const r = { order_id: '1', payment_method: 'pp', transaction_id: 'TX1', gateway: 'paypal', status: 'captured', total: '65.49',
+    currency: 'USD', sub_account: 's', store_domain: 'd', shield_domain: 'sd', endpoint_token: 'glk_testA',
+    created_at: '2026-10-02T15:00:00Z', refunded_at: '', customer: 'c', settled_at: '', note: '', import_batch_id: 'IB-1',
+    source_file_name: 'f.csv', source_row_number: 2, imported_at: '2026-10-10T08:00:00Z', _row: 2, ...o };
+  r.row_fingerprint = H.computeInternalRowFingerprint_(r);
+  return r;
+}
+const internalBuild = (rows, mapping) => H.buildInternalCanonical_(rows, mapping, { naiveTimeZone: '', parseLocal: null, ownershipTimeZone: NY });
+/** Transactions grid as normalizeInternalTransactions would have stored it (updated_at stamped). */
+const storedTransactions = (built) => H.buildTableValues_(TX_COLUMNS, built.transactions.map((o) => {
+  const row = H.objectToRow_(o, TX_COLUMNS); row[TX_COLUMNS.indexOf('updated_at')] = T1; return row;
+}));
+const fresh = (built, stored) => js(H.checkInternalTransactionsFresh_(built, stored, TX_COLUMNS));
+
+test('internal gate: fresh Transactions is current (updated_at ignored)', () => {
+  const b = internalBuild([rawRow({})], mappingFor('glk_testA', 'SLR-000001', '2026-10-01'));
+  const c = fresh(b, storedTransactions(b));
+  assert.equal(c.current, true);
+  assert.equal(c.reason, null);
+});
+
+test('internal gate: raw changes while Transactions is unchanged -> stale', () => {
+  const mapping = mappingFor('glk_testA', 'SLR-000001', '2026-10-01');
+  const stored = storedTransactions(internalBuild([rawRow({})], mapping));
+  const later = internalBuild([rawRow({}), rawRow({ _row: 3, transaction_id: 'TX2', source_row_number: 3 })], mapping);
+  const c = fresh(later, stored);
+  assert.equal(c.current, false);
+  assert.equal(c.reason, 'Transactions is stale; run normalizeInternalTransactions first.');
+  const changed = internalBuild([rawRow({ total: '70.00' })], mapping);
+  assert.equal(fresh(changed, stored).current, false);
+});
+
+test('internal gate: Endpoint Mapping change affecting ownership -> stale until renormalized', () => {
+  const stored = storedTransactions(internalBuild([rawRow({})], mappingFor('glk_testA', 'SLR-000001', '2026-10-01')));
+  const remapped = internalBuild([rawRow({})], mappingFor('glk_testA', 'SLR-000009', '2026-10-01'));
+  assert.equal(fresh(remapped, stored).current, false);
+  assert.equal(fresh(internalBuild([rawRow({})], []), stored).current, false, 'mapping removed -> UNASSIGNED differs');
+});
+
+test('internal gate: raw that cannot be normalized is reported as stale', () => {
+  const stored = storedTransactions(internalBuild([rawRow({})], []));
+  const bad = internalBuild([rawRow({ gateway: 'square' })], []);
+  assert.match(fresh(bad, stored).reason, /Transactions is stale; run normalizeInternalTransactions first \(raw has 1 error\(s\)\)/);
+});
+
+// Provider gate reuses checkKh001ProviderTransactionsCurrent_ (raw KH001 -> Provider Transactions).
+const PT_COLUMNS = js(H.getColumnNames_('Provider Transactions'));
+const PP_HEADER = ['Thời gian', 'Type', 'Status', 'Currency', 'Gross', 'Fee', 'Net', 'From Email Address', 'To Email Address',
+  'Transaction ID', 'Invoice Number', 'Balance Impact', 'Mã cổng', 'Nhóm GD'];
+const ppGrid = (gross) => [PP_HEADER, [D('2026-10-02T15:00:00Z'), 'Express Checkout Payment', 'Completed', 'USD', gross, -3.24,
+  Math.round((gross - 3.24) * 100) / 100, 'b@x', 's@x', 'TX1', 'INV', 'Credit', 'G1', 'Thanh toán']];
+const RC_HEADER = ['Transaction ID', 'Có trên KH', 'Có trên PP', 'Trạng thái', 'Mã cổng', 'Sub account', 'Thời gian GD', 'Số tiền KH',
+  'Gross PayPal', 'Chênh lệch', 'Phí PayPal', 'Net'];
+const rcGrid = () => { const blank = RC_HEADER.map(() => ''); return [blank, blank, blank, blank, blank, RC_HEADER]; };
+const grid = (values) => ({ values, checksum: H.computeRawChecksum_(values) });
+function storedPt(gross) {
+  const p = grid(ppGrid(gross));
+  const r = grid(rcGrid());
+  const rows = H.buildKh001ProviderTransactions_(p.values, r.values, H.computeKh001SourceFingerprint_(p.checksum, r.checksum)).rows;
+  return rows.map((o) => H.objectToRow_(o, PT_COLUMNS));
+}
+
+test('provider gate: KH001 raw changes while Provider Transactions is unchanged -> stale', () => {
+  const stored = storedPt(91.98);
+  assert.equal(H.checkKh001ProviderTransactionsCurrent_(grid(ppGrid(91.98)), grid(rcGrid()), stored, PT_COLUMNS).current, true);
+  const after = js(H.checkKh001ProviderTransactionsCurrent_(grid(ppGrid(95.00)), grid(rcGrid()), stored, PT_COLUMNS));
+  assert.equal(after.current, false);
+  assert.match(after.reason, /stale or modified/);
 });
