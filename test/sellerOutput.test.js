@@ -131,9 +131,9 @@ function multiSpec() {
       { id: 'S2', seller: 'CUS002', source: 'STRIPE', order: 77.5, status: 'MISSING_PROVIDER', created: '2026-10-05T15:00:00Z' },
     ],
     settlements: [
-      { settlement_id: 'ST-1', source_settlement_number: 1, period_start_date: D('2026-10-01T04:00:00Z'), period_end_date: D('2026-10-04T04:00:00Z'),
+      { settlement_id: 'ST-1', payment_source: 'PAYPAL', source_settlement_number: 1, period_start_date: D('2026-10-01T04:00:00Z'), period_end_date: D('2026-10-04T04:00:00Z'),
         source_payment_date: D('2026-10-06T04:00:00Z') },
-      { settlement_id: 'ST-S1', source_settlement_number: 7, period_start_date: D('2026-10-01T04:00:00Z'), period_end_date: D('2026-10-03T04:00:00Z'),
+      { settlement_id: 'ST-S1', payment_source: 'STRIPE', source_settlement_number: 1, period_start_date: D('2026-10-01T04:00:00Z'), period_end_date: D('2026-10-03T04:00:00Z'),
         source_payment_date: D('2026-10-05T04:00:00Z') }],
     terms: [{ seller_id: 'CUS002', payment_source: 'PAYPAL', seller_fee_rate: 0.08, effective_from: '2026-10-01', effective_to: '' },
       { seller_id: 'CUS002', payment_source: 'STRIPE', seller_fee_rate: 0.05, effective_from: '2026-10-01', effective_to: '' }],
@@ -153,7 +153,7 @@ test('multi-provider: one DoiSoat_GD with PAYPAL 8% and STRIPE 5% rows; STRIPE M
   ['Gross cổng', 'Chênh lệch', 'Refund / Dispute', 'Tỷ lệ VNS', 'Doanh thu (Gross)', 'Phí cổng', 'Net', 'Phí VNS', 'Hold', 'Lần chốt (ngày)',
     'Ngày VNS nhận tiền', 'Trạng thái chốt', 'Thực nhận'].forEach((c) => assert.equal(miss[c], '', 'blank ' + c));
   assert.ok(by('P1')['Thời gian GD'].getTime() > 0);
-  assert.equal(new Date(by('P1')['Lần chốt (ngày)']).toISOString(), '2026-10-04T12:00:00.000Z', 'date-only at 12:00 UTC: same calendar day in any time zone');
+  assert.equal(new Date(by('P1')['Lần chốt (ngày)']).toISOString(), '2026-10-04T12:00:00.000Z', 'date-only value anchored at 12:00 UTC to avoid date drift in the supported seller-template time zones');
 });
 
 test('multi-provider: TongHop_Thang Phí VNS = SUM of frozen seller_fee (not Net x one rate); PhieuDoiSoat section A per source', () => {
@@ -169,7 +169,7 @@ test('multi-provider: TongHop_Thang Phí VNS = SUM of frozen seller_fee (not Net
   assert.ok(near(snap.blocks.PhieuDoiSoat.total[5], fees));
   assert.equal(snap.blocks.PhieuDoiSoat.total[4], '', 'no single rate on the total row');
   const history = js(snap.blocks.PhieuDoiSoat.history);
-  assert.deepEqual(history.map((r) => r[0]), [7, 1], 'seller share of each paid settlement, chronological');
+  assert.deepEqual(history.map((r) => r[0]), ['STRIPE #1', 'PAYPAL #1'], 'provider-aware labels: both sources have a settlement #1');
   assert.ok(near(history[1][8], snap.totals.current_balance));
 });
 
@@ -194,7 +194,7 @@ test('ledgers: only SENT/CONFIRMED payouts and APPLIED adjustments count; sectio
   assert.ok(near(b[4], 5) && near(b[9], 100) && near(b[11 - 0], 25300) && near(b[12], 2530000));
   assert.ok(near(b[10], snap.totals.current_balance));
   const h = js(snap.blocks.PhieuDoiSoat.history);
-  assert.deepEqual(h.map((r) => r[0]), [7, 1, 'Payout', 'HOLD_RELEASE']);
+  assert.deepEqual(h.map((r) => r[0]), ['STRIPE #1', 'PAYPAL #1', 'Payout', 'HOLD_RELEASE']);
   assert.ok(near(h[2][7], 100), 'payout deducted once');
   assert.ok(near(h[3][10], 5) && near(h[3][11], snap.totals.seller_hold));
   assert.ok(!JSON.stringify(snap.blocks).includes('999'), 'DRAFT payout never published');
@@ -236,4 +236,39 @@ test('Dispute: only canonical cases attributable to the seller; no customer data
   assert.ok(!JSON.stringify(rows).includes('buyer phone'), 'internal notes / PII never output');
   assert.deepEqual(js(snaps.CUS002.blocks.DoiSoat_GD.rows).find((r) => r[0] === 'P1')[10], -15, 'Refund / Dispute from canonical APPLIED adjustments');
   assert.equal(snaps.CUS002.blocks.TongHop_Thang.rows[0][12], 1, 'Số dispute');
+});
+
+test('TongHop_Thang hold / available are recognised in the provider-paid (AVAILABLE) month, like Seller Balances', () => {
+  const spec = {
+    sellers: [{ seller_id: 'CUS002', seller_name: 'HUI' }],
+    txs: [{ id: 'X1', seller: 'CUS002', order: 104, created: '2026-09-30T15:00:00Z', leg: { fee: 4, rate: 0.08, settlement: 'ST-9' } }],
+    settlements: [{ settlement_id: 'ST-9', payment_source: 'PAYPAL', source_settlement_number: 3, period_start_date: D('2026-09-28T04:00:00Z'),
+      period_end_date: D('2026-09-30T04:00:00Z'), source_payment_date: D('2026-10-02T04:00:00Z') }],
+    adjustments: [{ adjustment_id: 'HR1', adjustment_type: 'HOLD_RELEASE', seller_id: 'CUS002', currency: 'USD', amount: 4, status: 'APPLIED',
+      effective_date: D('2026-11-20T05:00:00Z') }],
+    terms: [{ seller_id: 'CUS002', payment_source: 'PAYPAL', seller_fee_rate: 0.08, effective_from: '2026-09-01', effective_to: '' }],
+  };
+  const rows = js(build(spec).CUS002.blocks.TongHop_Thang.rows);
+  const col = js(vm.runInContext('SELLER_TEMPLATE.tongHopHeaders', context));
+  const m = (i) => Object.fromEntries(col.map((c, j) => [c, rows[i][j]]));
+  const [sep, oct, nov] = [m(0), m(1), m(2)];
+  assert.deepEqual([sep['Tháng'], oct['Tháng'], nov['Tháng']].map((d) => d.slice(0, 7)), ['2026-09', '2026-10', '2026-11']);
+  // Transaction-month figures stay in September ...
+  assert.deepEqual([sep['Số GD'], sep['Doanh thu (Gross)'], sep['Net']], [1, 104, 100]);
+  assert.ok(near(sep['Phí VNS'], 8));
+  // ... while hold / available are recognised when the provider paid (October).
+  assert.deepEqual([sep['Hold phát sinh'], sep['Số dư hold cuối tháng'], sep['Available seller']], [0, 0, 0]);
+  assert.ok(near(oct['Hold phát sinh'], 10) && near(oct['Số dư hold cuối tháng'], 10) && near(oct['Available seller'], 82));
+  assert.deepEqual([oct['Số GD'], oct['Phí VNS']], [0, 0]);
+  // An actual HOLD_RELEASE in a later month lowers the month-end hold by exactly that amount.
+  assert.ok(near(nov['Hold đã hoàn'], 4) && near(nov['Số dư hold cuối tháng'], 6) && near(nov['Hold phát sinh'], 0));
+  assert.ok(near(nov['Balance còn lại'], 86), 'released hold is credited to the balance');
+});
+
+test('template fixture formats: Tỷ lệ VNS is a 0.00% cell in DoiSoat_GD and PhieuDoiSoat section A (current template)', () => {
+  const nf = TEMPLATE.numberFormats;
+  const cellsOf = (name) => TEMPLATE.sheets.find((s) => s.name === name).cells;
+  for (let r = 7; r <= 1006; r += 333) assert.equal(nf[cellsOf('DoiSoat_GD')[r + ',12'].s], '0.00%', 'DoiSoat_GD L' + r);
+  for (let r = 11; r <= 21; r++) assert.equal(nf[cellsOf('PhieuDoiSoat')[r + ',6'].s], '0.00%', 'PhieuDoiSoat F' + r);
+  assert.notEqual(nf[cellsOf('PhieuDoiSoat')['11,7'].s], '0.00%', 'only the rate column is a percentage');
 });

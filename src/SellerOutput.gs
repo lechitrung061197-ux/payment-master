@@ -111,11 +111,19 @@ function rowMatches_(grid, r, startCol, labels) {
   return labels.every(function (l, i) { return sellerText_(gridCell_(grid, r, startCol + i)) === l.normalize('NFC'); });
 }
 
-/** Date-only value as a Date at 12:00 UTC of the Master calendar day (same calendar date in any sheet time zone). */
+/**
+ * Date-only value anchored at 12:00 UTC of the Master calendar day, to avoid date drift in the supported
+ * seller-template time zones (not a general time zone conversion).
+ */
 function sellerDateOnly_(value, dateKeyOf) {
   if (isBlankCell_(value)) return '';
   const key = dateKeyOf(value);
   return key ? new Date(key + 'T12:00:00Z') : '';
+}
+
+/** Provider-aware settlement label for PhieuDoiSoat section D, e.g. "PAYPAL #1" (sources can share numbers). */
+function sellerSettlementLabel_(settlement) {
+  return trimmedText_(settlement.payment_source) + ' #' + trimmedText_(settlement.source_settlement_number);
 }
 
 function micro_(v) {
@@ -460,7 +468,7 @@ function buildSellerOutputs_(input) {
       const unknown = inMonth.filter(function (x) { return !x.known; }).length;
       return [new Date(m + '-01T12:00:00Z'), monthIndex(m), Object.keys(sources).length, inMonth.length, sumLegs(legsM, 'gross_amount') / 1e6,
         sumLegs(legsM, 'processing_fee') / 1e6, sumLegs(legsM, 'net_amount') / 1e6, sumLegs(legsM, 'seller_fee') / 1e6,
-        sumLegs(legsM, 'seller_hold_amount') / 1e6, released / 1e6, cumHold / 1e6, availableM / 1e6, dispM, inMonth.length > 0 ? dispM / inMonth.length : '',
+        sumLegs(availM, 'seller_hold_amount') / 1e6, released / 1e6, cumHold / 1e6, availableM / 1e6, dispM, inMonth.length > 0 ? dispM / inMonth.length : '',
         sumOf(payM, 'amount') / 1e6, sumOf(adjM, 'amount') / 1e6, cumBalance / 1e6, obligation / 1e6,
         settledDates.length > 0 ? new Date(settledDates[settledDates.length - 1] + 'T12:00:00Z') : '',
         unknown > 0 ? unknown + ' GD chưa có provider economics (không ước tính)' : ''];
@@ -539,7 +547,7 @@ function buildSellerOutputs_(input) {
       if (e.kind === 'S') {
         runBalance += e.amount;
         runHold += e.hold;
-        return [e.s.source_settlement_number, dateOnly(e.s.period_start_date), dateOnly(e.s.period_end_date), dateOnly(e.s.source_payment_date),
+        return [sellerSettlementLabel_(e.s), dateOnly(e.s.period_start_date), dateOnly(e.s.period_end_date), dateOnly(e.s.source_payment_date),
           e.amount / 1e6, before / 1e6, (before + e.amount) / 1e6, 0, runBalance / 1e6, e.hold / 1e6, 0, runHold / 1e6,
           dateOnly(e.s.hold_release_due_from_date), dateOnly(e.s.hold_release_due_to_date), '', '', ''];
       }

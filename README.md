@@ -691,8 +691,8 @@ one hidden system tab:
 | Tab | Content (owned ranges only) |
 | --- | --- |
 | `DoiSoat_GD` | One row per seller internal transaction (header row 6, data from row 7): status (Khớp / Lệch số tiền / Thiếu trên cổng), payment source, internal order data and, for MATCHED legs, provider gross, processing fee, net, frozen `seller_fee_rate`, seller fee, seller hold, settlement dates / status and seller amount. MISSING_PROVIDER rows keep every provider / seller / settlement field blank. |
-| `TongHop_Thang` | One row per month, all payment sources together: counts, distinct sources, gross / fee / net, `Phí VNS` = SUM of frozen leg `seller_fee` (never net × one rate), hold created / released / month-end balance, available (by provider payment date), disputes, effective payouts, adjustments, balance, known obligation. Rows are inserted before the `Logic:` footer when needed. |
-| `PhieuDoiSoat` | Seller + period; "Chưa đối soát / chưa tính" (internal order amount and count of transactions without provider economics) and "Hold đang giữ" (Seller Balances hold) — never added together; A: known economics per payment source (rate shown only when exactly one rate applies); B: seller-only payable from AVAILABLE legs, hold releases, refunds / disputes, APPLIED adjustments, effective payouts → current balance and hold; C: counts / internal amounts by reconciliation status; D: chronological seller-only ledger of paid settlements (seller share only), adjustments and SENT / CONFIRMED payouts. |
+| `TongHop_Thang` | One row per month, all payment sources together. Transaction month: count, distinct sources, gross / processing fee / net, `Phí VNS` = SUM of frozen leg `seller_fee` (never net × one rate). Provider-paid (AVAILABLE) month — the Seller Balances recognition point: available seller, hold created and the month-end hold balance; actual HOLD_RELEASE by its effective date. Also disputes, effective payouts, adjustments, balance, known obligation. Rows are inserted before the `Logic:` footer when needed. |
+| `PhieuDoiSoat` | Seller + period; "Chưa đối soát / chưa tính" (internal order amount and count of transactions without provider economics) and "Hold đang giữ" (Seller Balances hold) — never added together; A: known economics per payment source (rate shown only when exactly one rate applies); B: seller-only payable from AVAILABLE legs, hold releases, refunds / disputes, APPLIED adjustments, effective payouts → current balance and hold; C: counts / internal amounts by reconciliation status; D: chronological seller-only ledger of paid settlements (seller share only, labelled by provider, e.g. `PAYPAL #1`, `STRIPE #1`), adjustments (by type) and SENT / CONFIRMED payouts (`Payout`). |
 | `Dispute` | Canonical Master disputes attributable to the seller (no buyer data, no internal notes); clean headers when none. |
 | `_Sync` (hidden) | `output_schema_version, seller_id, seller_name, master_schema_version, synced_at`, the four tab checksums and a combined checksum — the commit marker. No Master ID, tokens or PII. |
 
@@ -708,7 +708,7 @@ token, protected ID or e-mail address in any cell.
 **Renderer**: only explicit owned ranges are written, with `setValues` (blank padding clears stale
 rows); `sheet.clear()`, format calls and static titles / headers / approved formulas are never
 touched. Text that Sheets could reinterpret is written with a quote prefix. Date-only values are
-written at 12:00 UTC so the same calendar day shows in any template time zone. When a block outgrows
+anchored at 12:00 UTC to avoid date drift in the supported seller-template time zones. When a block outgrows
 the template capacity (DoiSoat_GD 1000 rows, TongHop_Thang months, PhieuDoiSoat A / D, Dispute),
 rows are inserted inside the block so presentation formula ranges, filters and conditional formats
 extend, and the template data-row format is copied onto the new rows.

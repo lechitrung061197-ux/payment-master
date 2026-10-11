@@ -8,7 +8,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-const { makeSpreadsheet, cloneSpreadsheet, writesTo, formatOps } = require('./helpers/sellerFakes');
+const { makeSpreadsheet, cloneSpreadsheet, writesTo, formatOps, TEMPLATE } = require('./helpers/sellerFakes');
 const { makeMaster } = require('./helpers/sellerMaster');
 
 const Utilities = {
@@ -301,4 +301,17 @@ test('overall status: PARTIAL when one fails and another succeeds; FAILED when n
   assert.equal(st('FAILED', 'FAILED'), 'FAILED');
   assert.equal(st('SUCCESS', 'NO_CHANGE'), 'SUCCESS');
   assert.equal(st('NO_CHANGE', 'NO_CHANGE'), 'NO_CHANGE');
+});
+
+test('rates land in the template percentage cells (0.08 shown as 8.00%) with zero formatting writes', () => {
+  const a = freshChild(CHILD_A);
+  installSync({ children: { [CHILD_A]: a }, destinations: [dest({})] });
+  assert.equal(js(H.runSellerSheetsSync_()).status, 'SUCCESS');
+  const nf = TEMPLATE.numberFormats;
+  assert.equal(cellOf(a, 'DoiSoat_GD', 7, 12).v, 0.08);
+  assert.equal(nf[cellOf(a, 'DoiSoat_GD', 7, 12).s], '0.00%');
+  assert.equal(cellOf(a, 'PhieuDoiSoat', 11, 6).v, 0.08);
+  assert.equal(nf[cellOf(a, 'PhieuDoiSoat', 11, 6).s], '0.00%');
+  assert.deepEqual(formatOps(a), []);
+  assert.deepEqual(a.log.filter((e) => e.op === 'copyTo'), [], 'no format copy without capacity growth');
 });

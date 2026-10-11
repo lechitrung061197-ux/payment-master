@@ -53,7 +53,7 @@ function makeMaster(D, spec) {
   }).filter((b) => b.settled_amount !== 0 || b.current_balance !== 0 || b.seller_hold_balance !== 0);
   return {
     transactions, matches, legs, balances, payouts, adjustments,
-    settlements: spec.settlements || [{ settlement_id: 'ST-1', source_settlement_number: 1, period_start_date: D('2026-10-01T04:00:00Z'),
+    settlements: spec.settlements || [{ settlement_id: 'ST-1', payment_source: 'PAYPAL', source_settlement_number: 1, period_start_date: D('2026-10-01T04:00:00Z'),
       period_end_date: D('2026-10-04T04:00:00Z'), source_payment_date: D('2026-10-06T04:00:00Z'), hold_release_due_from_date: '', hold_release_due_to_date: '' }],
     disputes: spec.disputes || [],
     sellerTerms: spec.terms || spec.sellers.map((s) => ({ seller_id: s.seller_id, payment_source: 'PAYPAL', seller_fee_rate: 0.08, effective_from: '2026-10-01', effective_to: '' })),
