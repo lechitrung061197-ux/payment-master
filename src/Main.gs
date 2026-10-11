@@ -232,3 +232,21 @@ function verifyInternalTransactions() {
   Logger.log(JSON.stringify(report, null, 2));
   return report;
 }
+
+/* ---------------------------------------------------------------------------
+ * Exact internal <-> provider reconciliation (Payment Matches only)
+ * ------------------------------------------------------------------------- */
+
+/** Rebuilds Payment Matches from Transactions + Provider Transactions (exact key + amount). */
+function reconcilePayments() {
+  const result = runPaymentReconciliation_();
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** Read-only: compares Payment Matches with a fresh exact reconciliation. */
+function verifyPaymentReconciliation() {
+  const report = buildPaymentReconciliationReport_();
+  Logger.log(JSON.stringify(report, null, 2));
+  return report;
+}

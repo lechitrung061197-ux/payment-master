@@ -49,6 +49,7 @@ src/
                                 also hosts the credential guard/redaction helpers (keep this file)
   SecurityRedaction.gs          Audit Log credential redaction + exposure check
   InternalTransactions.gs       Raw Internal Transactions -> Source System -> Transactions
+  PaymentReconciliation.gs      Exact Transactions <-> Provider Transactions -> Payment Matches
   Main.gs           Public entry points
 test/               Node unit tests for pure helpers (npm test, not pushed)
 ```
@@ -86,7 +87,7 @@ from the Apps Script editor. `setupMaster` never deletes tabs or data rows:
 | Source System | Latest canonical snapshot per internal transaction (rebuilt from raw) |
 | Source Payments | Raw provider events (payment, refund, dispute, hold, …), one row per event |
 | Transactions | Canonical internal transactions + effective-dated endpoint ownership |
-| Payment Matches | internal transaction ↔ (payment_source, external_transaction_id) |
+| Payment Matches | Exact internal ↔ provider reconciliation, one row per (payment_source, transaction id) |
 | Payment Legs | One row per matched external payment transaction, live economics |
 | Settlements | Canonical provider settlement headers (provider economics only), all providers |
 | Settlement Items | Frozen per-leg snapshot inside a settlement |
@@ -515,6 +516,34 @@ matching, Payment Legs, fees, holds, availability, balances or payouts.
   and ignores it for NO_CHANGE). Provider / settlement / seller-money tabs are never touched.
 - Dashboard formulas reference tabs by name (`INDIRECT`) and are refreshed by `setupMaster`, so
   they keep working when a tab is replaced by a swap.
+
+## Payment reconciliation (Phase 2G)
+
+Entry points: `reconcilePayments()` and read-only `verifyPaymentReconciliation()`.
+Only Payment Matches and Audit Log are written — no Payment Legs, fees, holds, availability,
+settlement items, balances or payouts, and `Transactions.status` is not changed
+(Payment Matches is the reconciliation source of truth until the settlement state machine).
+
+- **Exact key**: internal `(payment_source, internal_transaction_id)` = provider
+  `(payment_source, external_transaction_id)`, string equality only. PAYPAL only matches PAYPAL,
+  STRIPE only STRIPE. No order / customer / amount-only / sub_account / store / seller fallback.
+- **Uniqueness guards**: both key sets must be unique; a provider key present twice fails even
+  under different `provider_id` (one provider payment never confirms two internal transactions).
+- **Status** over the union of keys: both sides with equal currency (trim + uppercase) and
+  `|provider gross_amount − internal order_amount| < 0.005` → `MATCHED` (AUTO / CONFIRMED);
+  otherwise `AMOUNT_MISMATCH` (AUTO / PENDING_REVIEW; currency mismatch leaves
+  `amount_difference` blank with a note); internal only → `MISSING_PROVIDER`; provider only →
+  `MISSING_INTERNAL`. Provider `external_status` (e.g. Pending) does not affect identity.
+- **IDs / lineage**: `match_id = PM-<sha256(payment_source|transaction id)>`, stable when a row
+  moves from MISSING_PROVIDER to MATCHED. Copies internal / provider fingerprints,
+  `provider_transaction_id`, `provider_id`, `provider_external_status`; no seller economics.
+- **Timestamps**: `matched_at` / `matched_by = system` are set the first time a row is CONFIRMED
+  and preserved; `updated_at` changes only when the row content changes. A rerun with the same
+  input is NO_CHANGE. An existing `match_id` missing from the fresh union fails (rows are never
+  silently deleted); a previously confirmed row that is no longer MATCHED is reported.
+- Written as a whole table through SafeSwap under the script lock; requires Transactions and
+  Provider Transactions in a NORMAL swap state. The Dashboard "Matched" metric counts
+  Payment Matches with `reconciliation_status = MATCHED`.
 
 ## Tests
 

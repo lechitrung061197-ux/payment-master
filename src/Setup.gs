@@ -208,7 +208,8 @@ function dashboardMetrics_() {
   const notYet = 'Not implemented yet (later phase)';
   return [
     ['Total transactions', '=COUNTA(' + col(SHEETS.TRANSACTIONS, 'internal_transaction_id') + ')', 'Count of Transactions rows'],
-    ['Matched', '=COUNTIF(' + txStatus + ',"MATCHED")', 'Transactions.status = MATCHED'],
+    ['Matched', '=COUNTIF(' + col(SHEETS.PAYMENT_MATCHES, 'reconciliation_status') + ',"MATCHED")',
+      'Payment Matches.reconciliation_status = MATCHED'],
     ['Waiting settlement', '=COUNTIF(' + txStatus + ',"WAITING_SETTLEMENT")', 'Transactions.status = WAITING_SETTLEMENT'],
     ['Available (USD)', null, notYet],
     ['Seller balances (USD)', null, notYet],

@@ -9,7 +9,7 @@
 
 const APP = Object.freeze({
   NAME: 'Payment Master',
-  SCHEMA_VERSION: 8,
+  SCHEMA_VERSION: 9,
   LOCALE: 'en_US',
   TIMEZONE: 'America/New_York',
   DEFAULT_CURRENCY: 'USD',
@@ -86,6 +86,8 @@ const ENUMS = Object.freeze({
   ENDPOINT_MAPPING_STATUS: ['OPEN', 'CLOSED'],
   // Ownership of an internal transaction on its created date (Endpoint Mapping, exact token).
   OWNERSHIP_STATUS: ['MAPPED', 'UNASSIGNED_ENDPOINT'],
+  // Exact internal <-> provider reconciliation outcome (Payment Matches).
+  RECONCILIATION_STATUS: ['MATCHED', 'AMOUNT_MISMATCH', 'MISSING_PROVIDER', 'MISSING_INTERNAL'],
 });
 
 /** Number of endpoint_<N>_name / endpoint_<N>_key pairs in Sellers (schema-only to extend). */
@@ -310,18 +312,31 @@ const SCHEMA = Object.freeze([
   },
   {
     sheet: SHEETS.PAYMENT_MATCHES,
-    description: 'Links internal transactions to external payment transactions. Rows are never deleted; ' +
-      'un-matching sets match_status = REVERSED. At most one CONFIRMED row per ' +
-      'payment_source + external_transaction_id.',
+    description: 'Exact internal <-> provider reconciliation: one row per (payment_source, transaction id) in ' +
+      'the union of Transactions and Provider Transactions. match_id = PM-<sha256(payment_source|id)> is ' +
+      'stable across status changes. Exact key + currency + amount (< 0.005) only; no fallback matching. ' +
+      'Source of truth for reconciliation (Transactions.status is not changed here). Rows are never deleted.',
     columns: [
       col_('match_id', T.ID),
-      col_('internal_transaction_id', T.ID),
       col_('payment_source', T.ENUM, ENUMS.PAYMENT_SOURCE),
+      col_('internal_transaction_id', T.ID),
       col_('external_transaction_id', T.ID),
+      col_('provider_transaction_id', T.ID),
+      col_('provider_id', T.ID),
+      col_('reconciliation_status', T.ENUM, ENUMS.RECONCILIATION_STATUS),
       col_('match_type', T.ENUM, ENUMS.MATCH_TYPE),
       col_('match_status', T.ENUM, ENUMS.MATCH_STATUS),
+      col_('internal_currency', T.TEXT),
+      col_('provider_currency', T.TEXT),
+      col_('internal_amount', T.AMOUNT),
+      col_('provider_gross_amount', T.AMOUNT),
+      col_('amount_difference', T.AMOUNT4),
+      col_('provider_external_status', T.TEXT),
+      col_('internal_source_fingerprint', T.ID),
+      col_('provider_source_fingerprint', T.ID),
       col_('matched_at', T.DATETIME),
       col_('matched_by', T.TEXT),
+      col_('updated_at', T.DATETIME),
       col_('notes', T.TEXT),
     ],
   },
