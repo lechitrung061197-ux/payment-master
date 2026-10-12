@@ -57,7 +57,7 @@ src/
   SellerBalances.gs             Derived per-seller balances (+ read-only freshness for downstream gates)
   SellerPayoutAllocations.gs    Seller Payout Allocations: obligations, validation, derived states, FIFO
   SellerDestinations.gs         Seller child spreadsheet destinations (validation, initial seed)
-  SellerOutput.gs               Seller output contract v2: template anchors, validation, model, checksums
+  SellerOutput.gs               Seller output contract (schema 3): template anchors, validation, model, checksums
   SellerSheets.gs               Seller child sheet sync / verify (owned-range renderer, _Sync commit)
   SellerProvisioning.gs         Template-based seller sheet provisioning + Seller Sheets menu helpers
   Main.gs           Public entry points
@@ -741,7 +741,7 @@ without writing while any upstream step is stale.
   CONFIRMED; 5) `normalizeSellerBalances`; 6) `syncSellerSheets`; 7) PhieuDoiSoat section D shows each
   settlement and seller credit as PAID / PARTIAL / UNPAID.
 
-## Seller child sheets (Phase 2K, output contract v2)
+## Seller child sheets (Phase 2K + 2L, seller output schema version 3)
 
 Seller child spreadsheets are **output-only projections**. Payment Master stays the sole accounting
 source of truth: it computes and snapshots provider gross, processing fee, net, seller fee rate, seller
@@ -749,32 +749,38 @@ fee, seller hold, seller amount, settlement / payout state and adjustments; the 
 those values and is never read back into Master. No provider trace = no provider economics; no
 confirmed provider settlement = no seller available balance; MATCHED ≠ AVAILABLE.
 
-**Output contract (seller output schema version 2)** — exactly four visible tabs from the template plus
-one hidden system tab:
+**Output contract (seller output schema version 3, current)** — exactly four visible tabs from the template
+plus one hidden system tab (version 2 was the Phase 2K contract; version 3 adds the Phase 2L
+allocation-aware PhieuDoiSoat section D):
 
 | Tab | Content (owned ranges only) |
 | --- | --- |
 | `DoiSoat_GD` | One row per seller internal transaction (header row 6, data from row 7): status (Khớp / Lệch số tiền / Thiếu trên cổng), payment source, internal order data and, for MATCHED legs, provider gross, processing fee, net, frozen `seller_fee_rate`, seller fee, seller hold, settlement dates / status and seller amount. MISSING_PROVIDER rows keep every provider / seller / settlement field blank. |
 | `TongHop_Thang` | One row per month, all payment sources together. Transaction month: count, distinct sources, gross / processing fee / net, `Phí VNS` = SUM of frozen leg `seller_fee` (never net × one rate). Provider-paid (AVAILABLE) month — the Seller Balances recognition point: available seller, hold created and the month-end hold balance; actual HOLD_RELEASE by its effective date. Also disputes, effective payouts, adjustments, balance, known obligation. Rows are inserted before the `Logic:` footer when needed. |
-| `PhieuDoiSoat` | (Output schema 3: section D settlement rows are allocation-aware — see below.) Seller + period; "Chưa đối soát / chưa tính" (internal order amount and count of transactions without provider economics) and "Hold đang giữ" (Seller Balances hold) — never added together; A: known economics per payment source (rate shown only when exactly one rate applies); B: seller-only payable from AVAILABLE legs, hold releases, refunds / disputes, APPLIED adjustments, effective payouts → current balance and hold; C: counts / internal amounts by reconciliation status; D: chronological seller-only ledger of paid settlements (seller share only, labelled by provider, e.g. `PAYPAL #1`, `STRIPE #1`), adjustments (by type) and SENT / CONFIRMED payouts (`Payout`). |
+| `PhieuDoiSoat` | Seller + period; "Chưa đối soát / chưa tính" (internal order amount and count of transactions without provider economics) and "Hold đang giữ" (Seller Balances hold) — never added together; A: known economics per payment source (rate shown only when exactly one rate applies); B: seller-only payable from AVAILABLE legs, hold releases, refunds / disputes, APPLIED adjustments, effective payouts → current balance and hold; C: counts / internal amounts by reconciliation status; D: chronological seller-only ledger of paid settlements (seller share only, labelled by provider and payment state, e.g. `PAYPAL #1 · PAID`, `STRIPE #1 · UNPAID`), adjustments (positive credits with a payment state, e.g. `HOLD_RELEASE · PARTIAL`; negative ones by type) and SENT / CONFIRMED payouts (`Payout`) — see section D below. |
 | `Dispute` | Canonical Master disputes attributable to the seller (no buyer data, no internal notes); clean headers when none. |
 | `_Sync` (hidden) | `output_schema_version, seller_id, seller_name, master_schema_version, synced_at`, the four tab checksums and a combined checksum — the commit marker. No Master ID, tokens or PII. |
 
-**Output schema 3 (Phase 2L)** — PhieuDoiSoat section D, same template geometry, column I renamed
-**`Còn nợ` → `Chưa payout`**: a settlement row shows `Phát sinh phải trả` = this seller's due (frozen
-Settlement Items), `Đã payout seller (USD)` = effective allocations to it, `Chưa payout` = the cash of that
-obligation not yet allocated to an effective payout, and the label `<source> #<n> · PAID | PARTIAL | UNPAID`;
-a positive APPLIED adjustment row works the same way (`HOLD_RELEASE · UNPAID`, …: due = amount). Negative
-adjustment rows and `Payout` rows leave `Chưa payout` blank. `Tổng phải trả` (G) is the running balance
-after every row. `Chưa payout` is cash attribution, **not** the seller's debt: Section B `CÒN NỢ SAU THANH
-TOÁN (USD)` remains the authoritative accounting balance (example above: `PAYPAL #1 · PARTIAL` 100 / 80 /
-20, `REFUND` −20, `Payout` 80, Section B = 0). Existing children that still show `Còn nợ` are migrated by
-the next sync (that one header value cell only, no formatting); a template must already say `Chưa payout`
-(update the live template before provisioning new sellers). `Payout` rows still show each actual SENT /
-CONFIRMED transfer (running balance in `Còn nợ`). Allocations have no balance effect, so nothing is
-deducted twice; TongHop_Thang `Đã payout seller` and section B keep using actual Seller Payouts. Existing
-schema-2 children are upgraded in place by the next sync (owned content + `_Sync` only; no reclone, no
-formatting writes).
+**PhieuDoiSoat section D (output schema 3, Phase 2L)** — same template geometry; column I is
+**`Chưa payout`** (it was `Còn nợ` in the template before Phase 2L):
+
+| Column | Settlement row / positive APPLIED adjustment row (payout obligation) | Negative adjustment row | `Payout` row |
+| --- | --- | --- | --- |
+| A `Lần` | `<source> #<n> · PAID / PARTIAL / UNPAID`, or `<adjustment_type> · …` | adjustment type | `Payout` |
+| E `Phát sinh phải trả` | due (settlement: this seller's frozen Settlement Items; adjustment: its amount) | the (negative) amount | 0 |
+| G `Tổng phải trả` | chronological running seller accounting balance after the row | same | same |
+| H `Đã payout seller (USD)` | effective allocations to this obligation | 0 | the actual SENT / CONFIRMED payout amount |
+| I `Chưa payout` | cash-attribution remainder of this obligation (due − effective allocations) | blank | blank |
+
+`Chưa payout` is cash attribution only, **not** the seller's debt. Section B `CÒN NỢ SAU THANH TOÁN (USD)`
+remains the authoritative current accounting balance. Example: settlement 100, refund −20, payout 80
+allocated to the settlement → `PAYPAL #1 · PARTIAL` 100 / 80 / 20, `REFUND` −20, `Payout` 80, and Section B
+= 0. Allocations have no balance effect (the running balance moves only with settlements, adjustments and
+actual payouts), so nothing is deducted twice; TongHop_Thang `Đã payout seller` and section B keep using
+actual Seller Payouts. Existing schema-2 children are upgraded in place by the next sync (owned content +
+`_Sync` only; no reclone, no formatting writes); a child that still shows `Còn nợ` in section D gets that
+one header value cell migrated to `Chưa payout`. A template must already say `Chưa payout` (update the live
+template before provisioning new sellers).
 
 **Template preflight** (`createSellerSheet` before cloning, every sync before writing): the four tabs
 exist and are visible; no other tab (RAW_KH / RAW_PP, the old Phase 2K tabs or anything unknown —
