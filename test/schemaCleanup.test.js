@@ -68,8 +68,8 @@ function fakeSpreadsheet(tabs, namedRanges) {
 const legacyTab = (...rows) => [LEGACY_HEADER.slice(), ...rows];
 const run = (f) => { const warnings = []; const result = js(H.removeLegacyTabs_(f.ss, warnings)); return { result, warnings: js(warnings) }; };
 
-test('schema v17: Source Payments and its enum are gone; every required tab and the Dashboard stay', () => {
-  assert.equal(ev('APP.SCHEMA_VERSION'), 17);
+test('schema v17+: Source Payments and its enum are gone; every required tab and the Dashboard stay', () => {
+  assert.ok(ev('APP.SCHEMA_VERSION') >= 17, 'v17 removed the tab; later versions keep it removed');
   const names = Object.values(ev('SHEETS'));
   assert.ok(!names.includes(LEGACY), 'not in SHEETS');
   assert.ok(!ev('SCHEMA').some((t) => t.sheet === LEGACY), 'not in SCHEMA');

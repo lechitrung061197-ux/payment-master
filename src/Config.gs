@@ -9,7 +9,7 @@
 
 const APP = Object.freeze({
   NAME: 'Payment Master',
-  SCHEMA_VERSION: 17,
+  SCHEMA_VERSION: 18,
   LOCALE: 'en_US',
   TIMEZONE: 'America/New_York',
   DEFAULT_CURRENCY: 'USD',
@@ -99,6 +99,7 @@ const SELLER_ENDPOINT_SLOTS = 10;
 
 /** Tab names, in display order. */
 const SHEETS = Object.freeze({
+  OPERATIONS: 'Operations',
   SETTINGS: 'Settings',
   SELLERS: 'Sellers',
   SELLER_TERMS: 'Seller Terms',
@@ -146,7 +147,7 @@ function sellerEndpointColumns_(count) {
 
 /**
  * Data table schemas. Every table has a single, stable header row (row 1).
- * Dashboard is a layout tab, not a data table, and is defined in Setup.gs.
+ * Dashboard and Operations are layout tabs, not data tables (Setup.gs / Operations.gs); nothing reads them as a source.
  */
 const SCHEMA = Object.freeze([
   {

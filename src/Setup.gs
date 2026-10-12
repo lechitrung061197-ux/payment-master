@@ -48,6 +48,7 @@ function runSetup_() {
   SCHEMA.forEach(function (table) { ensureTable_(ss, table, warnings, migratedTabs); });
   ensureRawTargetTabs_(ss);
   ensureDashboard_(ss);
+  ensureOperationsLayout_(ss); // layout only: never changes tab visibility or operator input
   orderSheets_(ss);
   const oldSchemaVersion = readSettingValue_(ss, 'schema_version');
   const renamedKeys = migrateSettingKeys_(ss, warnings);

@@ -29,7 +29,6 @@ const SELLER_PROVISIONING = Object.freeze({
   folderSetting: 'seller_output_folder_id',
   driveIdPattern: /^[A-Za-z0-9_-]{20,}$/,
   spreadsheetMimeType: 'application/vnd.google-apps.spreadsheet',
-  menuTitle: 'Seller Sheets',
   autoCreatedNote: 'Auto-created by seller sheet provisioning',
 });
 

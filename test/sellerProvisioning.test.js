@@ -366,16 +366,19 @@ function fakeUi(button, text) {
     Button: { OK: 'OK', CANCEL: 'CANCEL' }, ButtonSet: { OK_CANCEL: 'OK_CANCEL', OK: 'OK' },
     prompt: (title, msg) => { env.prompts.push(msg); return { getSelectedButton: () => button, getResponseText: () => text }; },
     alert: (title, msg) => { env.alerts.push(msg); },
-    createMenu: (name) => { const m = { name, items: [], addItem: (l, fn) => { m.items.push([l, fn]); return m; }, addToUi: () => { env.menu = m; } }; return m; },
+    createMenu: (name) => { const m = { name, items: [], subMenus: [], addItem: (l, fn) => { m.items.push([l, fn]); return m; },
+      addSubMenu: (sub) => { m.subMenus.push(sub); return m; }, addToUi: () => { env.menu = m; } }; return m; },
   };
   context.SpreadsheetApp.getUi = () => ui;
 }
 
-test('menu: onOpen adds the Seller Sheets menu; Create Seller Sheet prompts, calls createSellerSheet and alerts the URL', () => {
+test('menu: onOpen keeps the seller sheet actions (Payment Master > Sellers); Create Seller Sheet prompts, calls createSellerSheet and alerts the URL', () => {
   install();
   fakeUi('OK', '  CUS001 ');
   H.onOpen();
-  assert.deepEqual(js(env.menu.items), [['Create Seller Sheet', 'menuCreateSellerSheet'], ['Sync All Seller Sheets', 'menuSyncSellerSheets'],
+  assert.equal(env.menu.name, 'Payment Master');
+  const sellers = env.menu.subMenus.find((m) => m.name === 'Sellers');
+  assert.deepEqual(js(sellers.items), [['Create Seller Sheet', 'menuCreateSellerSheet'], ['Sync Seller Sheets', 'menuSyncSellerSheets'],
     ['Verify Seller Sheets', 'menuVerifySellerSheets']]);
   const r = js(H.menuCreateSellerSheet());
   assert.equal(r.status, 'SUCCESS');

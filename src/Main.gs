@@ -360,12 +360,29 @@ function syncSellerSheet(sellerId) {
  * Master menu
  * ------------------------------------------------------------------------- */
 
-/** Simple trigger: adds the "Seller Sheets" menu to the Master spreadsheet. */
+/** Simple trigger: the "Payment Master" menu (sync, payouts, seller sheets, views). */
 function onOpen() {
-  SpreadsheetApp.getUi().createMenu(SELLER_PROVISIONING.menuTitle)
-    .addItem('Create Seller Sheet', 'menuCreateSellerSheet')
-    .addItem('Sync All Seller Sheets', 'menuSyncSellerSheets')
-    .addItem('Verify Seller Sheets', 'menuVerifySellerSheets')
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('Payment Master')
+    .addSubMenu(ui.createMenu('Sync')
+      .addItem('Run Full Sync', 'menuRunFullSync')
+      .addItem('Verify Health', 'menuVerifyHealth')
+      .addItem('Sync Seller Sheets', 'menuSyncSellerSheets'))
+    .addSubMenu(ui.createMenu('Payouts')
+      .addItem('Refresh Operations', 'menuRefreshOperations')
+      .addItem('Create Draft + FIFO', 'menuCreateDraftPayout')
+      .addItem('Mark Selected SENT', 'menuMarkSelectedPayoutSent')
+      .addItem('Mark Selected CONFIRMED', 'menuMarkSelectedPayoutConfirmed')
+      .addItem('Cancel Selected DRAFT', 'menuCancelSelectedPayout')
+      .addItem('Reverse Selected Payout', 'menuReverseSelectedPayout')
+      .addItem('Verify Seller Payouts', 'menuVerifySellerPayouts'))
+    .addSubMenu(ui.createMenu('Sellers')
+      .addItem('Create Seller Sheet', 'menuCreateSellerSheet')
+      .addItem('Sync Seller Sheets', 'menuSyncSellerSheets')
+      .addItem('Verify Seller Sheets', 'menuVerifySellerSheets'))
+    .addSubMenu(ui.createMenu('View')
+      .addItem('Operator View', 'menuApplyOperatorView')
+      .addItem('Technical View', 'menuApplyTechnicalView'))
     .addToUi();
 }
 
@@ -424,7 +441,11 @@ function verifySellerPayoutAllocations() {
 
 /** Runs the whole pipeline once (trigger handler; also safe to run manually). Skips if another run holds the lock. */
 function runScheduledPaymentPipeline(e) {
+  let hidden = [];
+  try { hidden = hiddenOperationsTabs_(getSpreadsheet_()); } catch (err) { hidden = []; }
   const result = runPaymentPipeline_({ trigger: e && e.triggerUid ? 'time-driven' : 'manual' });
+  // Outside the stages: keep hidden tabs hidden (a swap shows the tab it rewrites) and refresh Operations. Best effort.
+  afterPaymentPipelineRun_(hidden);
   Logger.log(JSON.stringify(result, null, 2));
   return result;
 }
@@ -448,4 +469,165 @@ function verifyPaymentPipelineHealth() {
   const report = buildPaymentPipelineHealth_();
   Logger.log(JSON.stringify(report, null, 2));
   return report;
+}
+
+/* ---------------------------------------------------------------------------
+ * Operations tab: operator view of the canonical ledger + controlled Seller Payout operations
+ * ------------------------------------------------------------------------- */
+
+/** Re-renders the Operations tab from the canonical Master tabs (writes the Operations tab only). */
+function refreshOperations() {
+  const result = runRefreshOperations_();
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** Creates one DRAFT Seller Payout from the Operations form and allocates it FIFO (no financial effect). */
+function createDraftSellerPayoutFromOperations() {
+  const result = runCreateDraftFromOperations_();
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** DRAFT -> SENT for the payout selected in the Operations payouts table (validated; reduces the seller balance once). */
+function markSelectedSellerPayoutSent() {
+  const result = runSellerPayoutTransition_(readSelectedOperationsPayout_, 'SENT', '');
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** SENT -> CONFIRMED for the selected payout (no second deduction). */
+function markSelectedSellerPayoutConfirmed() {
+  const result = runSellerPayoutTransition_(readSelectedOperationsPayout_, 'CONFIRMED', '');
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** DRAFT -> CANCELLED for the selected payout (allocations kept as audit trail; they no longer claim obligations). */
+function cancelSelectedSellerPayout(reason) {
+  const result = runSellerPayoutTransition_(readSelectedOperationsPayout_, 'CANCELLED', reason || '');
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** SENT / CONFIRMED -> REVERSED for the selected payout; reason required. Restores the balance; nothing is deleted. */
+function reverseSelectedSellerPayout(reason) {
+  const result = runSellerPayoutTransition_(readSelectedOperationsPayout_, 'REVERSED', reason || '');
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** Shows the operator tabs and hides the technical ones (Master tabs only; staging always hidden). */
+function applyOperatorView() {
+  const result = runApplyOperationsView_('OPERATOR');
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** Shows every Master tab (staging stays hidden). */
+function applyTechnicalView() {
+  const result = runApplyOperationsView_('TECHNICAL');
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** UI alert; the Master, provider-source, template and folder IDs are never shown. */
+function operationsAlert_(title, text) {
+  const ui = SpreadsheetApp.getUi();
+  ui.alert(title, sanitizeSellerAlertText_(String(text), sellerAlertHiddenIds_()), ui.ButtonSet.OK);
+}
+
+/** Menu: runs the full pipeline once and shows the outcome. */
+function menuRunFullSync() {
+  const r = runScheduledPaymentPipeline();
+  operationsAlert_('Run Full Sync', r.status + (r.failed_stage ? ' at ' + r.failed_stage : '') + (r.error ? '\n' + r.error : '') + '\n' +
+    r.stages.map(function (x) { return x.stage + ': ' + x.status; }).join('\n'));
+  return r;
+}
+
+/** Menu: pipeline health (read-only report, audited and shown in Operations). */
+function menuVerifyHealth() {
+  const r = runOperatorHealthCheck_();
+  const failed = r.checks.filter(function (c) { return !c.pass; }).map(function (c) { return c.name + ': ' + c.detail; }).concat(r.errors);
+  operationsAlert_('Verify Health', (r.pass ? 'PASS' : 'FAIL') + ' (' + r.checks.length + ' checks)' + (failed.length ? '\n' + failed.slice(0, 10).join('\n') : ''));
+  return r;
+}
+
+function menuRefreshOperations() {
+  const r = refreshOperations();
+  operationsAlert_('Refresh Operations', r.status + (r.error ? '\n' + r.error : '') + (r.problems && r.problems.length ? '\n' + r.problems.join('\n') : ''));
+  return r;
+}
+
+function menuCreateDraftPayout() {
+  const r = createDraftSellerPayoutFromOperations();
+  operationsAlert_('Create Draft + FIFO', formatOperationsAlert_(r));
+  return r;
+}
+
+/** Shared menu flow for a selected payout: read the selection (read-only), confirm, then run the guarded operation. */
+function menuSelectedPayoutAction_(title, question, needsReason, run) {
+  const ui = SpreadsheetApp.getUi();
+  let selected;
+  try {
+    selected = readSelectedOperationsPayout_(getSpreadsheet_());
+  } catch (err) {
+    operationsAlert_(title, err.message);
+    return null;
+  }
+  let reason = '';
+  if (needsReason) {
+    const response = ui.prompt(title, question.replace('%s', selected.payout_id) + '\n\nReason' + (needsReason === 'required' ? ' (required):' : ' (optional):'),
+      ui.ButtonSet.OK_CANCEL);
+    if (response.getSelectedButton() !== ui.Button.OK) return null;
+    reason = String(response.getResponseText()).trim();
+    if (needsReason === 'required' && reason === '') {
+      operationsAlert_(title, 'A reason is required; nothing changed.');
+      return null;
+    }
+  } else if (ui.alert(title, question.replace('%s', selected.payout_id), ui.ButtonSet.YES_NO) !== ui.Button.YES) {
+    return null;
+  }
+  const r = run(reason);
+  operationsAlert_(title, formatOperationsAlert_(r));
+  return r;
+}
+
+function menuMarkSelectedPayoutSent() {
+  return menuSelectedPayoutAction_('Mark Selected SENT', 'Mark %s SENT? This records that the money was sent and reduces the seller balance.',
+    false, function () { return markSelectedSellerPayoutSent(); });
+}
+
+function menuMarkSelectedPayoutConfirmed() {
+  return menuSelectedPayoutAction_('Mark Selected CONFIRMED', 'Mark %s CONFIRMED (receipt confirmed)? The balance is not reduced again.',
+    false, function () { return markSelectedSellerPayoutConfirmed(); });
+}
+
+function menuCancelSelectedPayout() {
+  return menuSelectedPayoutAction_('Cancel Selected DRAFT', 'Cancel DRAFT %s? It has no financial effect; its allocations stop claiming obligations.',
+    'optional', function (reason) { return cancelSelectedSellerPayout(reason); });
+}
+
+function menuReverseSelectedPayout() {
+  return menuSelectedPayoutAction_('Reverse Selected Payout', 'Reverse %s? The seller balance and obligation statuses are restored; nothing is deleted.',
+    'required', function (reason) { return reverseSelectedSellerPayout(reason); });
+}
+
+function menuVerifySellerPayouts() {
+  const r = verifySellerPayoutAllocations();
+  operationsAlert_('Verify Seller Payouts', (r.pass ? 'PASS' : 'FAIL') + '\nEffective payouts: ' + r.effective_payout_count +
+    '\nObligation statuses: ' + JSON.stringify(r.payment_status_counts) + (r.errors.length ? '\n' + r.errors.slice(0, 5).join('\n') : ''));
+  return r;
+}
+
+function menuApplyOperatorView() {
+  const r = applyOperatorView();
+  operationsAlert_('Operator View', r.status + (r.error ? '\n' + r.error : '\nHidden: ' + r.hidden.length + ' tab(s)'));
+  return r;
+}
+
+function menuApplyTechnicalView() {
+  const r = applyTechnicalView();
+  operationsAlert_('Technical View', r.status + (r.error ? '\n' + r.error : '\nShown: ' + r.shown.length + ' tab(s)'));
+  return r;
 }

@@ -60,9 +60,11 @@ src/
   SellerOutput.gs               Seller output contract (schema 4): template anchors, validation, model, checksums
   PaymentPipeline.gs            Scheduled twice-daily pipeline, health gates, trigger installer
   SellerSheets.gs               Seller child sheet sync / verify (owned-range renderer, _Sync commit)
-  SellerProvisioning.gs         Template-based seller sheet provisioning + Seller Sheets menu helpers
-  Main.gs           Public entry points
-test/               Node unit tests for pure helpers (npm test, not pushed)
+  SellerProvisioning.gs         Template-based seller sheet provisioning + seller-sheet menu helpers
+  Operations.gs                 Operations tab (operator view + payout form) and controlled payout transitions
+  Main.gs           Public entry points and the "Payment Master" menu
+test/               Node tests (npm test, not pushed); test/helpers/masterSim.js = production-shaped
+                    end-to-end Master simulation used by the integration tests
 ```
 
 `rootDir` is `.` (not `src`) because clasp 3.4.0 resolves `rootDir` twice on
@@ -94,10 +96,14 @@ from the Apps Script editor. `setupMaster` never deletes data rows or schema tab
 Schema v17 (Phase 2N) removed `Source Payments`: it never had a reader or writer (provider movements
 live in Provider Transactions / Provider Events), so `setupMaster` deletes the empty tab.
 
+Schema v18 (Phase 2O) adds the `Operations` tab (layout only, first tab). Setup never changes which tabs are
+hidden and never overwrites operator input in it.
+
 ## Master tabs
 
 | Tab | Purpose |
 | --- | --- |
+| Operations | Operator view + payout command form (not an accounting source; nothing reads it) — see "Operations" below |
 | Settings | Key/value config. Provider-scoped keys: `provider_fee_rate.<PROVIDER>`, `provider_hold_rate.<PROVIDER>`; `default_seller_hold_rate` is legacy (not used for KH001) |
 | Sellers | User-managed desired mapping: 1 row = 1 seller, endpoint_<N>_name/key pairs |
 | Seller Terms | User-edited effective-dated seller fee history per seller + payment_source (seeded once while empty) |
@@ -792,10 +798,87 @@ is skipped (`PIPELINE_SKIPPED_LOCKED`) and never runs in parallel.
   _remaining`, `adjustment_due / _paid / _remaining`, `total_payoutable_due / total_paid / total_remaining`,
   the same per seller, status counts (total and per target type), every obligation state and a report-only
   production regression (HUI settlement obligations 2132.2706 + 905.1734 = 3037.444, no payouts, no credits).
-- **Workflow**: 1) create the Seller Payout as DRAFT; 2) `autoAllocateSellerPayoutFIFO` or enter
-  allocations manually; 3) review them (`verifySellerPayoutAllocations`); 4) set the payout to SENT /
-  CONFIRMED; 5) `normalizeSellerBalances`; 6) `syncSellerSheets`; 7) PhieuDoiSoat section D shows each
-  settlement and seller credit as PAID / PARTIAL / UNPAID.
+- **Workflow**: use the Operations tab (Phase 2O, below): Create Draft + FIFO → review → Mark Selected SENT
+  (→ CONFIRMED). The manual path (`autoAllocateSellerPayoutFIFO`, editing the status in Seller Payouts, then
+  `normalizeSellerBalances` and `syncSellerSheets`) still works and is guarded by the same validation, but
+  skips the pre-write simulation of the Operations transitions.
+
+## Operations tab and seller payout operations (Phase 2O, schema v18)
+
+`Operations` is the operator's daily screen. It is a **view + command form only**: no accounting module reads
+it (balances, amounts, statuses and seller ownership always come from the canonical tabs), and after any
+operation the truth lives in Seller Payouts + Seller Payout Allocations; the tab is re-rendered from them.
+
+**Layout** (`setupMaster` writes labels / help / input formats only; operator input in column B is never
+overwritten): rows 5–16 **System status** (Master schema version, latest pipeline run + status and latest
+health check from the Audit Log, providers (enabled + raw sync), total seller available / hold (Seller Balances),
+effective payouts (SENT / CONFIRMED), DRAFT payouts, open payout obligations, ACTIVE seller destinations);
+rows 18–30 **New payout form** (Seller dropdown of ACTIVE sellers, Currency, Payout Date `dd/MM/yyyy` (a text
+cell, parsed strictly — never re-read by the en_US locale), Amount, Payout Currency, FX Rate, Payout Amount,
+Payment Method, Reference, Notes, request token, last result); from row 32 (columns A–L, rewritten on every
+refresh — keep custom notes in column N or later) **Seller payable** (one row per seller + currency:
+current_balance, seller_hold_balance, DRAFT reserved, available_to_draft, open obligations, effective paid,
+payment state) and **Recent / active payouts** (every DRAFT / SENT / CONFIRMED + the 20 latest closed ones:
+id, seller, date, amounts and currencies, method, reference, status, allocated amount, FULL / PARTIAL / NONE).
+
+- `available_to_draft = max(0, min(current_balance − DRAFT reserved, open obligations not yet claimed by a
+  DRAFT))`. DRAFT is never paid money.
+- **Refresh**: menu Refresh Operations, after every payout operation, and after every pipeline run (outside
+  the stages, best effort; it never changes the pipeline result).
+
+**Payout lifecycle** (only these transitions; payouts and allocations are never deleted, no negative payout is
+ever created):
+
+| From | To | Menu | Effect |
+| --- | --- | --- | --- |
+| (form) | DRAFT | Create Draft + FIFO | no financial effect; FIFO allocation rows claim obligations |
+| DRAFT | SENT | Mark Selected SENT | reduces the seller balance once; obligations PARTIAL / PAID |
+| SENT | CONFIRMED | Mark Selected CONFIRMED | no second deduction |
+| DRAFT | CANCELLED | Cancel Selected DRAFT | no financial effect; its allocations stay (audit trail) but stop claiming |
+| SENT / CONFIRMED | REVERSED | Reverse Selected Payout (reason required) | balance and obligation statuses restored |
+
+- **Create Draft + FIFO** (`createDraftSellerPayoutFromOperations`): Settlement Items and Seller Balances must
+  be current and the ledger valid; the form is validated (ACTIVE seller, a currency the seller has, date,
+  amount > 0; same currency → fx 1, payout currency = currency, payout amount = amount; another payout currency
+  needs an explicit FX rate and payout amount — no conversion rule is invented); amount ≤ available_to_draft and
+  ≤ payable balance as of the payout date minus other DRAFTs; the FIFO plan (`planFifoAllocation_`, oldest first)
+  must allocate it fully — all **before** one Seller Payouts row is written; then `runSellerPayoutFifo_` writes
+  the allocation rows. **Idempotency**: `seller_payout_id = SP-OPS-<sha256(request token)>`; a retry with the
+  same token returns the existing payout (`NO_CHANGE`); the token rotates and the amount fields clear only after
+  success, so a double click cannot create a second payout. If FIFO fails the DRAFT stays unallocated (no
+  financial effect, cannot be marked SENT; cancel it or retry).
+- **Before SENT** (pre-write simulation, all must hold or nothing changes): payout exists once and is DRAFT;
+  Settlement Items + Seller Balances current; the current ledger is valid; known seller, currency, positive
+  amount, valid payout date, consistent fx / payout amount; the payout fully allocated; the ledger with the payout
+  as SENT has no error (no over-allocation, no over-paid obligation, no cross-seller / currency / source
+  mismatch, every target available by the payout date, payable balance ≥ 0 as of every effective payout date);
+  the Seller Balances rebuild with it has no error. CONFIRMED and REVERSED use the same simulation.
+- **After SENT / CONFIRMED / REVERSED**: `normalizeSellerBalances`, ledger re-verification (derived
+  UNPAID / PARTIAL / PAID), pipeline health, then `syncSellerSheet` of the **affected seller only** (when it has
+  an ACTIVE destination and health passes), Operations refresh, audit. A failing follow-up leaves the recorded
+  status and reports `PARTIAL` (run the pipeline to finish).
+- **Selection**: transitions act on the selected row of the Operations payouts table. Another tab, a non-payout
+  row, several rows, or a row whose status no longer matches Seller Payouts (stale view) → alert, nothing changed.
+- **Locking**: every operation holds the **document lock** (the scheduled pipeline's outer lock) and the reused
+  runners keep their script lock inside (DocumentLock → ScriptLock, the pipeline's order). Busy →
+  `SKIPPED_LOCKED`, nothing changed; the pipeline likewise skips while an operation runs.
+- **Audit**: `SELLER_PAYOUT_DRAFT_CREATED`, `SELLER_PAYOUT_SENT`, `_CONFIRMED`, `_CANCELLED`, `_REVERSED`
+  (old / new status; payout id, seller, currency, amount, payout currency / amount, fx, date, method, reference,
+  allocation targets, reason, follow-up results), `SELLER_PAYOUT_OPERATION_FAILED` (validation error),
+  `SELLER_PAYOUT_OPERATION_SKIPPED_LOCKED`, plus the reused runners' own rows.
+
+**Menu `Payment Master`**: Sync (Run Full Sync, Verify Health, Sync Seller Sheets) · Payouts (Refresh
+Operations, Create Draft + FIFO, Mark Selected SENT / CONFIRMED, Cancel Selected DRAFT, Reverse Selected Payout,
+Verify Seller Payouts) · Sellers (Create Seller Sheet, Sync Seller Sheets, Verify Seller Sheets) · View
+(Operator View, Technical View).
+
+**Views** (menu only; `setupMaster` never changes visibility): **Operator View** shows Operations, Dashboard,
+Sellers, Seller Terms, Seller Destinations, Seller Payouts, Adjustments, Disputes and hides every other Master
+tab (raw, canonical engine tables, Seller Payout Allocations, Import Batches, Settings, Audit Log); **Technical
+View** shows every Master tab. `__STAGE_*` tabs always stay hidden and custom (non-Master) tabs are never touched.
+Hidden state never affects code (tabs are found by name). Because a crash-safe swap shows the tab it rewrites,
+pipeline runs and payout operations re-hide the tabs that were hidden before they started, so the chosen view
+survives them.
 
 ## Seller child sheets (Phase 2K + 2L + 2M, seller output schema version 4)
 
@@ -910,8 +993,8 @@ formats, locale and time zone are all kept — nothing is rebuilt or forced), an
 writes only the owned ranges. `syncSellerSheet(sellerId)` syncs exactly one ACTIVE destination with
 the same guards and never touches another seller.
 
-**Menu**: `onOpen` adds **Seller Sheets** → Create Seller Sheet (prompts for the seller ID, lists
-INACTIVE sellers, shows the result and the sheet URL), Sync All Seller Sheets, Verify Seller Sheets.
+**Menu**: `Payment Master` → **Sellers** → Create Seller Sheet (prompts for the seller ID, lists
+INACTIVE sellers, shows the result and the sheet URL), Sync Seller Sheets, Verify Seller Sheets.
 Alerts never show the Master, provider-source, template or folder IDs. The manifest therefore also
 requests the `drive` and `script.container.ui` scopes (re-authorization needed after deploy).
 
