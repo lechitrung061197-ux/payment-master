@@ -226,7 +226,7 @@ function operationsPayoutMatchesForm_(payout, parsed, dateKeyOf) {
     sellerDateKeyOrNull_(payout.payout_date, dateKeyOf || masterDateKey_) === parsed.payout_key && same(payout.amount, parsed.amount) &&
     trimmedText_(payout.payout_currency) === parsed.payout_currency && same(payout.fx_rate, parsed.fx_rate) &&
     same(payout.payout_amount, parsed.payout_amount) && trimmedText_(payout.payment_method) === parsed.payment_method &&
-    trimmedText_(payout.reference) === parsed.reference;
+    trimmedText_(payout.reference) === parsed.reference && trimmedText_(payout.notes) === parsed.notes;
 }
 
 /**
@@ -504,7 +504,7 @@ function ensureOperationsLayout_(ss) {
   sheet.getRange(O.formStartRow, 1, O.formFields.length, 1).setValues(O.formFields.map(function (f) { return [f[1]]; }));
   sheet.getRange(O.formStartRow, 3, O.formFields.length, 1).setValues(O.formFields.map(function (f) { return [f[2]]; })).setFontColor('#666666');
   sheet.getRange(O.tokenRow, 1, 2, 1).setValues([[O.tokenLabel], [O.resultLabel]]);
-  sheet.getRange(O.tokenRow, 3).setValue('Changes after each created payout; a retry with the same token never creates a second payout.').setFontColor('#666666');
+  sheet.getRange(O.tokenRow, 3).setValue('Changes only after this request\'s DRAFT is created AND fully allocated (or via Payouts > New Payout Request); a retry with the same token never creates a second payout.').setFontColor('#666666');
   const row = function (key) { return O.formStartRow + O.formFields.map(function (f) { return f[0]; }).indexOf(key); };
   sheet.getRange(row('payout_date'), 2).setNumberFormat('@'); // typed dd/MM/yyyy stays text: never re-parsed by the en_US locale
   sheet.getRange(row('amount'), 2).setNumberFormat(FORMATS.AMOUNT4);
@@ -604,10 +604,10 @@ function renderOperations_(ss, lastResult) {
   }
   const dateCell = sheet.getRange(fieldRow('payout_date'), 2);
   if (trimmedText_(dateCell.getValue()) === '') dateCell.setValue(formatOperationsDate_(masterDateKey_(now)));
+  // Only a blank token is generated here. A non-blank token is the retry identity of the current request and is rotated
+  // only by the create operation (after DRAFT + full FIFO allocation) or the explicit New Payout Request reset.
   const tokenCell = sheet.getRange(O.tokenRow, 2);
-  const token = trimmedText_(tokenCell.getValue());
-  const used = ledger && ledger.payouts.some(function (p) { return trimmedText_(p.seller_payout_id) === operationsPayoutId_(token); });
-  if (token === '' || used) tokenCell.setValue(Utilities.getUuid());
+  if (trimmedText_(tokenCell.getValue()) === '') tokenCell.setValue(Utilities.getUuid());
   if (lastResult) {
     sheet.getRange(O.resultRow, 2, 1, 2).setValues([[String(lastResult.status || ''), formatOperationsAlert_(lastResult).slice(0, 900)]]);
   }
@@ -769,14 +769,30 @@ function operationsSellerIds_(ss) {
   return readSellersDraft_(ss).parsed.sellers.map(function (s) { return s.seller_id; }).filter(function (id) { return id !== ''; });
 }
 
-/** Creates one DRAFT payout from the Operations form and allocates it FIFO. Never throws. */
+function operationsFormRow_(key) {
+  return OPERATIONS.formStartRow + OPERATIONS.formFields.map(function (f) { return f[0]; }).indexOf(key);
+}
+
+/** Ends the current request: new token, amount / reference / notes cleared (seller, currency, date, method kept). */
+function rotateOperationsRequest_(sheet) {
+  ['amount', 'fx_rate', 'payout_amount', 'reference', 'notes'].forEach(function (k) { sheet.getRange(operationsFormRow_(k), 2).setValue(''); });
+  sheet.getRange(OPERATIONS.tokenRow, 2).setValue(Utilities.getUuid());
+}
+
+/**
+ * Creates one DRAFT payout from the Operations form and allocates it FIFO. Never throws.
+ * Token lifecycle: the token is the request's retry identity (seller_payout_id = SP-OPS-<sha256(token)>). It is rotated
+ * here only once the request's DRAFT exists AND is fully allocated (new request, retry that completed the allocation, or
+ * retry of an already complete request). Any failure keeps it, so the next click retries the same payout.
+ */
 function runCreateDraftFromOperations_() {
   return withOperationsLock_('CREATE_DRAFT', function (ss) {
     const sheet = operationsSheetOrThrow_(ss);
     const form = readOperationsForm_(sheet);
     if (form.token === '') throw new Error('Request token is missing; run Refresh Operations. Nothing changed.');
     const payoutId = operationsPayoutId_(form.token);
-    const result = { status: 'FAILED', operation: 'CREATE_DRAFT', seller_payout_id: payoutId, old_status: '', new_status: '', warnings: [] };
+    const result = { status: 'FAILED', operation: 'CREATE_DRAFT', seller_payout_id: payoutId, old_status: '', new_status: '', warnings: [],
+      request: 'NEW', draft_created: false };
     assertOperationsAccountingCurrent_(ss);
     let created = false;
     let payout = null;
@@ -786,14 +802,17 @@ function runCreateDraftFromOperations_() {
       const balances = readSchemaTableObjects_(ss, SHEETS.SELLER_BALANCES, sellerBalancesTab_()).rows;
       const existing = input.payouts.filter(function (p) { return trimmedText_(p.seller_payout_id) === payoutId; });
       if (existing.length > 0) {
-        // Retry of the same request: the payout exists; it must be exactly what the form says.
+        // Retry of the same request: the payout exists; it must be exactly what the form says (notes included).
+        result.request = 'RETRY';
         const lines = buildOperationsLines_({ balances: balances, states: input.validation.states, payouts: input.payouts, allocations: input.allocations });
         const parsed = parseOperationsForm_(form, { sellers: sellers, lines: lines, dateKeyOf: masterDateKey_ });
         if (existing.length > 1 || parsed.errors.length > 0 || !operationsPayoutMatchesForm_(existing[0], parsed.payout, masterDateKey_)) {
-          throw new Error('Request token already used by Seller Payout ' + payoutId + ' with other values; run Refresh Operations for a new token. Nothing changed.');
+          throw new Error('Request token already used by Seller Payout ' + payoutId + ' with other values; nothing changed. Restore the values of ' +
+            'that request to retry it, or use Payouts > New Payout Request to start a new one.');
         }
         if (trimmedText_(existing[0].status) !== SELLER_ALLOCATIONS.draftStatus) {
-          throw new Error('Seller Payout ' + payoutId + ' (this request) is already ' + existing[0].status + '; nothing changed.');
+          throw new Error('Seller Payout ' + payoutId + ' (this request) is already ' + existing[0].status +
+            '; nothing changed. Use Payouts > New Payout Request to start a new one.');
         }
         payout = existing[0];
         return;
@@ -805,31 +824,68 @@ function runCreateDraftFromOperations_() {
       appendSellerPayoutRow_(ss, plan.payout);
       payout = plan.payout;
       created = true;
+      // The canonical DRAFT row exists from here on: audit it now, before FIFO (allocation still pending).
+      operationsAudit_(OPERATIONS.auditActions.DRAFT, payoutId, '', SELLER_ALLOCATIONS.draftStatus,
+        Object.assign({ request: 'NEW', allocation_status: 'PENDING' }, operationsPayoutAuditFields_(payout, [])));
     });
+    result.draft_created = true; // a canonical DRAFT row exists (created now or by an earlier attempt of this request)
+    result.draft_created_now = created;
+    result.payout_status = SELLER_ALLOCATIONS.draftStatus;
+    result.new_status = SELLER_ALLOCATIONS.draftStatus;
     // FIFO: the existing allocator (own script lock); oldest obligation first. It never changes the payout status.
     const fifo = runSellerPayoutFifo_(payoutId);
     result.fifo_status = fifo.status;
-    result.draft_created = created;
     const after = readSellerAllocationInputs_(ss);
     const own = after.allocations.filter(function (a) { return trimmedText_(a.seller_payout_id) === payoutId; });
-    const allocated = own.reduce(function (s, a) { return s + operationsMicros_(a.allocated_amount); }, 0);
+    const allocated = own.reduce(function (sum, a) { return sum + operationsMicros_(a.allocated_amount); }, 0);
     result.allocations = own.map(function (a) { return { target_type: a.target_type, target_id: a.target_id, allocated_amount: a.allocated_amount }; });
     Object.assign(result, operationsPayoutAuditFields_(payout, own));
-    if (fifo.status === 'FAILED' || Math.abs(allocated - operationsMicros_(payout.amount)) > SELLER_ALLOCATIONS.toleranceMicros) {
+    result.allocated_amount = allocated / 1e6;
+    const full = fifo.status !== 'FAILED' && Math.abs(allocated - operationsMicros_(payout.amount)) <= SELLER_ALLOCATIONS.toleranceMicros;
+    if (!full) {
+      result.allocation_status = allocated > 0 ? 'PARTIAL' : 'NONE';
+      result.fifo_error = fifo.error || (fifo.warnings || []).join(' ') || null;
+      result.required_action = 'Fix the cause, then click Create Draft + FIFO again with the same form (same request token) to retry this DRAFT; ' +
+        'or cancel the DRAFT (Cancel Selected DRAFT) and start a New Payout Request.';
       result.error = 'DRAFT ' + payoutId + (created ? ' was created' : ' exists') + ' but is not fully allocated (' + allocated / 1e6 + ' of ' + payout.amount +
-        ')' + (fifo.error ? ': ' + fifo.error : '') + '. A DRAFT has no financial effect and cannot be marked SENT; cancel it or fix the cause and retry.';
-      result.new_status = SELLER_ALLOCATIONS.draftStatus;
-      return result;
+        ')' + (result.fifo_error ? ': ' + result.fifo_error : '') + '. It has no financial effect and cannot be marked SENT. ' + result.required_action;
+      return result; // token kept: the next click retries this same payout
     }
-    result.status = created ? 'SUCCESS' : 'NO_CHANGE';
-    result.new_status = SELLER_ALLOCATIONS.draftStatus;
+    result.allocation_status = 'FULL';
+    // NO_CHANGE: retry of a request that was already complete; SUCCESS: new DRAFT or a retry that completed the allocation.
+    result.status = !created && fifo.status === 'NO_CHANGE' ? 'NO_CHANGE' : 'SUCCESS';
     if (!created) result.warnings.push('Same request token: Seller Payout ' + payoutId + ' already exists; no second payout created.');
-    operationsAudit_(OPERATIONS.auditActions.DRAFT, payoutId, '', SELLER_ALLOCATIONS.draftStatus, Object.assign({ request: created ? 'NEW' : 'RETRY' },
-      operationsPayoutAuditFields_(payout, own)));
-    // The request is complete: rotate the token and clear the amount fields, so a second click cannot repeat it.
-    const fieldRow = function (key) { return OPERATIONS.formStartRow + OPERATIONS.formFields.map(function (f) { return f[0]; }).indexOf(key); };
-    ['amount', 'fx_rate', 'payout_amount', 'reference', 'notes'].forEach(function (k) { sheet.getRange(fieldRow(k), 2).setValue(''); });
-    sheet.getRange(OPERATIONS.tokenRow, 2).setValue(Utilities.getUuid());
+    rotateOperationsRequest_(sheet); // the request is complete: a further click cannot repeat it
+    return result;
+  });
+}
+
+/**
+ * Explicit "New Payout Request": rotates the request token and clears the amount fields. Refused while the current
+ * request's DRAFT exists but is not fully allocated (retry it, or cancel it first), so a retry identity is never lost.
+ */
+function runResetOperationsRequest_() {
+  return withOperationsLock_('NEW_REQUEST', function (ss) {
+    const sheet = operationsSheetOrThrow_(ss);
+    const token = readOperationsForm_(sheet).token;
+    const result = { status: 'SUCCESS', operation: 'NEW_REQUEST', warnings: [] };
+    if (token !== '') {
+      const payoutId = operationsPayoutId_(token);
+      const input = readSellerAllocationInputs_(ss);
+      const p = input.payouts.filter(function (x) { return trimmedText_(x.seller_payout_id) === payoutId; })[0];
+      if (p && trimmedText_(p.status) === SELLER_ALLOCATIONS.draftStatus) {
+        const allocated = input.allocations.filter(function (a) { return trimmedText_(a.seller_payout_id) === payoutId; })
+          .reduce(function (sum, a) { return sum + operationsMicros_(a.allocated_amount); }, 0);
+        if (Math.abs(allocated - operationsMicros_(p.amount)) > SELLER_ALLOCATIONS.toleranceMicros) {
+          result.status = 'FAILED';
+          result.seller_payout_id = payoutId;
+          result.error = 'The current request already created DRAFT ' + payoutId + ', which is not fully allocated (' + allocated / 1e6 + ' of ' + p.amount +
+            '). Retry it with Create Draft + FIFO, or cancel it (Cancel Selected DRAFT) first; the request token was kept.';
+          return result;
+        }
+      }
+    }
+    rotateOperationsRequest_(sheet);
     return result;
   });
 }

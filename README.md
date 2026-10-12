@@ -843,10 +843,15 @@ ever created):
   needs an explicit FX rate and payout amount — no conversion rule is invented); amount ≤ available_to_draft and
   ≤ payable balance as of the payout date minus other DRAFTs; the FIFO plan (`planFifoAllocation_`, oldest first)
   must allocate it fully — all **before** one Seller Payouts row is written; then `runSellerPayoutFifo_` writes
-  the allocation rows. **Idempotency**: `seller_payout_id = SP-OPS-<sha256(request token)>`; a retry with the
-  same token returns the existing payout (`NO_CHANGE`); the token rotates and the amount fields clear only after
-  success, so a double click cannot create a second payout. If FIFO fails the DRAFT stays unallocated (no
-  financial effect, cannot be marked SENT; cancel it or retry).
+  the allocation rows. **Idempotency**: `seller_payout_id = SP-OPS-<sha256(request token)>`; the token is the
+  request's retry identity. Only the create operation rotates it (and clears amount / reference / notes), and only
+  once the request's DRAFT exists **and is fully allocated** (new request, a retry that completed the allocation, or
+  `NO_CHANGE` retry of a complete request). Refresh only fills a blank token. If FIFO fails after the DRAFT row was
+  written, the result is FAILED, the token and form stay, and the next click retries the **same** payout (never a
+  second DRAFT); the DRAFT has no financial effect and cannot be marked SENT meanwhile. Same token with different
+  values (notes included) → rejected, nothing changed, token kept. **Payouts > New Payout Request** rotates the
+  token explicitly; it is refused while the current request's DRAFT exists but is not fully allocated (retry it or
+  cancel it first).
 - **Before SENT** (pre-write simulation, all must hold or nothing changes): payout exists once and is DRAFT;
   Settlement Items + Seller Balances current; the current ledger is valid; known seller, currency, positive
   amount, valid payout date, consistent fx / payout amount; the payout fully allocated; the ledger with the payout
@@ -862,13 +867,17 @@ ever created):
 - **Locking**: every operation holds the **document lock** (the scheduled pipeline's outer lock) and the reused
   runners keep their script lock inside (DocumentLock → ScriptLock, the pipeline's order). Busy →
   `SKIPPED_LOCKED`, nothing changed; the pipeline likewise skips while an operation runs.
-- **Audit**: `SELLER_PAYOUT_DRAFT_CREATED`, `SELLER_PAYOUT_SENT`, `_CONFIRMED`, `_CANCELLED`, `_REVERSED`
+- **Audit**: `SELLER_PAYOUT_DRAFT_CREATED` is written as soon as the canonical DRAFT row exists, before FIFO
+  (`allocation_status: PENDING`; never repeated for a retry of the same row); FIFO then writes its own
+  `SELLER_PAYOUT_ALLOCATION_FIFO_*` row. If FIFO fails, `SELLER_PAYOUT_OPERATION_FAILED` records `draft_created: true`,
+  the payout id, `payout_status: DRAFT`, the FIFO error, the allocated amount and the required action (retry). Also
+  `SELLER_PAYOUT_SENT`, `_CONFIRMED`, `_CANCELLED`, `_REVERSED`
   (old / new status; payout id, seller, currency, amount, payout currency / amount, fx, date, method, reference,
   allocation targets, reason, follow-up results), `SELLER_PAYOUT_OPERATION_FAILED` (validation error),
   `SELLER_PAYOUT_OPERATION_SKIPPED_LOCKED`, plus the reused runners' own rows.
 
 **Menu `Payment Master`**: Sync (Run Full Sync, Verify Health, Sync Seller Sheets) · Payouts (Refresh
-Operations, Create Draft + FIFO, Mark Selected SENT / CONFIRMED, Cancel Selected DRAFT, Reverse Selected Payout,
+Operations, Create Draft + FIFO, New Payout Request, Mark Selected SENT / CONFIRMED, Cancel Selected DRAFT, Reverse Selected Payout,
 Verify Seller Payouts) · Sellers (Create Seller Sheet, Sync Seller Sheets, Verify Seller Sheets) · View
 (Operator View, Technical View).
 

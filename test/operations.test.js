@@ -97,12 +97,16 @@ test('2: create DRAFT from the form: one Seller Payouts row (DRAFT) and FIFO all
   assert.ok(near(a[0].allocated_amount, firstDue) && near(a[1].allocated_amount, 100));
   assert.ok(a.every((x) => x.seller_id === 'CUS001' && x.seller_payout_id === r.seller_payout_id));
   const acts = actions(before);
-  assert.ok(acts.includes('SELLER_PAYOUT_ALLOCATION_FIFO_SUCCESS') && acts.includes('SELLER_PAYOUT_DRAFT_CREATED'));
+  assert.ok(acts.indexOf('SELLER_PAYOUT_DRAFT_CREATED') >= 0 && acts.indexOf('SELLER_PAYOUT_DRAFT_CREATED') < acts.indexOf('SELLER_PAYOUT_ALLOCATION_FIFO_SUCCESS'),
+    'DRAFT_CREATED is written as soon as the canonical row exists, before FIFO');
+  assert.equal(acts.filter((a) => a === 'SELLER_PAYOUT_DRAFT_CREATED').length, 1);
   const created = sim.audit().find((x) => x.action === 'SELLER_PAYOUT_DRAFT_CREATED');
   const d = JSON.parse(created.details);
-  assert.deepEqual([d.seller_payout_id, d.seller_id, d.currency, d.payout_currency, d.payment_method, d.reference, d.allocation_targets.length],
-    [r.seller_payout_id, 'CUS001', 'USD', 'USD', 'Bank transfer', 'REF-CUS001-' + (firstDue + 100), 2]);
+  assert.deepEqual([d.seller_payout_id, d.seller_id, d.currency, d.payout_currency, d.payment_method, d.reference, d.allocation_status, d.request],
+    [r.seller_payout_id, 'CUS001', 'USD', 'USD', 'Bank transfer', 'REF-CUS001-' + (firstDue + 100), 'PENDING', 'NEW']);
   assert.equal(created.new_status, 'DRAFT');
+  assert.equal(r.allocation_status, 'FULL');
+  assert.equal(JSON.parse(sim.audit().find((x) => x.action === 'SELLER_PAYOUT_ALLOCATION_FIFO_SUCCESS').details).rows.length, 2);
   assert.equal(sim.formValue('amount'), '', 'amount cleared after success');
 });
 
@@ -491,7 +495,7 @@ test('menu: one "Payment Master" menu (Sync / Payouts / Sellers / View); every h
   assert.equal(ui.menu.name, 'Payment Master');
   assert.deepEqual(ui.menu.subs.map((m) => [m.name, m.items.map((i) => i[0])]), [
     ['Sync', ['Run Full Sync', 'Verify Health', 'Sync Seller Sheets']],
-    ['Payouts', ['Refresh Operations', 'Create Draft + FIFO', 'Mark Selected SENT', 'Mark Selected CONFIRMED', 'Cancel Selected DRAFT', 'Reverse Selected Payout', 'Verify Seller Payouts']],
+    ['Payouts', ['Refresh Operations', 'Create Draft + FIFO', 'New Payout Request (reset form)', 'Mark Selected SENT', 'Mark Selected CONFIRMED', 'Cancel Selected DRAFT', 'Reverse Selected Payout', 'Verify Seller Payouts']],
     ['Sellers', ['Create Seller Sheet', 'Sync Seller Sheets', 'Verify Seller Sheets']],
     ['View', ['Operator View', 'Technical View']]]);
   ui.menu.subs.forEach((m) => m.items.forEach(([, fn]) => assert.equal(typeof sim.ctx[fn], 'function', fn)));
@@ -509,4 +513,89 @@ test('menu: one "Payment Master" menu (Sync / Payouts / Sellers / View); every h
   assert.equal(payouts()[0].status, 'SENT');
   assert.ok(alerts.every(([, m]) => !m.includes(sim.MASTER_ID) && !m.includes(sim.TEMPLATE_ID)), 'IDs never shown');
   delete sim.M.globals.SpreadsheetApp.getUi;
+});
+
+// ------------------------------------------------------------------ 2O.1: token lifecycle on a partial DRAFT creation
+test('2O.1: FIFO fails after the DRAFT row exists -> FAILED, 1 DRAFT, token kept; retries reuse it; token rotates only after full allocation', () => {
+  const realFifo = sim.ctx.runSellerPayoutFifo_;
+  let fifoCalls = 0;
+  sim.ctx.runSellerPayoutFifo_ = (id) => { fifoCalls++; return { status: 'FAILED', seller_payout_id: id, error: 'simulated FIFO failure', rows: [] }; };
+  try {
+    const before = sim.audit().length;
+    const token = sim.token();
+    const r = draft('CUS001', 500);
+    assert.equal(r.status, 'FAILED');
+    assert.deepEqual([r.draft_created, r.draft_created_now, r.payout_status, r.allocation_status, r.allocated_amount], [true, true, 'DRAFT', 'NONE', 0]);
+    assert.match(r.error, /DRAFT SP-OPS-[0-9A-F]+ was created but is not fully allocated \(0 of 500\): simulated FIFO failure/);
+    assert.deepEqual(payouts().map((p) => [p.seller_payout_id, p.status]), [[r.seller_payout_id, 'DRAFT']]);
+    assert.equal(sim.token(), token, 'final render kept the token');
+    assert.equal(sim.formValue('amount'), 500, 'form kept for the retry');
+    // audit: DRAFT_CREATED (PENDING) then OPERATION_FAILED with the partial-creation facts
+    const rows = sim.audit().slice(before);
+    const createdRows = rows.filter((x) => x.action === 'SELLER_PAYOUT_DRAFT_CREATED');
+    assert.equal(createdRows.length, 1);
+    assert.equal(JSON.parse(createdRows[0].details).allocation_status, 'PENDING');
+    const failed = rows.filter((x) => x.action === 'SELLER_PAYOUT_OPERATION_FAILED');
+    assert.equal(failed.length, 1);
+    const fd = JSON.parse(failed[0].details);
+    assert.deepEqual([fd.draft_created, fd.seller_payout_id, fd.payout_status, fd.fifo_error, fd.allocated_amount],
+      [true, r.seller_payout_id, 'DRAFT', 'simulated FIFO failure', 0]);
+    assert.match(fd.required_action, /same request token\) to retry this DRAFT/);
+    // repeated failed retries: same payout, no extra DRAFT, no second DRAFT_CREATED, token kept
+    for (let i = 0; i < 3; i++) {
+      const again = run('createDraftSellerPayoutFromOperations()');
+      assert.equal(again.status, 'FAILED');
+      assert.equal(again.seller_payout_id, r.seller_payout_id);
+      assert.deepEqual([again.draft_created, again.draft_created_now, again.request], [true, false, 'RETRY']);
+      assert.match(again.error, / exists but is not fully allocated/);
+    }
+    assert.equal(payouts().length, 1);
+    assert.equal(sim.token(), token);
+    assert.equal(fifoCalls, 4);
+    assert.equal(sim.audit().slice(before).filter((x) => x.action === 'SELLER_PAYOUT_DRAFT_CREATED').length, 1);
+    // an incomplete request cannot be reset away
+    const reset = run('newOperationsPayoutRequest()');
+    assert.equal(reset.status, 'FAILED');
+    assert.match(reset.error, /not fully allocated .* the request token was kept/);
+    assert.equal(sim.token(), token);
+    // the DRAFT cannot be marked SENT meanwhile
+    assert.match(sent(r.seller_payout_id).error, /not fully allocated \(0 of 500\)/);
+    // FIFO works again: the same click completes the same payout, then (only then) the token rotates
+    sim.ctx.runSellerPayoutFifo_ = realFifo;
+    const ok = run('createDraftSellerPayoutFromOperations()');
+    assert.equal(ok.status, 'SUCCESS', ok.error);
+    assert.deepEqual([ok.seller_payout_id, ok.request, ok.allocation_status, ok.draft_created_now], [r.seller_payout_id, 'RETRY', 'FULL', false]);
+    assert.equal(payouts().length, 1);
+    assert.ok(near(allocations().reduce((a, x) => a + x.allocated_amount, 0), 500));
+    assert.notEqual(sim.token(), token, 'rotated after full allocation');
+    assert.equal(sim.formValue('amount'), '');
+    assert.equal(sim.audit().slice(before).filter((x) => x.action === 'SELLER_PAYOUT_DRAFT_CREATED').length, 1, 'no second DRAFT_CREATED for the retry');
+    // refresh never rotates a non-blank token
+    const t2 = sim.token();
+    run('refreshOperations()');
+    assert.equal(sim.token(), t2);
+  } finally {
+    sim.ctx.runSellerPayoutFifo_ = realFifo;
+  }
+});
+
+test('2O.1: same token with different notes is a different request: rejected, payout untouched, token kept', () => {
+  const token = sim.token();
+  const r = draft('CUS002', 300, { notes: 'first request' });
+  assert.equal(r.status, 'SUCCESS');
+  mS('Operations').api.getRange(call('OPERATIONS.tokenRow'), 2).setValue(token); // replay of the completed request's token
+  const snapshot = JSON.stringify([payouts(), allocations()]);
+  const other = draft('CUS002', 300, { notes: 'second request' });
+  assert.equal(other.status, 'FAILED');
+  assert.match(other.error, /Request token already used by Seller Payout .* with other values; nothing changed/);
+  assert.equal(JSON.stringify([payouts(), allocations()]), snapshot);
+  assert.equal(sim.token(), token, 'kept until an explicit New Payout Request');
+  const same = draft('CUS002', 300, { notes: 'first request' });
+  assert.equal(same.status, 'NO_CHANGE', same.error);
+  assert.notEqual(sim.token(), token, 'a completed same request may rotate');
+  // explicit reset of a complete / unused request rotates the token
+  const t3 = sim.token();
+  assert.equal(run('newOperationsPayoutRequest()').status, 'SUCCESS');
+  assert.notEqual(sim.token(), t3);
+  assert.equal(payouts().length, 1);
 });

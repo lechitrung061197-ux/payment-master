@@ -371,6 +371,7 @@ function onOpen() {
     .addSubMenu(ui.createMenu('Payouts')
       .addItem('Refresh Operations', 'menuRefreshOperations')
       .addItem('Create Draft + FIFO', 'menuCreateDraftPayout')
+      .addItem('New Payout Request (reset form)', 'menuNewPayoutRequest')
       .addItem('Mark Selected SENT', 'menuMarkSelectedPayoutSent')
       .addItem('Mark Selected CONFIRMED', 'menuMarkSelectedPayoutConfirmed')
       .addItem('Cancel Selected DRAFT', 'menuCancelSelectedPayout')
@@ -489,6 +490,13 @@ function createDraftSellerPayoutFromOperations() {
   return result;
 }
 
+/** Starts a new payout request (new token, amount fields cleared); refused while the current request's DRAFT is incomplete. */
+function newOperationsPayoutRequest() {
+  const result = runResetOperationsRequest_();
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
 /** DRAFT -> SENT for the payout selected in the Operations payouts table (validated; reduces the seller balance once). */
 function markSelectedSellerPayoutSent() {
   const result = runSellerPayoutTransition_(readSelectedOperationsPayout_, 'SENT', '');
@@ -562,6 +570,12 @@ function menuRefreshOperations() {
 function menuCreateDraftPayout() {
   const r = createDraftSellerPayoutFromOperations();
   operationsAlert_('Create Draft + FIFO', formatOperationsAlert_(r));
+  return r;
+}
+
+function menuNewPayoutRequest() {
+  const r = newOperationsPayoutRequest();
+  operationsAlert_('New Payout Request', r.status === 'SUCCESS' ? 'Form ready for a new payout request.' : formatOperationsAlert_(r));
   return r;
 }
 
