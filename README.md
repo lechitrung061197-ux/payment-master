@@ -79,13 +79,20 @@ clasp open-script
 ```
 
 Then run `setupMaster` (build/update tabs) or `verifyMaster` (read-only report)
-from the Apps Script editor. `setupMaster` never deletes tabs or data rows:
+from the Apps Script editor. `setupMaster` never deletes data rows or schema tabs:
 
 - A tab whose header differs from the schema is migrated **only if it has no data
   rows**; otherwise it is left untouched and reported as a warning.
 - Renamed Settings keys (`SETTING_KEY_RENAMES`) are renamed in place, keeping the value.
+- A tab removed from the schema (`LEGACY_TABS`) is deleted only when it is provably unused: header
+  empty or exactly the legacy header, no data rows, nothing beyond the header columns, and no formula
+  or named range elsewhere that references it. Otherwise it is kept, reported as a warning by
+  `setupMaster` and listed under `legacyTabs` by `verifyMaster`.
 - Each run writes a `SCHEMA_SETUP` row to Audit Log (old/new schema version,
-  migrated tabs, renamed keys, warnings).
+  migrated tabs, renamed keys, removed / kept legacy tabs, warnings).
+
+Schema v17 (Phase 2N) removed `Source Payments`: it never had a reader or writer (provider movements
+live in Provider Transactions / Provider Events), so `setupMaster` deletes the empty tab.
 
 ## Master tabs
 
@@ -98,7 +105,6 @@ from the Apps Script editor. `setupMaster` never deletes tabs or data rows:
 | Endpoint Mapping | System-managed effective-dated endpoint ownership history |
 | Raw Internal Transactions | Append-only internal CSV evidence: 16 raw CSV columns + 5 ingestion metadata columns |
 | Source System | Latest canonical snapshot per internal transaction (rebuilt from raw) |
-| Source Payments | Raw provider events (payment, refund, dispute, hold, …), one row per event |
 | Transactions | Canonical internal transactions + effective-dated endpoint ownership |
 | Payment Matches | Exact internal ↔ provider reconciliation, one row per (payment_source, transaction id) |
 | Payment Legs | One leg per CONFIRMED MATCHED payment: provider amounts, KH001 actual fee/hold, settlement membership |
@@ -109,7 +115,7 @@ from the Apps Script editor. `setupMaster` never deletes tabs or data rows:
 | Seller Payout Allocations | Classification of each payout to seller settlement obligations (never reduces a balance) |
 | Adjustments | Seller-side money effects: REFUND, DISPUTE, DISPUTE_FEE, MANUAL_ADJUSTMENT, HOLD_RELEASE |
 | Disputes | Dispute case tracking |
-| Dashboard | Skeleton summary |
+| Dashboard | Optional read-only report (formulas over accounting tabs; nothing reads it) |
 | Audit Log | Append-only operation log |
 | Import Batches | One row per raw source-tab sync attempt (RUNNING → SUCCESS / NO_CHANGE / FAILED) |
 | Raw KH001 PayPal | Raw mirror of KH001 `RAW_PP` |
@@ -132,7 +138,7 @@ Hidden `__STAGE_*` tabs are internal to raw sync and must never be read by busin
 
 | Table | Unique key |
 | --- | --- |
-| Source Payments (raw events) | `payment_source + external_event_id` |
+| Provider Events | `provider_id + payment_source + external_event_id` |
 | Payment Matches (CONFIRMED rows) | `payment_source + external_transaction_id` |
 | Payment Legs | `payment_source + external_transaction_id` |
 | Settlement Items | `payment_leg_id` in at most one non-VOID settlement |

@@ -3,7 +3,9 @@
  * Builds and formats the Master spreadsheet from SCHEMA.
  *
  * Setup is idempotent and non-destructive:
- * - Missing tabs are created; existing tabs are never deleted.
+ * - Missing tabs are created; schema tabs are never deleted. A tab listed in LEGACY_TABS is
+ *   deleted only when it is provably empty and unreferenced (removeLegacyTabs_); otherwise it is
+ *   kept and reported as a warning.
  * - A header row that differs from the schema is migrated only when the tab has no
  *   data rows. A tab with data rows and a different header is reported as a warning
  *   and left untouched.
@@ -41,6 +43,8 @@ function runSetup_() {
   adoptDefaultSheet_(ss);
   // v13 -> v14: Seller Terms gains payment_source (existing rows = PAYPAL) before the header check.
   const sellerTermsMigrated = migrateSellerTermsPaymentSource_(ss);
+  // v16 -> v17: drop legacy tabs that left the schema, only when empty and unreferenced.
+  const legacyTabs = removeLegacyTabs_(ss, warnings);
   SCHEMA.forEach(function (table) { ensureTable_(ss, table, warnings, migratedTabs); });
   ensureRawTargetTabs_(ss);
   ensureDashboard_(ss);
@@ -71,7 +75,8 @@ function runSetup_() {
     oldStatus: oldSchemaVersion === null ? '' : 'SCHEMA_V' + oldSchemaVersion,
     newStatus: 'SCHEMA_V' + APP.SCHEMA_VERSION,
     details: { migratedTabs: migratedTabs, renamedSettingKeys: renamedKeys, sellerTermsMigrated: sellerTermsMigrated, sellerTermsSeeded: sellerTermsSeeded,
-      sellerDestinationsSeeded: sellerDestinationsSeeded, warnings: warnings },
+      sellerDestinationsSeeded: sellerDestinationsSeeded, removedLegacyTabs: legacyTabs.removed, keptLegacyTabs: legacyTabs.kept,
+      warnings: warnings },
   });
 
   return {
@@ -81,6 +86,8 @@ function runSetup_() {
     sellerTermsMigrated: sellerTermsMigrated,
     sellerTermsSeeded: sellerTermsSeeded,
     sellerDestinationsSeeded: sellerDestinationsSeeded,
+    removedLegacyTabs: legacyTabs.removed,
+    keptLegacyTabs: legacyTabs.kept,
     warnings: warnings,
   };
 }
@@ -97,6 +104,56 @@ function adoptDefaultSheet_(ss) {
   if (schemaNames.indexOf(sheet.getName()) >= 0) return;
   if (sheet.getLastRow() !== 0 || sheet.getLastColumn() !== 0) return;
   sheet.setName(SHEETS.SETTINGS);
+}
+
+/**
+ * Why a LEGACY_TABS tab cannot be deleted safely, or '' when it is provably unused. Read-only.
+ * Any doubt keeps the tab: unexpected header, data rows, cells beyond the header, or a formula /
+ * named range elsewhere that points at it.
+ */
+function legacyTabKeepReason_(ss, sheet, legacy) {
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
+  if (lastRow === 0 && lastColumn === 0) return ''; // fully blank tab
+  if (lastRow > 1) return (lastRow - 1) + ' row(s) below the header';
+  if (lastColumn > legacy.legacyHeader.length) return 'content beyond the ' + legacy.legacyHeader.length + ' legacy header columns';
+  const header = sheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0].map(function (v) { return String(v).trim(); });
+  while (header.length < legacy.legacyHeader.length) header.push('');
+  if (!arraysEqual_(header, legacy.legacyHeader)) return 'header row differs from the legacy header';
+  const sheetId = sheet.getSheetId();
+  const formulaRefs = ss.createTextFinder(legacy.sheet).matchFormulaText(true).findAll()
+    // Plain text that mentions the name (e.g. old Audit Log details) is not a reference.
+    .filter(function (r) { return r.getSheet().getSheetId() !== sheetId && String(r.getFormula()) !== ''; })
+    .map(function (r) { return "'" + r.getSheet().getName() + "'!" + r.getA1Notation(); });
+  if (formulaRefs.length > 0) return 'referenced by formula(s) ' + formulaRefs.slice(0, 5).join(', ');
+  const namedRanges = ss.getNamedRanges()
+    .filter(function (nr) { return nr.getRange().getSheet().getSheetId() === sheetId; })
+    .map(function (nr) { return nr.getName(); });
+  if (namedRanges.length > 0) return 'named range(s) ' + namedRanges.join(', ');
+  return '';
+}
+
+/**
+ * Deletes each LEGACY_TABS tab that is provably unused; keeps any other one and adds a warning.
+ * Idempotent: a missing tab is a no-op. Returns { removed: [names], kept: [names] }.
+ */
+function removeLegacyTabs_(ss, warnings) {
+  const removed = [];
+  const kept = [];
+  LEGACY_TABS.forEach(function (legacy) {
+    const sheet = ss.getSheetByName(legacy.sheet);
+    if (!sheet) return;
+    const reason = legacyTabKeepReason_(ss, sheet, legacy);
+    if (reason) {
+      kept.push(legacy.sheet);
+      warnings.push('Legacy tab "' + legacy.sheet + '" (removed from schema v' + legacy.removedInSchema +
+        ') kept: ' + reason + '. Review it manually; setup never deletes data.');
+      return;
+    }
+    ss.deleteSheet(sheet);
+    removed.push(legacy.sheet);
+  });
+  return { removed: removed, kept: kept };
 }
 
 function ensureTable_(ss, table, warnings, migratedTabs) {
@@ -260,7 +317,7 @@ function ensureDashboard_(ss) {
 
   if (sheet.getLastRow() === 0) {
     sheet.getRange('A1').setValue(APP.NAME + ' Dashboard').setFontWeight('bold').setFontSize(14);
-    sheet.getRange('A2').setValue('Skeleton only. Financial metrics are added in a later phase.')
+    sheet.getRange('A2').setValue('Read-only report. Formulas read the accounting tabs; nothing reads this tab.')
       .setFontColor('#666666');
     sheet.getRange(4, 1, 1, 3).setValues([['Metric', 'Value', 'Definition']])
       .setFontWeight('bold')

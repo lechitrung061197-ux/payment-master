@@ -9,7 +9,7 @@
 
 const APP = Object.freeze({
   NAME: 'Payment Master',
-  SCHEMA_VERSION: 16,
+  SCHEMA_VERSION: 17,
   LOCALE: 'en_US',
   TIMEZONE: 'America/New_York',
   DEFAULT_CURRENCY: 'USD',
@@ -59,7 +59,6 @@ const FORMATS = Object.freeze({
 const ENUMS = Object.freeze({
   RECORD_STATUS: ['ACTIVE', 'INACTIVE'],
   PAYMENT_SOURCE: ['PAYPAL', 'STRIPE', 'BANK', 'OTHER'],
-  SOURCE_EVENT_TYPE: ['PAYMENT', 'REFUND', 'DISPUTE', 'DISPUTE_FEE', 'HOLD', 'RELEASE', 'OTHER'],
   // Derived summary status only. Never used as a source for money calculations.
   // PAID is intentionally absent until seller payout allocation exists.
   TRANSACTION_STATUS: [
@@ -107,7 +106,6 @@ const SHEETS = Object.freeze({
   ENDPOINT_MAPPING: 'Endpoint Mapping',
   RAW_INTERNAL_TRANSACTIONS: 'Raw Internal Transactions',
   SOURCE_SYSTEM: 'Source System',
-  SOURCE_PAYMENTS: 'Source Payments',
   TRANSACTIONS: 'Transactions',
   PAYMENT_MATCHES: 'Payment Matches',
   PAYMENT_LEGS: 'Payment Legs',
@@ -289,30 +287,6 @@ const SCHEMA = Object.freeze([
       col_('row_fingerprint', T.ID),
       col_('import_batch_id', T.ID),
       col_('source_file_name', T.TEXT),
-      col_('imported_at', T.DATETIME),
-    ],
-  },
-  {
-    sheet: SHEETS.SOURCE_PAYMENTS,
-    description: 'Raw provider events/movements from all sources, one row per event. ' +
-      'Unique key: payment_source + external_event_id. Several events (payment, refund, ' +
-      'dispute, ...) may share the same external_transaction_id.',
-    columns: [
-      col_('payment_source', T.ENUM, ENUMS.PAYMENT_SOURCE),
-      col_('external_event_id', T.ID),
-      col_('external_transaction_id', T.ID),
-      col_('related_external_transaction_id', T.ID),
-      col_('provider', T.ID),
-      col_('event_type', T.ENUM, ENUMS.SOURCE_EVENT_TYPE),
-      col_('event_date', T.DATETIME),
-      col_('gross_amount', T.USD),
-      col_('processing_fee', T.USD),
-      col_('net_amount', T.USD),
-      col_('currency', T.TEXT),
-      col_('external_status', T.TEXT),
-      col_('order_reference', T.TEXT),
-      col_('payer_reference', T.TEXT),
-      col_('import_batch_id', T.ID),
       col_('imported_at', T.DATETIME),
     ],
   },
@@ -770,6 +744,23 @@ const DEFAULT_SETTINGS = Object.freeze([
 
 /** Settings keys whose value is always kept in sync with code. */
 const MANAGED_SETTING_KEYS = Object.freeze(['schema_version']);
+
+/**
+ * Tabs removed from the schema. Setup deletes such a tab only when it is provably unused: header row
+ * empty or exactly the legacy header, no data rows, no cells beyond the header columns, and no formula
+ * or named range elsewhere in the spreadsheet that references it. Otherwise the tab is kept and
+ * reported as a warning. Never removes business data.
+ */
+const LEGACY_TABS = Object.freeze([
+  {
+    // v17: never had a reader or writer; provider movements live in Provider Transactions/Events.
+    sheet: 'Source Payments',
+    removedInSchema: 17,
+    legacyHeader: ['payment_source', 'external_event_id', 'external_transaction_id', 'related_external_transaction_id',
+      'provider', 'event_type', 'event_date', 'gross_amount', 'processing_fee', 'net_amount', 'currency',
+      'external_status', 'order_reference', 'payer_reference', 'import_batch_id', 'imported_at'],
+  },
+]);
 
 /** Renamed Settings keys: [oldKey, newKey]. Applied by Setup before seeding. */
 const SETTING_KEY_RENAMES = Object.freeze([

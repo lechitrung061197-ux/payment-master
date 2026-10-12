@@ -10,6 +10,7 @@ function setupMaster() {
   Logger.log('Setup complete for spreadsheet %s', result.spreadsheetId);
   Logger.log('Migrated tabs: %s', JSON.stringify(result.migratedTabs));
   Logger.log('Renamed Settings keys: %s', JSON.stringify(result.renamedSettingKeys));
+  Logger.log('Legacy tabs removed: %s; kept: %s', JSON.stringify(result.removedLegacyTabs), JSON.stringify(result.keptLegacyTabs));
   if (result.warnings.length > 0) {
     Logger.log('WARNINGS:\n%s', result.warnings.join('\n'));
   }
@@ -20,6 +21,7 @@ function verifyMaster() {
   const ss = getSpreadsheet_();
   const expected = Object.keys(SHEETS).map(function (k) { return SHEETS[k]; });
   const actual = ss.getSheets().map(function (s) { return s.getName(); });
+  const legacy = LEGACY_TABS.map(function (t) { return t.sheet; });
 
   const headerIssues = SCHEMA
     .filter(function (t) {
@@ -49,8 +51,10 @@ function verifyMaster() {
     missingTabs: expected.filter(function (n) { return actual.indexOf(n) < 0; }),
     // Hidden staging tabs are expected; a leftover __SWAP_ tab is reported here.
     extraTabs: actual.filter(function (n) {
-      return expected.indexOf(n) < 0 && n.indexOf(STAGING_SHEET_PREFIX) !== 0;
+      return expected.indexOf(n) < 0 && legacy.indexOf(n) < 0 && n.indexOf(STAGING_SHEET_PREFIX) !== 0;
     }),
+    // Tabs removed from the schema but still present (setupMaster keeps one that is not provably unused).
+    legacyTabs: actual.filter(function (n) { return legacy.indexOf(n) >= 0; }),
     headerIssues: headerIssues,
     schemaVersion: { expected: APP.SCHEMA_VERSION, actual: schemaVersion },
     missingSettings: DEFAULT_SETTINGS
