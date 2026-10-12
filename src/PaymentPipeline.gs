@@ -18,6 +18,11 @@
  * - Every run has a pipeline_run_id; audit actions: PIPELINE_STARTED, <STAGE>_<STATUS> (entity_type PIPELINE),
  *   HEALTH_CHECK_PASS / _FAIL, PIPELINE_SUCCESS / PIPELINE_FAILED / PIPELINE_SKIPPED_LOCKED.
  *
+ * Providers: the pipeline runs only providers ENABLED in RAW_SOURCES (Settings source.<ID>.enabled) and uses each one's
+ * adapters from PROVIDER_PIPELINE_RUNNERS (transactions, events, settlements, eventsReport). An enabled provider without
+ * a complete adapter fails the run closed before any fetch (audited with the provider id); disabled providers are never
+ * fetched or normalized.
+ *
  * Schedule: Settings scheduled_sync_morning_hour / scheduled_sync_afternoon_hour / scheduled_sync_timezone;
  * installScheduledPaymentPipelineTriggers() replaces this pipeline's triggers (idempotent, never duplicates).
  */
@@ -34,7 +39,42 @@ const PAYMENT_PIPELINE = Object.freeze({
   moneyToleranceMicros: 5000, // 0.005: MATCHED amount mismatch tolerance (Payment Matches convention)
 });
 
+/**
+ * Canonical pipeline adapters per provider (the existing provider-specific runners; closures resolve at call time).
+ * Adding a provider = add its RAW_SOURCES entry AND its adapters here; an enabled provider without them fails closed.
+ */
+const PROVIDER_PIPELINE_RUNNERS = Object.freeze({
+  KH001: Object.freeze({
+    transactions: function () { return runKh001ProviderTransactionsNormalizer_(); },
+    events: function () { return runKh001ProviderEventsNormalizer_(); },
+    settlements: function () { return runKh001SettlementsNormalizer_(); },
+    eventsReport: function () { return buildKh001ProviderEventsReport_(); },
+  }),
+});
+
+const PROVIDER_ADAPTER_KEYS = Object.freeze(['transactions', 'events', 'settlements', 'eventsReport']);
+
 /* ----------------------------- Pure helpers ----------------------------- */
+
+/**
+ * Enabled providers and their adapters. Fails (missing) for an enabled provider without a complete adapter set.
+ * @param {Object} rawSources RAW_SOURCES-like map
+ * @param {Object} settings Settings map
+ * @param {Object} registry PROVIDER_PIPELINE_RUNNERS-like map
+ * @return {{enabled: Array<{providerId: string, source: Object, runners: Object}>, missing: Array<string>, disabled: Array<string>}}
+ */
+function resolvePipelineProviders_(rawSources, settings, registry) {
+  const out = { enabled: [], missing: [], disabled: [] };
+  Object.keys(rawSources).sort().forEach(function (k) {
+    const source = rawSources[k];
+    if (!isSettingEnabled_(settings[source.enabledSetting])) { out.disabled.push(source.providerId); return; }
+    const runners = registry[source.providerId];
+    const lacking = PROVIDER_ADAPTER_KEYS.filter(function (a) { return !runners || typeof runners[a] !== 'function'; });
+    if (lacking.length > 0) { out.missing.push(source.providerId + ' (' + lacking.join(', ') + ')'); return; }
+    out.enabled.push({ providerId: source.providerId, source: source, runners: runners });
+  });
+  return out;
+}
 
 /** Validated schedule from Settings values: two distinct whole hours 0-23 and a time zone. */
 function parsePipelineSchedule_(settings) {
@@ -143,9 +183,45 @@ function evaluatePipelineInvariants_(t) {
 
 /* ---------------------------------- I/O --------------------------------- */
 
-/** Raw sync of every enabled provider source (stage 1). */
+/** Overridable accessors (tests): the configured raw sources and the provider adapter registry. */
+function pipelineRawSources_() { return RAW_SOURCES; }
+function providerPipelineRunners_() { return PROVIDER_PIPELINE_RUNNERS; }
+
+/** Enabled providers with adapters; throws (fail closed) when an enabled provider has no complete adapter set. */
+function readPipelineProviders_() {
+  const resolved = resolvePipelineProviders_(pipelineRawSources_(), readSettingsMap_(), providerPipelineRunners_());
+  if (resolved.missing.length > 0) {
+    const err = new Error('enabled provider(s) without a pipeline adapter: ' + resolved.missing.join(', ') + ' - nothing fetched or normalized');
+    err.missingAdapters = resolved.missing;
+    throw err;
+  }
+  return resolved;
+}
+
+/** Runs one adapter step for every enabled provider in order; stops at the first failure. */
+function runProviderAdapters_(providers, step, label) {
+  const results = {};
+  for (let i = 0; i < providers.length; i++) {
+    const p = providers[i];
+    const r = p.runners[step]();
+    const st = r && r.status ? r.status : 'FAILED';
+    results[p.providerId] = st;
+    if (PAYMENT_PIPELINE.okStatuses.indexOf(st) < 0) {
+      return { status: 'FAILED', providers: results, error: p.providerId + ' ' + label + ': ' + ((r && r.error) || st) };
+    }
+  }
+  return { status: combineStageStatuses_(Object.keys(results).map(function (k) { return results[k]; })), providers: results };
+}
+
+/** Raw sync of every enabled provider source (stage 1), after the adapter preflight. */
 function syncEnabledRawSources_() {
-  const results = Object.keys(RAW_SOURCES).map(function (k) { return syncRawSource_(RAW_SOURCES[k]); });
+  let providers;
+  try {
+    providers = readPipelineProviders_();
+  } catch (err) {
+    return { status: 'FAILED', error: err.message, missing_adapters: err.missingAdapters || [] };
+  }
+  const results = providers.enabled.map(function (p) { return syncRawSource_(p.source); });
   const failed = [];
   results.forEach(function (r) {
     Object.keys(r).forEach(function (k) {
@@ -153,6 +229,7 @@ function syncEnabledRawSources_() {
     });
   });
   return { status: combineStageStatuses_(results.map(classifyRawSyncSummary_)), sources: results,
+    providers: providers.enabled.map(function (p) { return p.providerId; }), disabled_providers: providers.disabled,
     error: failed.length ? 'raw sync failed: ' + failed.join(', ') + ' (see Import Batches)' : null };
 }
 
@@ -161,8 +238,9 @@ function readRawSyncHealth_(ss) {
   const settings = readSettingsMap_();
   const batches = readImportBatches_();
   const problems = [];
-  Object.keys(RAW_SOURCES).forEach(function (k) {
-    const source = RAW_SOURCES[k];
+  const sources = pipelineRawSources_();
+  Object.keys(sources).forEach(function (k) {
+    const source = sources[k];
     if (!isSettingEnabled_(settings[source.enabledSetting])) return;
     source.tabs.forEach(function (tab) {
       const state = detectSwapState_(ss, tab).state;
@@ -184,8 +262,11 @@ function buildPaymentPipelineHealth_() {
     const ss = getSpreadsheet_();
     const raw = readRawSyncHealth_(ss);
     add('raw_provider_sync_current', raw.length === 0, raw.join(' | '));
-    const events = buildKh001ProviderEventsReport_();
-    add('provider_events_current', events.pass === true, (events.errors || []).slice(0, 5).join(' | '));
+    const providers = readPipelineProviders_();
+    providers.enabled.forEach(function (p) {
+      const events = p.runners.eventsReport();
+      add('provider_events_current.' + p.providerId, events.pass === true, (events.errors || []).slice(0, 5).join(' | '));
+    });
     const gates = readSellerSheetsGates_(ss);
     Object.keys(gates.gates).forEach(function (g) { add(g + '_current', gates.gates[g], gates.gates[g] ? 'ok' : 'stale / invalid'); });
     if (!gates.current) report.errors = report.errors.concat(gates.reasons);
@@ -213,15 +294,16 @@ function paymentPipelineStages_() {
   return [
     { name: 'PROVIDER_SYNC', run: function () { return syncEnabledRawSources_(); } },
     { name: 'PROVIDER_NORMALIZE', run: function () {
-      const tx = runKh001ProviderTransactionsNormalizer_();
-      if (PAYMENT_PIPELINE.okStatuses.indexOf(status(tx)) < 0) return { status: 'FAILED', error: 'Provider Transactions: ' + (tx.error || status(tx)) };
-      const ev = runKh001ProviderEventsNormalizer_();
-      if (PAYMENT_PIPELINE.okStatuses.indexOf(status(ev)) < 0) return { status: 'FAILED', error: 'Provider Events: ' + (ev.error || status(ev)) };
-      return { status: combineStageStatuses_([status(tx), status(ev)]), provider_transactions: status(tx), provider_events: status(ev) };
+      const providers = readPipelineProviders_().enabled;
+      const tx = runProviderAdapters_(providers, 'transactions', 'Provider Transactions');
+      if (tx.status === 'FAILED') return { status: 'FAILED', error: tx.error, provider_transactions: tx.providers };
+      const ev = runProviderAdapters_(providers, 'events', 'Provider Events');
+      if (ev.status === 'FAILED') return { status: 'FAILED', error: ev.error, provider_transactions: tx.providers, provider_events: ev.providers };
+      return { status: combineStageStatuses_([tx.status, ev.status]), provider_transactions: tx.providers, provider_events: ev.providers };
     } },
     { name: 'INTERNAL_NORMALIZE', run: function () { return runInternalNormalizer_(); } },
     { name: 'RECONCILE', run: function () { return runPaymentReconciliation_(); } },
-    { name: 'SETTLEMENT_REFRESH', run: function () { return runKh001SettlementsNormalizer_(); } },
+    { name: 'SETTLEMENT_REFRESH', run: function () { return runProviderAdapters_(readPipelineProviders_().enabled, 'settlements', 'Settlements'); } },
     { name: 'PAYMENT_LEGS_REFRESH', run: function () { return runPaymentLegsNormalizer_(); } }, // provider-paid availability lives here
     { name: 'SETTLEMENT_ITEMS_REFRESH', run: function () { return runSettlementItemsNormalizer_(); } },
     { name: 'SELLER_BALANCES_REFRESH', run: function () { return runSellerBalancesNormalizer_(); } },
@@ -290,7 +372,8 @@ function runPaymentPipeline_(options) {
       const stageEnd = new Date();
       const entry = { stage: stage.name, status: out.status || 'FAILED', started_at: stageStart, completed_at: stageEnd,
         duration_ms: stageEnd.getTime() - stageStart.getTime(), error: out.error || null };
-      ['provider_transactions', 'provider_events', 'payment_status_counts', 'effective_payout_count', 'failed_checks', 'seller_status', 'sellers']
+      ['providers', 'disabled_providers', 'missing_adapters', 'provider_transactions', 'provider_events', 'payment_status_counts',
+        'effective_payout_count', 'failed_checks', 'seller_status', 'sellers']
         .forEach(function (k) { if (out[k] !== undefined) entry[k] = out[k]; });
       result.stages.push(entry);
       pipelineAudit_(stage.name + '_' + entry.status, runId, entry.status, Object.assign({ pipeline_run_id: runId }, entry));

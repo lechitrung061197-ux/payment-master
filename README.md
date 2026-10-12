@@ -689,11 +689,11 @@ is skipped (`PIPELINE_SKIPPED_LOCKED`) and never runs in parallel.
 
 | # | Stage (audit prefix) | Runner |
 | --- | --- | --- |
-| 1 | `PROVIDER_SYNC` | raw sync of every enabled provider source (`syncRawSource_`) |
-| 2 | `PROVIDER_NORMALIZE` | Provider Transactions, then Provider Events |
+| 1 | `PROVIDER_SYNC` | adapter preflight, then raw sync of every enabled provider source (`syncRawSource_`) |
+| 2 | `PROVIDER_NORMALIZE` | per enabled provider: Provider Transactions, then Provider Events |
 | 3 | `INTERNAL_NORMALIZE` | Raw Internal Transactions → Transactions (NO_CHANGE when raw is unchanged) |
 | 4 | `RECONCILE` | Payment Matches |
-| 5 | `SETTLEMENT_REFRESH` | provider Settlements (source paid amount / date) |
+| 5 | `SETTLEMENT_REFRESH` | per enabled provider: provider Settlements (source paid amount / date) |
 | 6 | `PAYMENT_LEGS_REFRESH` | Payment Legs, incl. provider-paid availability (AVAILABLE) |
 | 7 | `SETTLEMENT_ITEMS_REFRESH` | frozen Settlement Items |
 | 8 | `SELLER_BALANCES_REFRESH` | Seller Balances |
@@ -701,6 +701,11 @@ is skipped (`PIPELINE_SKIPPED_LOCKED`) and never runs in parallel.
 | 10 | `HEALTH_CHECK` (`_PASS` / `_FAIL`) | `verifyPaymentPipelineHealth` gates (below) |
 | 11 | `SELLER_SHEETS_SYNC` | ACTIVE seller sheets (PARTIAL counts as a pipeline failure) |
 
+- **Providers**: only providers ENABLED in `RAW_SOURCES` (Settings `source.<ID>.enabled`) are fetched and
+  normalized, each through its adapters in `PROVIDER_PIPELINE_RUNNERS` (`transactions`, `events`, `settlements`,
+  `eventsReport`; today only KH001). An enabled provider without a complete adapter set fails the run closed in
+  `PROVIDER_SYNC` before anything is fetched (`missing_adapters` in the audit); disabled providers are skipped.
+  Adding a provider = its `RAW_SOURCES` entry + its adapters.
 - **Stop on failure**: any stage that is not SUCCESS / NO_CHANGE (/ PASS) stops the run — nothing downstream
   runs and seller sheets are not published. Every run has a `pipeline_run_id` (`PRUN-…`); audit rows
   (`entity_type` PIPELINE, `entity_id` = run id): `PIPELINE_STARTED`, `<STAGE>_<STATUS>` with stage,

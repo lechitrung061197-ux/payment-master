@@ -47,6 +47,9 @@ function install(o) {
   const okValidation = { errors: H.emptyAllocationErrors_(), summary: { payment_status_counts: { UNPAID: 2 }, effective_payout_count: 0 } };
   Object.assign(context, {
     getSpreadsheet_: () => ({ getId: () => 'MASTER' }),
+    readSettingsMap_: () => o.settings || { 'source.KH001.enabled': true },
+    pipelineRawSources_: () => o.rawSources || vm.runInContext('RAW_SOURCES', context),
+    providerPipelineRunners_: () => o.registry || vm.runInContext('PROVIDER_PIPELINE_RUNNERS', context),
     appendAuditLog_: (e) => env.audit.push(js(e)),
     LockService: { getDocumentLock: () => ({ tryLock: () => !env.lockHeld, releaseLock: () => { env.released++; } }) },
     syncRawSource_: stub('syncRawSource_', result('syncRawSource_', { provider: 'KH001', RAW_PP: 'NO_CHANGE', DoiSoat_GD: 'NO_CHANGE', PhieuDoiSoat: 'NO_CHANGE', Dispute: 'NO_CHANGE' })),
@@ -138,6 +141,68 @@ test('D: unchanged input -> every stage NO_CHANGE, health PASS, seller sync NO_C
     assert.deepEqual(r.stages.map((s) => s.status), ['NO_CHANGE', 'NO_CHANGE', 'NO_CHANGE', 'NO_CHANGE', 'NO_CHANGE', 'NO_CHANGE', 'NO_CHANGE', 'NO_CHANGE',
       'SUCCESS', 'PASS', 'NO_CHANGE']);
   }
+});
+
+// ---- provider adapter registry (Phase 2M.1) ---------------------------------------------------------------
+const source = (id) => ({ providerId: id, enabledSetting: 'source.' + id + '.enabled', tabs: [] });
+const fakeAdapters = (id, o) => {
+  const call = (step, def) => () => { env.calls.push(id + '.' + step); return (o && o[step]) || def; };
+  return { transactions: call('transactions', { status: 'NO_CHANGE' }), events: call('events', { status: 'NO_CHANGE' }),
+    settlements: call('settlements', { status: 'NO_CHANGE' }), eventsReport: call('eventsReport', { pass: true }) };
+};
+
+test('registry: KH001 enabled -> exactly the KH001 runners, in order, with per-provider stage details', () => {
+  install({});
+  const r = js(H.runPaymentPipeline_());
+  assert.equal(r.status, 'SUCCESS');
+  assert.deepEqual(env.calls.filter((c) => /Kh001|syncRawSource_/.test(c)), ['syncRawSource_', 'runKh001ProviderTransactionsNormalizer_',
+    'runKh001ProviderEventsNormalizer_', 'runKh001SettlementsNormalizer_']);
+  assert.deepEqual(r.stages[0].providers, ['KH001']);
+  assert.deepEqual([r.stages[1].provider_transactions, r.stages[1].provider_events], [{ KH001: 'NO_CHANGE' }, { KH001: 'NO_CHANGE' }]);
+  assert.deepEqual(js(H.resolvePipelineProviders_(vm.runInContext('RAW_SOURCES', context), { 'source.KH001.enabled': true },
+    vm.runInContext('PROVIDER_PIPELINE_RUNNERS', context))).missing, []);
+});
+
+test('registry: an ENABLED provider without adapters fails closed before any fetch; nothing downstream, no seller sync', () => {
+  install({ rawSources: { KH001: source('KH001'), KH002: source('KH002') }, settings: { 'source.KH001.enabled': true, 'source.KH002.enabled': true } });
+  const r = js(H.runPaymentPipeline_());
+  assert.deepEqual([r.status, r.failed_stage], ['FAILED', 'PROVIDER_SYNC']);
+  assert.match(r.error, /enabled provider\(s\) without a pipeline adapter: KH002 \(transactions, events, settlements, eventsReport\)/);
+  assert.deepEqual(env.calls, [], 'no raw fetch, no normalize, no reconcile, no seller sync');
+  const audit = env.audit.find((e) => e.action === 'PROVIDER_SYNC_FAILED');
+  assert.deepEqual(audit.details.missing_adapters, ['KH002 (transactions, events, settlements, eventsReport)']);
+  assert.deepEqual(actions(), ['PIPELINE_STARTED', 'PROVIDER_SYNC_FAILED', 'PIPELINE_FAILED']);
+  const partial = { KH001: vm.runInContext('PROVIDER_PIPELINE_RUNNERS', context).KH001, KH002: { transactions: () => ({}) } };
+  assert.deepEqual(js(H.resolvePipelineProviders_({ KH001: source('KH001'), KH002: source('KH002') }, { 'source.KH001.enabled': true,
+    'source.KH002.enabled': 'TRUE' }, partial)).missing, ['KH002 (events, settlements, eventsReport)'], 'incomplete adapter sets fail too');
+});
+
+test('registry: a DISABLED provider is never fetched or normalized (even without adapters)', () => {
+  install({ rawSources: { KH001: source('KH001'), KH009: source('KH009') }, settings: { 'source.KH001.enabled': false, 'source.KH009.enabled': false } });
+  const r = js(H.runPaymentPipeline_());
+  assert.equal(r.status, 'SUCCESS', r.error);
+  assert.ok(!env.calls.some((c) => /Kh001|syncRawSource_/.test(c)), 'no KH001 runner, no raw sync');
+  assert.deepEqual([r.stages[0].providers, r.stages[0].disabled_providers], [[], ['KH001', 'KH009']]);
+});
+
+test('registry: several enabled providers run one by one; one provider failing stops the pipeline before seller publish', () => {
+  const rawSources = { KH001: source('KH001'), KH002: source('KH002') };
+  const settings = { 'source.KH001.enabled': true, 'source.KH002.enabled': true };
+  install({ rawSources, settings, registry: { KH001: fakeAdapters('KH001'), KH002: fakeAdapters('KH002', { settlements: { status: 'SUCCESS' } }) } });
+  let r = js(H.runPaymentPipeline_());
+  assert.equal(r.status, 'SUCCESS');
+  assert.deepEqual(env.calls.filter((c) => /^KH00|syncRawSource_/.test(c)), ['syncRawSource_', 'syncRawSource_', 'KH001.transactions', 'KH002.transactions',
+    'KH001.events', 'KH002.events', 'KH001.settlements', 'KH002.settlements', 'KH001.eventsReport', 'KH002.eventsReport'].filter((c) => !/eventsReport/.test(c)));
+  assert.deepEqual(r.stages.find((s) => s.stage === 'SETTLEMENT_REFRESH').status, 'SUCCESS');
+  install({ rawSources, settings, registry: { KH001: fakeAdapters('KH001'), KH002: fakeAdapters('KH002', { transactions: { status: 'FAILED', error: 'bad raw' } }) } });
+  r = js(H.runPaymentPipeline_());
+  assert.deepEqual([r.status, r.failed_stage], ['FAILED', 'PROVIDER_NORMALIZE']);
+  assert.match(r.error, /^KH002 Provider Transactions: bad raw/);
+  assert.deepEqual(r.stages[1].provider_transactions, { KH001: 'NO_CHANGE', KH002: 'FAILED' });
+  assert.ok(!env.calls.includes('KH001.events') && !env.calls.includes('runInternalNormalizer_') && !env.calls.includes('runSellerSheetsSync_'));
+  install({ rawSources, settings, registry: { KH001: fakeAdapters('KH001', { settlements: { status: 'FAILED', error: 'x' } }), KH002: fakeAdapters('KH002') } });
+  r = js(H.runPaymentPipeline_());
+  assert.deepEqual([r.failed_stage, env.calls.includes('KH002.settlements'), env.calls.includes('runSellerSheetsSync_')], ['SETTLEMENT_REFRESH', false, false]);
 });
 
 test('raw sync classification: DISABLED sources are skipped; any failed tab fails the stage', () => {
