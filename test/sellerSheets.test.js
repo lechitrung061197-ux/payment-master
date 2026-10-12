@@ -143,7 +143,7 @@ test('first sync: four template tabs filled in owned ranges, statics / formulas 
   for (let r = 7; r <= 1006; r++) for (let c = 1; c <= 21; c++) assert.ok(!cellOf(a, 'DoiSoat_GD', r, c).f, 'values-only data rows');
   assert.equal(cellOf(a, 'PhieuDoiSoat', 4, 2).v, 'DITECH (CUS001)');
   assert.equal(syncValue(a, 'seller_id'), 'CUS001');
-  assert.equal(syncValue(a, 'output_schema_version'), 3);
+  assert.equal(syncValue(a, 'output_schema_version'), 4);
   const text = JSON.stringify(a.sheets.map((s) => s.cells));
   for (const re of [/"B-1"/, /B-MISS/, /HUI/, /glk_/, /buyer@example/, /MASTER_SPREADSHEET/]) assert.ok(!re.test(text), 'CUS001 sheet must not contain ' + re);
 });
@@ -318,7 +318,7 @@ test('rates land in the template percentage cells (0.08 shown as 8.00%) with zer
   assert.deepEqual(a.log.filter((e) => e.op === 'copyTo'), [], 'no format copy without capacity growth');
 });
 
-test('18: an existing output-schema-2 child upgrades to schema 3 in place (no reclone, no format writes, statics kept)', () => {
+test('18: an existing older-schema child upgrades to the current output schema in place (no reclone, no format writes, statics kept)', () => {
   const a = freshChild(CHILD_A);
   installSync({ children: { [CHILD_A]: a }, destinations: [dest({})] });
   H.runSellerSheetsSync_();
@@ -332,7 +332,7 @@ test('18: an existing output-schema-2 child upgrades to schema 3 in place (no re
   const r = js(H.runSellerSheetsSync_());
   assert.equal(r.status, 'SUCCESS', JSON.stringify(r.sellers));
   assert.deepEqual(r.sellers[0].written_tabs, ['PhieuDoiSoat', '_Sync'], 'only changed owned content + commit marker');
-  assert.equal(syncValue(a, 'output_schema_version'), 3);
+  assert.equal(syncValue(a, 'output_schema_version'), 4);
   assert.equal(cellOf(a, 'PhieuDoiSoat', 50, 1).v, 'PAYPAL #1 · UNPAID');
   assert.deepEqual(a.sheets.map((s) => s.name), sheetsBefore, 'same spreadsheet, no new / replaced tab');
   assert.equal(JSON.stringify(a.sheets.map((s) => Object.entries(s.cells).map(([k, c]) => [k, c.s]))), formatsBefore, 'no formatting change');

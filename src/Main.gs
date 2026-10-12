@@ -413,3 +413,35 @@ function verifySellerPayoutAllocations() {
   Logger.log(JSON.stringify(report, null, 2));
   return report;
 }
+
+/* ---------------------------------------------------------------------------
+ * Scheduled payment pipeline (twice a day; publishes seller sheets only when everything passes)
+ * ------------------------------------------------------------------------- */
+
+/** Runs the whole pipeline once (trigger handler; also safe to run manually). Skips if another run holds the lock. */
+function runScheduledPaymentPipeline(e) {
+  const result = runPaymentPipeline_({ trigger: e && e.triggerUid ? 'time-driven' : 'manual' });
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** Installs / updates exactly two daily pipeline triggers from Settings (idempotent; never duplicates). */
+function installScheduledPaymentPipelineTriggers() {
+  const result = installPaymentPipelineTriggers_();
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** Removes the pipeline triggers (other triggers are untouched). */
+function removeScheduledPaymentPipelineTriggers() {
+  const removed = removePaymentPipelineTriggers_();
+  Logger.log('Removed %s pipeline trigger(s)', removed);
+  return removed;
+}
+
+/** Read-only: every pipeline health gate (freshness of each layer + accounting invariants). */
+function verifyPaymentPipelineHealth() {
+  const report = buildPaymentPipelineHealth_();
+  Logger.log(JSON.stringify(report, null, 2));
+  return report;
+}

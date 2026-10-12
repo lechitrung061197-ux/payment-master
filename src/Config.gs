@@ -9,7 +9,7 @@
 
 const APP = Object.freeze({
   NAME: 'Payment Master',
-  SCHEMA_VERSION: 15,
+  SCHEMA_VERSION: 16,
   LOCALE: 'en_US',
   TIMEZONE: 'America/New_York',
   DEFAULT_CURRENCY: 'USD',
@@ -70,7 +70,8 @@ const ENUMS = Object.freeze({
   MATCH_STATUS: ['PENDING_REVIEW', 'CONFIRMED', 'REJECTED', 'REVERSED'],
   LEG_SETTLEMENT_STATUS: ['WAITING_SETTLEMENT', 'SETTLED', 'AVAILABLE'],
   SETTLEMENT_STATUS: ['DRAFT', 'LOCKED', 'VOID'],
-  SELLER_PAYOUT_STATUS: ['DRAFT', 'SENT', 'CONFIRMED', 'VOID'],
+  // Only SENT / CONFIRMED move money. VOID / REVERSED / CANCELLED / FAILED never count (balance and paid status revert).
+  SELLER_PAYOUT_STATUS: ['DRAFT', 'SENT', 'CONFIRMED', 'VOID', 'REVERSED', 'CANCELLED', 'FAILED'],
   // What a Seller Payout Allocation pays: a seller settlement obligation or a positive APPLIED adjustment.
   SELLER_PAYOUT_ALLOCATION_TARGET_TYPE: ['SETTLEMENT', 'ADJUSTMENT'],
   ADJUSTMENT_TYPE: ['REFUND', 'DISPUTE', 'DISPUTE_FEE', 'MANUAL_ADJUSTMENT', 'HOLD_RELEASE'],
@@ -515,7 +516,8 @@ const SCHEMA = Object.freeze([
   {
     sheet: SHEETS.SELLER_PAYOUTS,
     description: 'Money actually sent to sellers. amount is in currency; payout_amount is in payout_currency. ' +
-      'Valid payouts: status SENT or CONFIRMED. One payout may pay several settlements (see Seller Payout ' +
+      'Valid payouts: status SENT or CONFIRMED (DRAFT is provisional; VOID / REVERSED / CANCELLED / FAILED never count). ' +
+      'One payout may pay several settlements (see Seller Payout ' +
       'Allocations), so there is no settlement_id here.',
     columns: [
       col_('seller_payout_id', T.ID),
@@ -757,6 +759,10 @@ const DEFAULT_SETTINGS = Object.freeze([
   ['seller_template_spreadsheet_id', '', 'STRING',
     'Seller template (UI authority) cloned by createSellerSheet: four visible tabs DoiSoat_GD, TongHop_Thang, PhieuDoiSoat, Dispute; Master writes only owned ranges.'],
   ['seller_output_folder_id', '', 'STRING', 'Drive folder that receives seller sheets created by createSellerSheet.'],
+  ['scheduled_sync_morning_hour', 8, 'NUMBER', 'Hour (0-23) of the morning runScheduledPaymentPipeline run, in scheduled_sync_timezone.'],
+  ['scheduled_sync_afternoon_hour', 17, 'NUMBER', 'Hour (0-23) of the afternoon runScheduledPaymentPipeline run, in scheduled_sync_timezone.'],
+  ['scheduled_sync_timezone', 'Asia/Ho_Chi_Minh', 'STRING',
+    'Time zone of the scheduled pipeline hours. Re-run installScheduledPaymentPipelineTriggers after changing the schedule.'],
   ['source.INTERNAL.naive_timestamp_timezone', '', 'STRING',
     'Timezone for internal CSV timestamps without an offset (e.g. "2026-10-01 12:00:00"). Blank = such ' +
     'timestamps are rejected. Timestamps with Z or an offset never use it.'],

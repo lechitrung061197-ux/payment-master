@@ -7,13 +7,15 @@
  * - Targets (target_type / target_id):
  *     SETTLEMENT / settlement_id  - due = SUM(frozen Settlement Items.seller_available_amount) of that seller +
  *                                   settlement + currency (never provider totals, non-AVAILABLE legs, balances or
- *                                   seller sheets; another seller's share is never allocatable);
+ *                                   seller sheets; another seller's share is never allocatable). Provider paid and
+ *                                   seller paid are separate ledgers: provider source_paid_amount is never read here;
  *     ADJUSTMENT / adjustment_id  - a seller credit: status APPLIED and amount > 0 (any adjustment type, e.g.
  *                                   HOLD_RELEASE or a positive MANUAL_ADJUSTMENT); due = amount. Negative / zero,
  *                                   PENDING and VOID adjustments are never payout obligations.
  * - allocation_id = SPA-<sha256(seller_payout_id|target_type|target_id)>; unique by payout + target_type + target_id.
- * - Only SENT / CONFIRMED payouts count as paid; DRAFT allocations are provisional; VOID allocations have no
- *   financial effect but must still be structurally valid. An effective payout must be fully allocated; no payout
+ * - Only SENT / CONFIRMED payouts count as paid; DRAFT allocations are provisional; VOID / REVERSED / CANCELLED /
+ *   FAILED payouts have no financial effect (their rows must still be structurally valid), so a reversed payout makes
+ *   the obligation fall back to PARTIAL / UNPAID automatically. An effective payout must be fully allocated; no payout
  *   may be over-allocated; no obligation over-paid.
  * - Temporal guards: an effective payout needs a valid payout_date; a target must be available (settlement
  *   source_payment_date / adjustment effective_date) on or before the payout date; and the seller PAYABLE BALANCE as of
@@ -35,6 +37,8 @@ const SELLER_ALLOCATIONS = Object.freeze({
   effectiveStatuses: Object.freeze(['SENT', 'CONFIRMED']),
   draftStatus: 'DRAFT',
   voidStatus: 'VOID',
+  // Terminal non-money statuses: no financial effect (rows still structurally validated); paid status reverts.
+  noEffectStatuses: Object.freeze(['VOID', 'REVERSED', 'CANCELLED', 'FAILED']),
   settlementTarget: 'SETTLEMENT',
   adjustmentTarget: 'ADJUSTMENT',
   payoutableAdjustmentStatus: 'APPLIED',
@@ -297,7 +301,7 @@ function validateSellerPayoutAllocations_(input) {
       bad('invalid_targets', 'target_type must be ' + A.settlementTarget + ' or ' + A.adjustmentTarget + ' (found "' + a.target_type + '")');
     }
     // A target must be available on or before the payout date (no payment of a future obligation).
-    if (o && status !== A.voidStatus) {
+    if (o && A.noEffectStatuses.indexOf(status) < 0) {
       const targetKey = sellerDateKeyOrNull_(o.date, dateKeyOf);
       const payoutKey = payout ? sellerDateKeyOrNull_(payout.payout_date, dateKeyOf) : null;
       if (!targetKey) bad('target_date_errors', targetType + ' ' + targetId + ' has no valid availability date');
@@ -306,7 +310,7 @@ function validateSellerPayoutAllocations_(input) {
     if (targetType === A.settlementTarget) summary.settlement_allocation_rows++;
     if (targetType === A.adjustmentTarget) summary.adjustment_allocation_rows++;
     // ---- financial effect (VOID: none)
-    if (status === A.voidStatus) { summary.void_allocation_rows++; return; }
+    if (A.noEffectStatuses.indexOf(status) >= 0) { summary.void_allocation_rows++; return; }
     if (!ok || !o) return;
     const micros = Math.round(a.allocated_amount * 1e6);
     payoutAllocated[payoutId] = (payoutAllocated[payoutId] || 0) + micros;
@@ -323,7 +327,7 @@ function validateSellerPayoutAllocations_(input) {
   Object.keys(payoutsById).sort().forEach(function (id) {
     const p = payoutsById[id];
     const status = trimmedText_(p.status);
-    if (status === A.voidStatus) return;
+    if (A.noEffectStatuses.indexOf(status) >= 0) return;
     const amount = isFiniteNumber_(p.amount) ? Math.round(p.amount * 1e6) : null;
     const allocated = payoutAllocated[id] || 0;
     const effective = A.effectiveStatuses.indexOf(status) >= 0;
@@ -425,7 +429,7 @@ function planFifoAllocation_(payout, allocations, validation, payoutsById, now, 
   const claimed = {};
   allocations.forEach(function (a) {
     const parent = payoutsById[trimmedText_(a.seller_payout_id)];
-    if (!parent || trimmedText_(parent.status) === A.voidStatus || !isFiniteNumber_(a.allocated_amount)) return;
+    if (!parent || A.noEffectStatuses.indexOf(trimmedText_(parent.status)) >= 0 || !isFiniteNumber_(a.allocated_amount)) return;
     const key = sellerObligationKey_(trimmedText_(a.target_type), trimmedText_(a.seller_id), trimmedText_(a.target_id), trimmedText_(a.currency));
     claimed[key] = (claimed[key] || 0) + Math.round(a.allocated_amount * 1e6);
   });

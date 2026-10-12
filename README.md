@@ -57,7 +57,8 @@ src/
   SellerBalances.gs             Derived per-seller balances (+ read-only freshness for downstream gates)
   SellerPayoutAllocations.gs    Seller Payout Allocations: obligations, validation, derived states, FIFO
   SellerDestinations.gs         Seller child spreadsheet destinations (validation, initial seed)
-  SellerOutput.gs               Seller output contract (schema 3): template anchors, validation, model, checksums
+  SellerOutput.gs               Seller output contract (schema 4): template anchors, validation, model, checksums
+  PaymentPipeline.gs            Scheduled twice-daily pipeline, health gates, trigger installer
   SellerSheets.gs               Seller child sheet sync / verify (owned-range renderer, _Sync commit)
   SellerProvisioning.gs         Template-based seller sheet provisioning + Seller Sheets menu helpers
   Main.gs           Public entry points
@@ -679,6 +680,50 @@ without writing while any upstream step is stale.
   (`AMOUNT4` for unrounded economics); `setupMaster` on a v10 Master adds Seller Terms (seeded
   once) and leaves every data tab untouched.
 
+## Scheduled payment pipeline (Phase 2M)
+
+`runScheduledPaymentPipeline()` runs the whole chain twice a day and publishes seller sheets only when every
+stage and every health gate passes. It reuses the existing runners (each keeps its own script lock, staging /
+swap, freshness gates and idempotency); the pipeline itself holds the **document lock**, so an overlapping run
+is skipped (`PIPELINE_SKIPPED_LOCKED`) and never runs in parallel.
+
+| # | Stage (audit prefix) | Runner |
+| --- | --- | --- |
+| 1 | `PROVIDER_SYNC` | raw sync of every enabled provider source (`syncRawSource_`) |
+| 2 | `PROVIDER_NORMALIZE` | Provider Transactions, then Provider Events |
+| 3 | `INTERNAL_NORMALIZE` | Raw Internal Transactions → Transactions (NO_CHANGE when raw is unchanged) |
+| 4 | `RECONCILE` | Payment Matches |
+| 5 | `SETTLEMENT_REFRESH` | provider Settlements (source paid amount / date) |
+| 6 | `PAYMENT_LEGS_REFRESH` | Payment Legs, incl. provider-paid availability (AVAILABLE) |
+| 7 | `SETTLEMENT_ITEMS_REFRESH` | frozen Settlement Items |
+| 8 | `SELLER_BALANCES_REFRESH` | Seller Balances |
+| 9 | `SELLER_PAYOUT_STATUS_REFRESH` | validates Seller Payouts + Allocations; UNPAID / PARTIAL / PAID are derived, never stored |
+| 10 | `HEALTH_CHECK` (`_PASS` / `_FAIL`) | `verifyPaymentPipelineHealth` gates (below) |
+| 11 | `SELLER_SHEETS_SYNC` | ACTIVE seller sheets (PARTIAL counts as a pipeline failure) |
+
+- **Stop on failure**: any stage that is not SUCCESS / NO_CHANGE (/ PASS) stops the run — nothing downstream
+  runs and seller sheets are not published. Every run has a `pipeline_run_id` (`PRUN-…`); audit rows
+  (`entity_type` PIPELINE, `entity_id` = run id): `PIPELINE_STARTED`, `<STAGE>_<STATUS>` with stage,
+  status, started_at, completed_at, duration and error, then `PIPELINE_SUCCESS` / `PIPELINE_FAILED` (failed
+  stage, failed_at, duration) or `PIPELINE_SKIPPED_LOCKED`. The stage runners keep their own detailed audit rows.
+- **Health gates** (`verifyPaymentPipelineHealth()`, read-only): raw provider sync current (swap NORMAL, last
+  batch SUCCESS / NO_CHANGE per enabled tab), Provider Events current, and Transactions / Provider Transactions /
+  Payment Matches / Settlements / Seller Terms / Payment Legs / Settlement Items / Seller Balances current; no
+  duplicate IDs in any canonical table; MATCHED amount mismatch = 0; `seller_available = net − seller_fee −
+  seller_hold` on every leg and item; payout allocations valid; paid ≤ obligation; Seller Balances reconcile to
+  Settlement Items + APPLIED adjustments − valid seller payouts.
+- **Schedule** (Settings, seeded): `scheduled_sync_morning_hour` (8), `scheduled_sync_afternoon_hour` (17),
+  `scheduled_sync_timezone` (`Asia/Ho_Chi_Minh`). `installScheduledPaymentPipelineTriggers()` replaces this
+  pipeline's triggers with exactly two daily time-driven triggers (idempotent — re-running never duplicates;
+  other triggers untouched); `removeScheduledPaymentPipelineTriggers()` removes them. Requires the
+  `script.scriptapp` scope.
+- **Provider paid ≠ seller paid.** Provider paid (did the provider pay VNS?) comes only from Settlements
+  (`source_paid_amount`, `source_payment_date` → AVAILABLE). Seller paid (did VNS pay the seller?) comes only from
+  Seller Payouts + Seller Payout Allocations (`validateSellerPayoutAllocations_` in SellerPayoutAllocations.gs). A
+  provider-paid settlement without a seller payout stays UNPAID. Payout statuses: DRAFT (provisional), SENT /
+  CONFIRMED (effective), VOID / REVERSED / CANCELLED / FAILED (no financial effect — the balance is restored and
+  the obligation falls back to PARTIAL / UNPAID automatically).
+
 ## Seller Payout Allocations (Phase 2L)
 
 - **Seller Payout** = the actual money transfer. It is the only thing that reduces Seller Balances
@@ -741,7 +786,7 @@ without writing while any upstream step is stale.
   CONFIRMED; 5) `normalizeSellerBalances`; 6) `syncSellerSheets`; 7) PhieuDoiSoat section D shows each
   settlement and seller credit as PAID / PARTIAL / UNPAID.
 
-## Seller child sheets (Phase 2K + 2L, seller output schema version 3)
+## Seller child sheets (Phase 2K + 2L + 2M, seller output schema version 4)
 
 Seller child spreadsheets are **output-only projections**. Payment Master stays the sole accounting
 source of truth: it computes and snapshots provider gross, processing fee, net, seller fee rate, seller
@@ -749,9 +794,10 @@ fee, seller hold, seller amount, settlement / payout state and adjustments; the 
 those values and is never read back into Master. No provider trace = no provider economics; no
 confirmed provider settlement = no seller available balance; MATCHED ≠ AVAILABLE.
 
-**Output contract (seller output schema version 3, current)** — exactly four visible tabs from the template
-plus one hidden system tab (version 2 was the Phase 2K contract; version 3 adds the Phase 2L
-allocation-aware PhieuDoiSoat section D):
+**Output contract (seller output schema version 4, current)** — exactly four visible tabs from the template
+plus one hidden system tab (version 2 was the Phase 2K contract; version 3 added the Phase 2L
+allocation-aware PhieuDoiSoat section D; version 4 adds the payout date / method / reference of the effective
+payouts on each section D obligation row):
 
 | Tab | Content (owned ranges only) |
 | --- | --- |
@@ -761,7 +807,7 @@ allocation-aware PhieuDoiSoat section D):
 | `Dispute` | Canonical Master disputes attributable to the seller (no buyer data, no internal notes); clean headers when none. |
 | `_Sync` (hidden) | `output_schema_version, seller_id, seller_name, master_schema_version, synced_at`, the four tab checksums and a combined checksum — the commit marker. No Master ID, tokens or PII. |
 
-**PhieuDoiSoat section D (output schema 3, Phase 2L)** — same template geometry; column I is
+**PhieuDoiSoat section D (output schema 3+, Phase 2L / 2M)** — same template geometry; column I is
 **`Chưa payout`** (it was `Còn nợ` in the template before Phase 2L):
 
 | Column | Settlement row / positive APPLIED adjustment row (payout obligation) | Negative adjustment row | `Payout` row |
@@ -771,6 +817,7 @@ allocation-aware PhieuDoiSoat section D):
 | G `Tổng phải trả` | chronological running seller accounting balance after the row | same | same |
 | H `Đã payout seller (USD)` | effective allocations to this obligation | 0 | the actual SENT / CONFIRMED payout amount |
 | I `Chưa payout` | cash-attribution remainder of this obligation (due − effective allocations) | blank | blank |
+| O `Hình thức / chứng từ` | effective payouts allocated to it: `dd/MM/yyyy · method · reference · amount` (schema 4) | type | method / reference |
 
 `Chưa payout` is cash attribution only, **not** the seller's debt. Section B `CÒN NỢ SAU THANH TOÁN (USD)`
 remains the authoritative current accounting balance. Example: settlement 100, refund −20, payout 80

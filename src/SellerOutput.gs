@@ -17,13 +17,15 @@
  *   ("Chưa payout" - cash attribution, NOT the seller's accounting debt; Section B is the balance) and a
  *   label "<source> #<n> · UNPAID|PARTIAL|PAID" / "<adjustment_type> · ...". Negative adjustments stay plain debit
  *   rows. Payout rows still show the actual money movement; allocations never move the running balance.
+ * - Output schema 4: obligation rows also show, in "Hình thức / chứng từ", every effective payout allocated to them
+ *   ("dd/MM/yyyy · method · reference · amount"), straight from Seller Payouts + Seller Payout Allocations.
  *
  * Everything in this file is pure (unit-tested in Node); I/O lives in SellerSheets.gs.
  */
 
 const SELLER_OUTPUT = Object.freeze({
-  schemaVersion: 3,
-  checksumVersion: 'seller-output-v3',
+  schemaVersion: 4,
+  checksumVersion: 'seller-output-v4',
   syncTab: '_Sync',
   visibleTabs: Object.freeze(['DoiSoat_GD', 'TongHop_Thang', 'PhieuDoiSoat', 'Dispute']),
   legacyTabs: Object.freeze(['Summary', 'Transactions', 'Settlements', 'Payouts', 'Adjustments', 'Sync Info']),
@@ -553,6 +555,26 @@ function buildSellerOutputs_(input) {
       events.push({ key: dk(s.source_payment_date), rank: 0, order: Number(s.source_settlement_number) || 0, kind: 'S', s: s, st: st,
         amount: micro_(st.due_amount), hold: micro_(st.hold_amount), paid: micro_(st.paid_amount), remaining: micro_(st.remaining_amount) });
     });
+    // Effective payouts allocated to each obligation (payout date / method / reference shown on the obligation row).
+    const payoutById = {};
+    input.payouts.forEach(function (p) { payoutById[trimmedText_(p.seller_payout_id)] = p; });
+    const paidBy = {};
+    (input.allocations || []).forEach(function (a) {
+      const p = payoutById[trimmedText_(a.seller_payout_id)];
+      if (!p || trimmedText_(a.seller_id) !== sellerId || counted.indexOf(trimmedText_(p.status)) < 0) return;
+      const k = trimmedText_(a.target_type) + '|' + trimmedText_(a.target_id);
+      (paidBy[k] = paidBy[k] || []).push({ p: p, amount: a.allocated_amount });
+    });
+    const paidText = function (targetType, targetId) {
+      return (paidBy[targetType + '|' + targetId] || []).slice().sort(function (x, y) {
+        return compareCanonicalValues_(x.p.payout_date, y.p.payout_date) || compareCanonicalValues_(String(x.p.seller_payout_id), String(y.p.seller_payout_id));
+      }).map(function (x) {
+        const key = dk(x.p.payout_date);
+        const date = key ? key.slice(8, 10) + '/' + key.slice(5, 7) + '/' + key.slice(0, 4) : '';
+        return [date, trimmedText_(x.p.payment_method), trimmedText_(x.p.reference), isFiniteNumber_(x.amount) ? String(Math.round(x.amount * 1e6) / 1e6) : '']
+          .filter(Boolean).join(' · ');
+      }).join('; ');
+    };
     const creditState = {};
     allocation.states.filter(function (st) { return st.seller_id === sellerId && st.target_type === SELLER_ALLOCATIONS.adjustmentTarget; })
       .forEach(function (st) { creditState[st.target_id] = st; });
@@ -573,7 +595,7 @@ function buildSellerOutputs_(input) {
         return [sellerSettlementLabel_(e.s, e.st.payment_status), dateOnly(e.s.period_start_date), dateOnly(e.s.period_end_date),
           dateOnly(e.s.source_payment_date), e.amount / 1e6, before / 1e6, (before + e.amount) / 1e6, e.paid / 1e6, e.remaining / 1e6, e.hold / 1e6, 0,
           runHold / 1e6,
-          dateOnly(e.s.hold_release_due_from_date), dateOnly(e.s.hold_release_due_to_date), '', '', ''];
+          dateOnly(e.s.hold_release_due_from_date), dateOnly(e.s.hold_release_due_to_date), paidText(SELLER_ALLOCATIONS.settlementTarget, String(e.s.settlement_id)), '', ''];
       }
       if (e.kind === 'A') {
         runBalance += e.amount;
@@ -582,7 +604,8 @@ function buildSellerOutputs_(input) {
         if (e.st) {
           // Positive APPLIED credit = payout obligation: H / I = effective allocations to it / its remaining.
           return [type + ' · ' + e.st.payment_status, dateOnly(e.a.effective_date), '', '', e.amount / 1e6, before / 1e6, runBalance / 1e6,
-            micro_(e.st.paid_amount) / 1e6, micro_(e.st.remaining_amount) / 1e6, 0, e.release / 1e6, runHold / 1e6, '', '', type, '', ''];
+            micro_(e.st.paid_amount) / 1e6, micro_(e.st.remaining_amount) / 1e6, 0, e.release / 1e6, runHold / 1e6, '', '',
+            paidText(SELLER_ALLOCATIONS.adjustmentTarget, trimmedText_(e.a.adjustment_id)) || type, '', ''];
         }
         // Negative APPLIED adjustment: ordinary ledger debit, no payout status (and nothing "Chưa payout").
         return [type, dateOnly(e.a.effective_date), '', '', e.amount / 1e6, before / 1e6, runBalance / 1e6, 0, '', 0, e.release / 1e6,
