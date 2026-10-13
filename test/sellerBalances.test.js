@@ -35,16 +35,18 @@ const build = (o) => H.buildSellerBalances_({ items: o.items || [item('1', 'CUS0
 const errs = (b) => js(H.flattenBalanceErrors_(b.errors)).join(' | ');
 const row = (b, k) => js(b.rows).find((r) => r.seller_id + '|' + r.currency === (k || 'CUS001|USD'));
 
-test('current production shape: four sellers from Settlement Items only; regression report', () => {
-  const exp = js(vm.runInContext('SELLER_BALANCES_REGRESSION', context)).balances;
-  const items = Object.entries(exp).map(([k, v], i) => item(String(i), k.split('|')[0], v.settled_amount, v.seller_hold_balance));
+// Production fixture (Phase 2J shape) lives here, not in runtime code.
+const PROD_BALANCES = { CUS001: [1919.3986, 234.073], CUS002: [3037.444, 370.42], CUS003: [256.7666, 31.313], CUS004: [3156.4424, 384.932] };
+
+test('current production shape: four sellers from Settlement Items only; runtime invariants pass', () => {
+  const items = Object.entries(PROD_BALANCES).map(([id, [settled, hold]], i) => item(String(i), id, settled, hold));
   const b = build({ items });
   assert.equal(errs(b), '');
   const s = js(H.summarizeSellerBalances_(b.rows));
   assert.equal(s.balance_rows, 4);
   assert.ok(Math.abs(s.settled_total - 8370.0516) < 1e-9);
   assert.ok(Math.abs(s.hold_total - 1020.738) < 1e-9);
-  assert.equal(H.evaluateSellerBalancesRegression_(b.rows, s).pass, true);
+  assert.equal(H.evaluateSellerBalancesInvariants_(b.rows, s).pass, true);
   const r = row(b);
   assert.equal(r.current_balance, r.available_amount);
   assert.equal(r.paid_amount, 0);
@@ -97,4 +99,19 @@ test('rerun NO_CHANGE with updated_at preserved; content change updates it; a di
   const changed = build({ existing: first, now: T2, adjustments: [adj('A1')] });
   assert.equal(changed.rows[0].updated_at.getTime(), T2.getTime());
   assert.match(errs(build({ items: [item('2', 'CUS002', 5, 0)], existing: first, now: T2 })), /Seller balance CUS001\|USD would disappear/);
+});
+
+test('invariants (2P.2): pass after a legitimate payout; fail on an inconsistent row or wrong totals', () => {
+  const items = Object.entries(PROD_BALANCES).map(([id, [settled, hold]], i) => item(String(i), id, settled, hold));
+  const b = build({ items, payouts: [pay('P1', { seller_id: 'CUS002', amount: 3037.444, status: 'CONFIRMED' })] });
+  assert.equal(errs(b), '');
+  const s = js(H.summarizeSellerBalances_(b.rows));
+  assert.ok(Math.abs(s.current_balance_total - 5332.6076) < 1e-9);
+  assert.equal(H.evaluateSellerBalancesInvariants_(b.rows, s).pass, true, 'a valid payout never fails the runtime report');
+  const rows = js(b.rows);
+  rows[1].current_balance = 1;
+  const bad = js(H.evaluateSellerBalancesInvariants_(rows, s));
+  assert.equal(bad.pass, false);
+  assert.ok(bad.failed.includes('current_balance = settled + adjustments - paid') && bad.failed.includes('available_amount = current_balance'));
+  assert.ok(js(H.evaluateSellerBalancesInvariants_(js(b.rows), { ...s, paid_total: 0 })).failed.includes('summary totals = SUM(rows)'));
 });

@@ -11,7 +11,9 @@
  *   DOCUMENT lock (DocumentLock outer -> ScriptLock inner).
  * - Status changes are named actions only (SEND / CONFIRM / CANCEL / REVERSE), mapped to the guarded
  *   runSellerPayoutTransition_ with the status the browser last saw (stale -> rejected). Retry Allocation reruns the
- *   existing FIFO allocator for an incomplete DRAFT. The client can never send a status value.
+ *   existing FIFO allocator for an incomplete DRAFT. Set Payment Proof (runSetPayoutProof_) is the only payout edit:
+ *   method + reference of a DRAFT. The client can never send a status value.
+ * - Lists: open payouts (DRAFT / SENT, never dropped) and the 20 most recent CONFIRMED (still reversible).
  * - Dates: the Master timezone (America/New_York) on the server; the browser clock / timezone is never used.
  *
  * The first part of this file is pure (unit-tested in Node); the I/O part follows.
@@ -95,6 +97,16 @@ function buildPayoutPreview_(rows, obligations) {
   });
 }
 
+/** Open (DRAFT / SENT, all) and recent CONFIRMED (bounded) payout views, newest first. */
+function payoutModalLists_(payouts, allocations, sellerId, dateKeyOf) {
+  const views = (payouts || []).filter(function (p) { return trimmedText_(p.seller_payout_id) !== '' && (!sellerId || trimmedText_(p.seller_id) === sellerId); })
+    .map(function (p) { return Object.assign(buildPayoutModalView_(p, allocations, dateKeyOf), { _key: sellerDateKeyOrNull_(p.payout_date, dateKeyOf || masterDateKey_) || '' }); })
+    .sort(function (a, b) { return compareCanonicalValues_(b._key, a._key) || compareCanonicalValues_(b.seller_payout_id, a.seller_payout_id); });
+  const strip = function (v) { delete v._key; return v; };
+  return { open_payouts: views.filter(function (v) { return OPERATIONS.openStatuses.indexOf(v.status) >= 0; }).map(strip),
+    recent_confirmed: views.filter(function (v) { return v.status === 'CONFIRMED'; }).slice(0, OPERATIONS.recentClosedLimit).map(strip) };
+}
+
 /** Read-only summary of one payout for the modal. */
 function buildPayoutModalView_(payout, allocations, dateKeyOf) {
   const id = trimmedText_(payout.seller_payout_id);
@@ -108,7 +120,7 @@ function buildPayoutModalView_(payout, allocations, dateKeyOf) {
     fx_rate: payout.fx_rate, payment_method: trimmedText_(payout.payment_method), reference: trimmedText_(payout.reference), notes: trimmedText_(payout.notes),
     status: status, allocated_amount: allocated / 1e6, allocation_status: allocated <= SELLER_ALLOCATIONS.toleranceMicros ? 'NONE' : full ? 'FULL' : 'PARTIAL',
     allocations: own.map(function (a) { return { target_type: trimmedText_(a.target_type), target_id: trimmedText_(a.target_id), allocated_amount: a.allocated_amount }; }),
-    actions: payoutModalActions_(status, full) };
+    needs_proof: trimmedText_(payout.payment_method) === '' || trimmedText_(payout.reference) === '', actions: payoutModalActions_(status, full) };
 }
 
 /* ---------------------------------- I/O --------------------------------- */
@@ -128,12 +140,8 @@ function payoutModalLine_(l, name) {
     payment_state: l.payment_state };
 }
 
-function activePayoutViews_(ctx, sellerId) {
-  return ctx.input.payouts.filter(function (p) {
-    return OPERATIONS.activeStatuses.indexOf(trimmedText_(p.status)) >= 0 && (!sellerId || trimmedText_(p.seller_id) === sellerId);
-  }).map(function (p) { return buildPayoutModalView_(p, ctx.input.allocations); })
-    .sort(function (a, b) { return compareCanonicalValues_(b.payout_date.split('/').reverse().join(''), a.payout_date.split('/').reverse().join('')) ||
-      compareCanonicalValues_(b.seller_payout_id, a.seller_payout_id); });
+function payoutModalListsOf_(ctx, sellerId) {
+  return payoutModalLists_(ctx.input.payouts, ctx.input.allocations, sellerId);
 }
 
 /** Modal start: ACTIVE sellers, the Master (New York) date, a fresh request token, active payouts to resume. Never throws. */
@@ -144,7 +152,7 @@ function runPayoutModalBootstrap_() {
     return payoutModalSafe_({ status: 'SUCCESS', master_timezone: APP.TIMEZONE, today: formatOperationsDate_(masterDateKey_(new Date())),
       token: Utilities.getUuid(), sellers: ctx.sellers.filter(function (s) { return s.seller_id !== '' && s.status === 'ACTIVE'; })
         .map(function (s) { return { seller_id: s.seller_id, seller_name: s.seller_name }; }),
-      active_payouts: activePayoutViews_(ctx, '') });
+      lists: payoutModalListsOf_(ctx, '') });
   } catch (err) {
     return { status: 'FAILED', error: err && err.message ? err.message : String(err) };
   }
@@ -166,7 +174,7 @@ function runPayoutModalSeller_(sellerId) {
     });
     return payoutModalSafe_({ status: 'SUCCESS', seller_id: id, seller_name: seller.seller_name,
       lines: lines.map(function (l) { return payoutModalLine_(l, seller.seller_name); }),
-      default_currency: lines.length === 1 ? lines[0].currency : '', obligations: obligations, active_payouts: activePayoutViews_(ctx, id),
+      default_currency: lines.length === 1 ? lines[0].currency : '', obligations: obligations, lists: payoutModalListsOf_(ctx, id),
       ledger_errors: flattenAllocationErrors_(ctx.input.validation.errors).slice(0, 5) });
   } catch (err) {
     return { status: 'FAILED', error: err && err.message ? err.message : String(err) };
@@ -272,4 +280,10 @@ function runPayoutModalRetryAllocation_(payoutId) {
     return r;
   });
   return withPayoutModalView_(result, id);
+}
+
+/** Records method + reference of a DRAFT (the only payout edit the modal can make). Never throws. */
+function runPayoutModalSetProof_(payoutId, expectedStatus, method, reference) {
+  const id = trimmedText_(payoutId);
+  return withPayoutModalView_(runSetPayoutProof_(id, expectedStatus, method, reference), id);
 }

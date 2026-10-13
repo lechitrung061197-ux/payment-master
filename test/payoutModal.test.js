@@ -47,7 +47,7 @@ test('1: bootstrap lists only ACTIVE sellers, the New York date, a request token
   assert.equal(b.master_timezone, 'America/New_York');
   assert.match(b.token, /\S/);
   assert.notEqual(b.token, fn('payoutModalBootstrap').token, 'a new request each time the modal opens');
-  assert.deepEqual(b.active_payouts, []);
+  assert.deepEqual(b.lists, { open_payouts: [], recent_confirmed: [] });
 });
 
 test('2 + 3 + 4: seller selection returns the canonical balance and FIFO obligations; one currency is auto-selected; Pay Full = available_to_draft', () => {
@@ -68,7 +68,7 @@ test('2 + 3 + 4: seller selection returns the canonical balance and FIFO obligat
   const r2 = fn('payoutModalSeller', 'CUS001');
   assert.ok(near(r2.lines[0].draft_reserved, 500) && near(r2.lines[0].available_to_draft, 1419.3986));
   assert.ok(near(r2.obligations.USD[0].draft_claimed, 500));
-  assert.equal(r2.active_payouts.length, 1);
+  assert.equal(r2.lists.open_payouts.length, 1);
 });
 
 test('5: the FIFO preview equals the allocation Create Draft then writes (same canonical plan), and writes nothing', () => {
@@ -181,7 +181,7 @@ test('14: stale browser data is recomputed / rejected by the backend', () => {
   assert.equal(stale.status, 'FAILED');
   assert.match(stale.error, /available to draft 56\.7666/);
   // a stale status: the modal shows DRAFT but the payout was cancelled elsewhere
-  const view = fn('payoutModalSeller', 'CUS003').active_payouts[0];
+  const view = fn('payoutModalSeller', 'CUS003').lists.open_payouts[0];
   assert.equal(view.status, 'DRAFT');
   assert.equal(act(view, 'CANCEL').status, 'SUCCESS');
   const again = act(view, 'SEND'); // still "DRAFT" in the browser
@@ -213,7 +213,7 @@ test('resume: an incomplete DRAFT (FIFO failed) is offered Retry Allocation + Ca
   assert.match(act(c.payout, 'SEND').error, /not fully allocated/);
   // modal closed and reopened: the DRAFT is listed and resumable
   const reopened = fn('payoutModalBootstrap');
-  assert.deepEqual(reopened.active_payouts.map((p) => [p.seller_payout_id, p.actions]), [[c.seller_payout_id, ['RETRY_ALLOCATION', 'CANCEL']]]);
+  assert.deepEqual(reopened.lists.open_payouts.map((p) => [p.seller_payout_id, p.actions]), [[c.seller_payout_id, ['RETRY_ALLOCATION', 'CANCEL']]]);
   const r = fn('payoutModalRetryAllocation', c.seller_payout_id);
   assert.equal(r.status, 'SUCCESS', r.error);
   assert.deepEqual([r.payout.allocation_status, r.payout.actions], ['FULL', ['SEND', 'CANCEL']]);
@@ -258,7 +258,7 @@ test('HTML: a UI only - calls only the whitelisted endpoints, renders with textC
   const html = fs.readFileSync(path.join(SRC, 'PayoutModalView.html'), 'utf8');
   const called = [...html.matchAll(/call\('(\w+)'/g)].map((m) => m[1]);
   assert.deepEqual([...new Set(called)].sort(), ['payoutModalBootstrap', 'payoutModalCreateDraft', 'payoutModalPayout', 'payoutModalPreview',
-    'payoutModalRetryAllocation', 'payoutModalSeller', 'payoutModalTransition'].sort());
+    'payoutModalRetryAllocation', 'payoutModalSeller', 'payoutModalSetPaymentProof', 'payoutModalTransition'].sort());
   called.forEach((n) => assert.equal(typeof sim.ctx[n], 'function', n));
   assert.ok(!/innerHTML|outerHTML|insertAdjacentHTML|document\.write/.test(html), 'no HTML injection sinks');
   assert.ok(!/setValue|getRange|Seller Payouts|status\s*:\s*'SENT'/.test(html), 'no direct sheet access / status payloads');

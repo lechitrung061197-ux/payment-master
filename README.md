@@ -811,8 +811,8 @@ is skipped (`PIPELINE_SKIPPED_LOCKED`) and never runs in parallel.
 - **`verifySellerPayoutAllocations()`** (read-only): row counts (draft / effective / void, per target type),
   effective payouts and how many are fully allocated, every error class, `settlement_due / _paid /
   _remaining`, `adjustment_due / _paid / _remaining`, `total_payoutable_due / total_paid / total_remaining`,
-  the same per seller, status counts (total and per target type), every obligation state and a report-only
-  production regression (HUI settlement obligations 2132.2706 + 905.1734 = 3037.444, no payouts, no credits).
+  the same per seller, status counts (total and per target type), every obligation state and the runtime
+  invariants (`regression`, Phase 2P.2: due = paid + remaining, status, effective payouts fully allocated, totals).
 - **Workflow**: use the Operations tab (Phase 2O, below): Create Draft + FIFO → review → Mark Selected SENT
   (→ CONFIRMED). The manual path (`autoAllocateSellerPayoutFIFO`, editing the status in Seller Payouts, then
   `normalizeSellerBalances` and `syncSellerSheets`) still works and is guarded by the same validation, but
@@ -833,7 +833,7 @@ cell, parsed strictly — never re-read by the en_US locale), Amount, Payout Cur
 Payment Method, Reference, Notes, request token, last result); from row 32 (columns A–L, rewritten on every
 refresh — keep custom notes in column N or later) **Seller payable** (one row per seller + currency:
 current_balance, seller_hold_balance, DRAFT reserved, available_to_draft, open obligations, effective paid,
-payment state) and **Recent / active payouts** (every DRAFT / SENT / CONFIRMED + the 20 latest closed ones:
+payment state) and **Recent / active payouts** (every DRAFT / SENT + the 20 latest closed ones, CONFIRMED included:
 id, seller, date, amounts and currencies, method, reference, status, allocated amount, FULL / PARTIAL / NONE).
 
 - `available_to_draft = max(0, min(current_balance − DRAFT reserved, open obligations not yet claimed by a
@@ -913,6 +913,30 @@ Operations form stays as a fallback under `Payouts > Advanced`. The modal is a U
   before. A complete request returns `next_token`; an incomplete one keeps the token (retry, never a second DRAFT).
   Endpoints: `payoutModalBootstrap`, `payoutModalSeller`, `payoutModalPreview`, `payoutModalCreateDraft`,
   `payoutModalPayout`, `payoutModalTransition`, `payoutModalRetryAllocation`.
+
+**Payout hardening (Phase 2P.2)** — guards enforced by the backend (Operations selected-row actions and the modal alike):
+
+- **Future payout date**: a DRAFT may be dated in the future (Preview / Create allowed), but DRAFT → SENT fails while
+  `payout_date` > Master today (`masterDateKey_(now)`, America/New_York; never the browser clock or a fixed UTC offset):
+  "Payout date 20/10/2026 is in the future …; it cannot be marked SENT before that date."
+- **Payment proof**: a DRAFT may be created without `payment_method` / `reference`; DRAFT → SENT requires both. The
+  normalized `payment_method + reference` (trimmed, single spaces, case-insensitive) must not be on any other payout
+  except a CANCELLED one (REVERSED keeps its reference; the payout itself never counts). Checked at Create (when a
+  reference is given), at Set Payment Proof and at SEND. **Set Payment Proof** (modal; `runSetPayoutProof_`) is the
+  only payout edit: method + reference of a DRAFT, audited `SELLER_PAYOUT_PROOF_UPDATED`; transitions never carry edits.
+- **Bounded lists**: open = DRAFT / SENT (never dropped). CONFIRMED is closed. The Operations table shows every
+  DRAFT / SENT + the 20 latest closed payouts; the modal shows open payouts and the 20 latest CONFIRMED (Reverse
+  still available).
+- **Cross currency**: `fx_rate` = payout-currency units per 1 accounting-currency unit, so
+  `payout_amount ≈ amount × fx_rate` within `max(0.01, |amount × fx_rate| × 1e-6)` — validated at Preview, Create,
+  SENT and CONFIRMED; the modal recalculates the payout amount, the server re-validates. Same currency unchanged
+  (fx 1, payout amount = amount).
+- **Runtime invariants instead of "0 payout" snapshots**: `verifySellerBalances().regression`,
+  `verifySellerPayoutAllocations().regression` and `verifySellerSheets().regression` are state-independent invariant
+  reports (current_balance = settled + adjustments − paid; available = current; totals = Σ rows; obligation due = paid
+  + remaining; status matches paid / remaining; effective payout allocation = amount; no over-allocation; seller
+  projection balance / hold = Seller Balances). A failed invariant is an error; a valid payout never fails them.
+  Production figures live only in test fixtures.
 
 **Menu `Payment Master`**: Sync (Run Full Sync, Verify Health, Sync Seller Sheets) · Payouts (New Payout, Refresh
 Operations, Mark Selected SENT / CONFIRMED, Cancel Selected DRAFT, Reverse Selected Payout,
@@ -1071,9 +1095,9 @@ the old `_Sync`, so `verifySellerSheets` reports the child as stale / incomplete
 **Results**: per seller `SUCCESS` / `NO_CHANGE` / `FAILED`; overall `SELLER_SHEETS_SYNC_SUCCESS`,
 `_NO_CHANGE`, `_PARTIAL` or `_FAILED`, audited with per-seller details. `verifySellerSheets()` is
 read-only: per ACTIVE destination it checks access, the contract, each tab's checksum, `_Sync`,
-combined checksum, isolation and leaks, and reports a report-only production regression (CUS002 / HUI:
-143 transactions, 74 MATCHED, 69 MISSING_PROVIDER; balance 3037.444 + hold 370.420 + seller fee
-296.336 + processing fee 156.310 + missing-provider order amount 3501.760 = 7362.270 total order amount).
+combined checksum, isolation and leaks, and reports the runtime seller-output invariants (`regression`, Phase 2P.2:
+each projected balance / hold = Seller Balances, known obligation ≥ balance + hold). The HUI production figures
+(143 transactions, 74 MATCHED, 69 MISSING_PROVIDER, …) are a test fixture only.
 
 ## Tests
 

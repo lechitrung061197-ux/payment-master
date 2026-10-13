@@ -73,23 +73,6 @@ const SELLER_TEMPLATE = Object.freeze({
   disputeDocsWaiting: 'Chờ seller nộp docs',
 });
 
-/** Current production regression (report only): seller summaries after Phase 2J; CUS002 / HUI in detail. */
-const SELLER_SHEETS_REGRESSION = Object.freeze({
-  snapshot: 'Production after Phase 2J (356 Transactions, 168 AVAILABLE PAYPAL legs, no payouts/adjustments)',
-  sellers: {
-    CUS001: { total_transactions: 88, matched_transactions: 43, missing_provider_transactions: 45, current_balance: 1919.3986,
-      seller_hold: 234.073, known_obligation: 2153.4716 },
-    CUS002: { total_transactions: 143, matched_transactions: 74, missing_provider_transactions: 69, total_order_amount: 7362.27,
-      matched_gross: 3860.51, processing_fee: 156.31, net: 3704.2, seller_fee: 296.336, seller_hold: 370.42, current_balance: 3037.444,
-      known_obligation: 3407.864, missing_provider_order_amount: 3501.76 },
-    CUS003: { total_transactions: 26, matched_transactions: 4, missing_provider_transactions: 22, current_balance: 256.7666,
-      seller_hold: 31.313, known_obligation: 288.0796 },
-    CUS004: { total_transactions: 99, matched_transactions: 47, missing_provider_transactions: 52, current_balance: 3156.4424,
-      seller_hold: 384.932, known_obligation: 3541.3744 },
-  },
-  seller_fee_rates: { CUS002: { PAYPAL: [0.08] } },
-});
-
 /* ------------------------------ Grid helpers ------------------------------ */
 
 function sellerText_(v) {
@@ -810,29 +793,37 @@ function compareSellerWorkbook_(snapshot, wb, opts) {
   return out;
 }
 
-/** Report-only regression of expected seller totals. */
-function evaluateSellerSheetsRegression_(snapshots) {
-  const exp = SELLER_SHEETS_REGRESSION;
+/**
+ * Runtime invariants of the seller output (report.regression), state-independent: each seller's projected balance and
+ * hold equal the canonical Seller Balances (sum over currencies), known obligation >= balance + hold, transaction counts
+ * add up (matched + missing <= total). Section B / D reconciliation to Seller Balances is enforced while building.
+ */
+function evaluateSellerSheetsInvariants_(snapshots, balances) {
+  const tol = 50;
+  const m = function (v) { return isFiniteNumber_(v) ? Math.round(v * 1e6) : NaN; };
+  const canon = {};
+  (balances || []).forEach(function (b) {
+    const c = canon[trimmedText_(b.seller_id)] = canon[trimmedText_(b.seller_id)] || { balance: 0, hold: 0 };
+    c.balance += m(b.current_balance);
+    c.hold += m(b.seller_hold_balance);
+  });
   const checks = [];
-  const add = function (n, e, a, pass) { checks.push({ name: n, expected: e, actual: a, pass: pass }); };
-  Object.keys(exp.sellers).forEach(function (id) {
-    const t = snapshots[id] ? snapshots[id].totals : null;
-    Object.keys(exp.sellers[id]).forEach(function (f) {
-      const e = exp.sellers[id][f];
-      const a = t ? t[f] : null;
-      add(id + '.' + f, e, a, isFiniteNumber_(a) && Math.abs(a - e) < 0.00005);
-    });
-  });
-  Object.keys(exp.seller_fee_rates).forEach(function (id) {
-    const t = snapshots[id] ? snapshots[id].totals.seller_fee_rates : null;
-    add(id + '.seller_fee_rates', exp.seller_fee_rates[id], t, JSON.stringify(t) === JSON.stringify(exp.seller_fee_rates[id]));
-  });
-  const hui = snapshots.CUS002 ? snapshots.CUS002.totals : null;
-  if (hui) {
-    const lhs = Math.round((hui.current_balance + hui.seller_hold + hui.seller_fee + hui.processing_fee + hui.missing_provider_order_amount) * 1e6);
-    add('CUS002.identity', 'balance + hold + seller fee + processing fee + missing order amount = total order amount', lhs / 1e6,
-      Math.abs(lhs - Math.round(hui.total_order_amount * 1e6)) <= 50);
-  }
-  return { snapshot: exp.snapshot, pass: checks.every(function (c) { return c.pass; }),
+  const add = function (n, problems) { checks.push({ name: n, pass: problems.length === 0, detail: problems.slice(0, 10).join(' | ') || 'ok' }); };
+  const ids = Object.keys(snapshots).sort();
+  add('seller balance = Seller Balances', ids.filter(function (id) {
+    return !(Math.abs(m(snapshots[id].totals.current_balance) - ((canon[id] || {}).balance || 0)) <= tol);
+  }));
+  add('seller hold = Seller Balances', ids.filter(function (id) {
+    return !(Math.abs(m(snapshots[id].totals.seller_hold) - ((canon[id] || {}).hold || 0)) <= tol);
+  }));
+  add('known obligation >= balance + hold', ids.filter(function (id) {
+    const t = snapshots[id].totals;
+    return !(m(t.known_obligation) >= m(t.current_balance) + m(t.seller_hold) - tol);
+  }));
+  add('matched + missing <= total transactions', ids.filter(function (id) {
+    const t = snapshots[id].totals;
+    return !(t.matched_transactions + t.missing_provider_transactions <= t.total_transactions);
+  }));
+  return { snapshot: 'invariants', pass: checks.every(function (c) { return c.pass; }),
     failed: checks.filter(function (c) { return !c.pass; }).map(function (c) { return c.name; }), checks: checks };
 }

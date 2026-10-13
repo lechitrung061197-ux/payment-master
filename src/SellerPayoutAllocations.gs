@@ -46,17 +46,6 @@ const SELLER_ALLOCATIONS = Object.freeze({
   maxReportedErrors: 30,
 });
 
-/** Current production regression (after Phase 2K: no payouts, no allocations, no positive APPLIED adjustments). */
-const SELLER_ALLOCATIONS_REGRESSION = Object.freeze({
-  snapshot: 'Production after Phase 2K (verified HUI settlement obligations; no payouts / allocations / seller credits)',
-  allocation_rows: 0,
-  effective_payout_count: 0,
-  per_seller_settlement_due: { CUS001: 1919.3986, CUS002: 3037.444, CUS003: 256.7666, CUS004: 3156.4424 },
-  per_seller_paid: { CUS001: 0, CUS002: 0, CUS003: 0, CUS004: 0 },
-  adjustment_due: 0,
-  settlement_due: { 'CUS002|ST-KH001-PAYPAL-000001': 2132.2706, 'CUS002|ST-KH001-PAYPAL-000002': 905.1734 },
-});
-
 /* ----------------------------- Pure helpers ----------------------------- */
 
 function sellerAllocationId_(payoutId, targetType, targetId, digestHex) {
@@ -560,7 +549,8 @@ function buildSellerPayoutAllocationsReport_() {
     });
     const errors = flattenAllocationErrors_(v.errors);
     if (errors.length > 0) report.errors.push('Seller Payout Allocations has ' + errors.length + ' error(s); Seller Balances will fail closed.');
-    report.regression = evaluateSellerAllocationsRegression_(v);
+    report.regression = evaluateSellerAllocationsInvariants_(v, input.payouts);
+    if (!report.regression.pass) report.errors.push('Seller Payout Allocations invariants failed: ' + report.regression.failed.join(', '));
   } catch (err) {
     report.errors.push(err && err.message ? err.message : String(err));
   }
@@ -568,27 +558,41 @@ function buildSellerPayoutAllocationsReport_() {
   return redactDeep_(report);
 }
 
-function evaluateSellerAllocationsRegression_(validation) {
-  const exp = SELLER_ALLOCATIONS_REGRESSION;
+/**
+ * Runtime invariants of the payout ledger (report.regression). State-independent - they hold with or without payouts:
+ *   every obligation due = paid + remaining; paid <= due; status = UNPAID / PARTIAL / PAID of (due, paid);
+ *   every effective (SENT / CONFIRMED) payout allocated exactly its amount; no payout over-allocated;
+ *   summary totals = SUM(obligation states). All ± 0.00005.
+ */
+function evaluateSellerAllocationsInvariants_(validation, payouts) {
+  const A = SELLER_ALLOCATIONS;
+  const tol = A.toleranceMicros;
+  const m = function (v) { return isFiniteNumber_(v) ? Math.round(v * 1e6) : NaN; };
   const checks = [];
-  const add = function (n, e, a, pass) { checks.push({ name: n, expected: e, actual: a, pass: pass }); };
-  const s = validation.summary;
-  add('allocation_rows', exp.allocation_rows, s.allocation_rows, s.allocation_rows === exp.allocation_rows);
-  add('effective_payout_count', exp.effective_payout_count, s.effective_payout_count, s.effective_payout_count === exp.effective_payout_count);
-  add('adjustment_due', exp.adjustment_due, s.adjustment_due, Math.abs(s.adjustment_due - exp.adjustment_due) < 0.00005);
-  ['per_seller_settlement_due', 'per_seller_paid'].forEach(function (k) {
-    Object.keys(exp[k]).forEach(function (id) {
-      const a = s[k][id];
-      add(k + '.' + id, exp[k][id], a === undefined ? null : a, isFiniteNumber_(a) && Math.abs(a - exp[k][id]) < 0.00005);
-    });
+  const add = function (n, problems) { checks.push({ name: n, pass: problems.length === 0, detail: problems.slice(0, 10).join(' | ') || 'ok' }); };
+  const label = function (s) { return s.target_type + ' ' + s.target_id + ' (' + s.seller_id + ')'; };
+  const states = validation.states;
+  add('due = paid + remaining', states.filter(function (s) { return !(Math.abs(m(s.due_amount) - m(s.paid_amount) - m(s.remaining_amount)) <= tol); }).map(label));
+  add('paid <= due', states.filter(function (s) { return !(m(s.paid_amount) <= m(s.due_amount) + tol); }).map(label));
+  add('status matches paid / remaining', states.filter(function (s) {
+    return s.payment_status !== sellerSettlementStatus_(m(s.due_amount), m(s.paid_amount));
+  }).map(label));
+  const effective = [];
+  const over = [];
+  (payouts || []).forEach(function (p) {
+    const id = trimmedText_(p.seller_payout_id);
+    const status = trimmedText_(p.status);
+    if (id === '' || A.noEffectStatuses.indexOf(status) >= 0 || !isFiniteNumber_(p.amount)) return;
+    const allocated = validation.payoutAllocated[id] || 0;
+    if (A.effectiveStatuses.indexOf(status) >= 0 && Math.abs(allocated - m(p.amount)) > tol) effective.push(id + ' allocated ' + allocated / 1e6 + ' of ' + p.amount);
+    if (allocated > m(p.amount) + tol) over.push(id + ' allocated ' + allocated / 1e6 + ' > ' + p.amount);
   });
-  Object.keys(exp.settlement_due).forEach(function (key) {
-    const parts = key.split('|');
-    const st = validation.states.filter(function (x) {
-      return x.target_type === SELLER_ALLOCATIONS.settlementTarget && x.seller_id === parts[0] && x.target_id === parts[1];
-    })[0];
-    add('settlement_due.' + key, exp.settlement_due[key], st ? st.due_amount : null, !!st && Math.abs(st.due_amount - exp.settlement_due[key]) < 0.00005);
-  });
-  return { snapshot: exp.snapshot, pass: checks.every(function (c) { return c.pass; }),
+  add('effective payout allocation = payout amount', effective);
+  add('no payout over-allocated', over);
+  const sum = function (f) { return states.reduce(function (a, s) { return a + m(s[f]); }, 0); };
+  const sm = validation.summary;
+  add('summary totals = SUM(obligations)', [['total_payoutable_due', 'due_amount'], ['total_paid', 'paid_amount'], ['total_remaining', 'remaining_amount']]
+    .filter(function (t) { return !(Math.abs(m(sm[t[0]]) - sum(t[1])) <= tol); }).map(function (t) { return t[0]; }));
+  return { snapshot: 'invariants', pass: checks.every(function (c) { return c.pass; }),
     failed: checks.filter(function (c) { return !c.pass; }).map(function (c) { return c.name; }), checks: checks };
 }

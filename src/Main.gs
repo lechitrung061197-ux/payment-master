@@ -707,3 +707,8 @@ function payoutModalTransition(payoutId, action, expectedStatus, reason) {
 function payoutModalRetryAllocation(payoutId) {
   return runPayoutModalRetryAllocation_(payoutId);
 }
+
+/** Modal: records the payment proof (method + reference) of a DRAFT before Mark SENT. */
+function payoutModalSetPaymentProof(payoutId, expectedStatus, method, reference) {
+  return runPayoutModalSetProof_(payoutId, expectedStatus, method, reference);
+}

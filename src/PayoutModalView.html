@@ -55,9 +55,11 @@
   </div>
   <div class="row">
     <div class="field"><label for="payoutCurrency">Payout currency</label><input id="payoutCurrency" autocomplete="off"></div>
-    <div class="field"><label for="fxRate">FX rate</label><input id="fxRate" inputmode="decimal" autocomplete="off"></div>
-    <div class="field"><label for="payoutAmount">Payout amount</label><input id="payoutAmount" inputmode="decimal" autocomplete="off"></div>
+    <div class="field"><label for="fxRate">FX rate (payout currency per 1 currency)</label><input id="fxRate" inputmode="decimal" autocomplete="off"></div>
+    <div class="field"><label for="payoutAmount">Payout amount = Amount × FX rate</label><input id="payoutAmount" inputmode="decimal" autocomplete="off"></div>
   </div>
+  <div class="muted">Same currency: FX 1 and payout amount = amount. Other payout currency: payout amount is recalculated as Amount × FX rate;
+    the server re-validates it (tolerance max(0.01, 0.0001%)). Method and reference may be left blank for a DRAFT but are required to mark it SENT.</div>
   <div class="row">
     <div class="field"><label for="method">Payment method</label><input id="method" autocomplete="off"></div>
     <div class="field"><label for="reference">Reference</label><input id="reference" autocomplete="off"></div>
@@ -75,14 +77,21 @@
     <h2 style="margin-top:4px">Payout <span id="pId"></span> <span class="pill" id="pStatus"></span></h2>
     <div id="pInfo" class="muted"></div>
     <table id="pAlloc"><thead><tr><th>Allocated to</th><th class="num">Amount</th></tr></thead><tbody></tbody></table>
+    <div class="row hidden" id="proofRow" style="margin-top:8px">
+      <div class="field"><label for="proofMethod">Payment method (required to SEND)</label><input id="proofMethod" autocomplete="off"></div>
+      <div class="field"><label for="proofReference">Reference (required, unique)</label><input id="proofReference" autocomplete="off"></div>
+      <button id="proofBtn" type="button">Save payment proof</button>
+    </div>
     <div class="row" style="margin-top:8px">
       <div class="field" style="flex:1"><label for="reason">Reason (required to Reverse, optional to Cancel)</label><input id="reason" autocomplete="off"></div>
     </div>
     <div class="row" id="actions" style="margin-top:8px"></div>
   </div>
 
-  <h2>Active payouts (resume)</h2>
-  <table id="active"><thead><tr><th>Payout</th><th>Seller</th><th>Date</th><th class="num">Amount</th><th>Status</th><th>Allocation</th><th></th></tr></thead><tbody></tbody></table>
+  <h2>Open payouts (DRAFT / SENT)</h2>
+  <table id="open"><thead><tr><th>Payout</th><th>Seller</th><th>Date</th><th class="num">Amount</th><th>Status</th><th>Allocation</th><th></th></tr></thead><tbody></tbody></table>
+  <h2>Recent CONFIRMED (last 20, reversible)</h2>
+  <table id="recent"><thead><tr><th>Payout</th><th>Seller</th><th>Date</th><th class="num">Amount</th><th>Status</th><th>Allocation</th><th></th></tr></thead><tbody></tbody></table>
 
 <script>
   // UI only: every number shown comes from the server; every write is a server call that re-validates against the canonical Master.
@@ -95,7 +104,7 @@
   function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
   function cell(tr, text, num) { var td = document.createElement('td'); td.textContent = text === undefined || text === null ? '' : String(text); if (num) td.className = 'num'; tr.appendChild(td); return td; }
   function setBusy(b) { S.busy = b; ['payFull', 'previewBtn', 'createBtn'].forEach(function (id) { $(id).disabled = b || (id === 'createBtn' && !S.previewOk); });
-    Array.prototype.forEach.call(document.querySelectorAll('#actions button, #active button'), function (x) { x.disabled = b; }); }
+    Array.prototype.forEach.call(document.querySelectorAll('#actions button, #open button, #recent button, #proofBtn'), function (x) { x.disabled = b; }); }
   function call(fn, args, ok) {
     setBusy(true);
     google.script.run.withSuccessHandler(function (r) { setBusy(false); ok(r || { status: 'FAILED', error: 'No response' }); })
@@ -106,8 +115,11 @@
   function invalidatePreview() { S.previewOk = false; $('createBtn').disabled = true; $('preview').classList.add('hidden'); $('previewNote').textContent = ''; }
   function syncFx() {
     var same = sameCurrency();
-    $('fxRate').disabled = same; $('payoutAmount').disabled = same;
-    if (same) { $('fxRate').value = '1'; $('payoutAmount').value = $('amount').value; }
+    $('fxRate').disabled = same;
+    $('payoutAmount').disabled = same;
+    if (same) { $('fxRate').value = '1'; $('payoutAmount').value = $('amount').value; return; }
+    var a = Number($('amount').value.trim()); var fx = Number($('fxRate').value.trim());
+    if (a > 0 && fx > 0) $('payoutAmount').value = String(Math.round(a * fx * 100) / 100); // display help; the server re-validates
   }
   function payload() {
     return { token: S.token, seller_id: S.seller ? S.seller.seller_id : '', currency: $('currency').value, payout_date: $('payoutDate').value.trim(),
@@ -143,8 +155,12 @@
     if (!$('payoutCurrency').value) $('payoutCurrency').value = l.currency;
     syncFx();
   }
-  function renderActive(list) {
-    var tb = $('active').tBodies[0]; clear(tb);
+  function renderActive(lists) {
+    renderList('open', (lists || {}).open_payouts);
+    renderList('recent', (lists || {}).recent_confirmed);
+  }
+  function renderList(id, list) {
+    var tb = $(id).tBodies[0]; clear(tb);
     (list || []).forEach(function (p) {
       var tr = document.createElement('tr');
       cell(tr, p.seller_payout_id); cell(tr, p.seller_id); cell(tr, p.payout_date); cell(tr, fmt(p.amount) + ' ' + p.currency, true); cell(tr, p.status);
@@ -162,9 +178,13 @@
       ' · ' + p.payment_method + ' ' + p.reference + ' · allocation ' + p.allocation_status + ' (' + fmt(p.allocated_amount) + ')';
     var tb = $('pAlloc').tBodies[0]; clear(tb);
     p.allocations.forEach(function (a) { var tr = document.createElement('tr'); cell(tr, a.target_type + ' ' + a.target_id); cell(tr, fmt(a.allocated_amount), true); tb.appendChild(tr); });
+    var draft = p.status === 'DRAFT';
+    $('proofRow').classList.toggle('hidden', !draft);
+    if (draft) { $('proofMethod').value = p.payment_method; $('proofReference').value = p.reference; }
     var box = $('actions'); clear(box);
     p.actions.forEach(function (a) {
       var b = document.createElement('button'); b.type = 'button'; b.textContent = ACTION_LABELS[a] || a;
+      if (a === 'SEND' && p.needs_proof) { b.disabled = true; b.title = 'Save the payment method and reference first'; }
       if (a === 'SEND' || a === 'CONFIRM') b.className = 'primary';
       if (a === 'REVERSE' || a === 'CANCEL') b.className = 'danger';
       b.onclick = function () { act(a); }; box.appendChild(b);
@@ -201,11 +221,17 @@
       cur.value = r.default_currency || (r.lines.some(function (l) { return l.currency === keep; }) ? keep : (r.lines[0] ? r.lines[0].currency : ''));
       cur.disabled = r.lines.length <= 1;
       if (!keepForm) invalidatePreview();
-      renderSummary(); renderActive(r.active_payouts);
+      renderSummary(); renderActive(r.lists);
       if (r.ledger_errors && r.ledger_errors.length) msg('Ledger has errors (fix first): ' + r.ledger_errors.join(' | '), 'err');
     });
   }
 
+  $('proofBtn').onclick = function () {
+    var p = S.payout; if (!p || S.busy) return;
+    call('payoutModalSetPaymentProof', [p.seller_payout_id, p.status, $('proofMethod').value.trim(), $('proofReference').value.trim()], function (r) {
+      report(r); if (r.payout) renderPayout(r.payout); refreshSeller(true);
+    });
+  };
   $('seller').onchange = function () {
     var id = $('seller').value; S.seller = null; $('payoutCurrency').value = ''; invalidatePreview(); clear($('summary')); clear($('obligations').tBodies[0]);
     if (!id) return;
@@ -213,7 +239,7 @@
   };
   $('currency').onchange = function () { $('payoutCurrency').value = $('currency').value; invalidatePreview(); renderSummary(); };
   ['amount', 'payoutDate', 'payoutCurrency', 'fxRate', 'payoutAmount', 'method', 'reference', 'notes'].forEach(function (id) {
-    $(id).oninput = function () { if (id === 'amount' || id === 'payoutCurrency') syncFx(); invalidatePreview(); };
+    $(id).oninput = function () { if (id === 'amount' || id === 'payoutCurrency' || id === 'fxRate') syncFx(); invalidatePreview(); };
   });
   $('payFull').onclick = function () { var l = line(); if (!l) return; $('amount').value = String(l.available_to_draft); syncFx(); invalidatePreview(); };
   $('previewBtn').onclick = function () {
@@ -251,7 +277,7 @@
     var sel = $('seller'); clear(sel);
     var o0 = document.createElement('option'); o0.value = ''; o0.textContent = '— select —'; sel.appendChild(o0);
     r.sellers.forEach(function (s) { var o = document.createElement('option'); o.value = s.seller_id; o.textContent = s.seller_id + ' · ' + s.seller_name; sel.appendChild(o); });
-    renderActive(r.active_payouts);
+    renderActive(r.lists);
     msg('Select a seller.', 'info');
   });
 </script>

@@ -101,6 +101,11 @@ function buildSellerSnapshotsFromMaster_(ss, sellers) {
   });
 }
 
+/** Canonical Seller Balances rows (the seller-output invariants compare against them). */
+function readSellerOutputBalances_(ss) {
+  return readSchemaTableObjects_(ss, SHEETS.SELLER_BALANCES, sellerBalancesTab_()).rows;
+}
+
 /** IDs that must never appear in seller output: the Master and configured provider source spreadsheets. */
 function sellerHiddenIds_(ss) {
   const guard = sellerDestinationGuard_(ss);
@@ -336,7 +341,8 @@ function buildSellerSheetsReport_() {
       .map(function (s) { return { seller_id: s.seller_id, seller_name: s.seller_name }; });
     const built = buildSellerSnapshotsFromMaster_(ss, sellers);
     built.errors.forEach(function (e) { report.errors.push(e); });
-    report.regression = evaluateSellerSheetsRegression_(built.snapshots);
+    report.regression = evaluateSellerSheetsInvariants_(built.snapshots, readSellerOutputBalances_(ss));
+    if (!report.regression.pass) report.errors.push('Seller output invariants failed: ' + report.regression.failed.join(', '));
     const active = report.destinations_valid ? dest.parsed.active : [];
     const hiddenIds = sellerHiddenIds_(ss);
     report.active_destinations = active.length;

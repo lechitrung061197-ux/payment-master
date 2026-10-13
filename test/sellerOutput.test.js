@@ -103,8 +103,10 @@ test('HUI (CUS002) regression: totals, identity, PAYPAL 8%; provider 7% fee neve
     .forEach(([k, e]) => assert.ok(near(t[k], e), k + ' ' + t[k]));
   assert.ok(near(t.current_balance + t.seller_hold + t.seller_fee + t.processing_fee + t.missing_provider_order_amount, t.total_order_amount), 'identity');
   assert.deepEqual(js(t.seller_fee_rates), { PAYPAL: [0.08] });
-  const reg = js(H.evaluateSellerSheetsRegression_({ CUS002: hui }));
-  assert.deepEqual(reg.checks.filter((c) => c.name.startsWith('CUS002') && !c.pass), []);
+  const reg = js(H.evaluateSellerSheetsInvariants_({ CUS002: hui }, [{ seller_id: 'CUS002', currency: 'USD', current_balance: 3037.444, seller_hold_balance: 370.42 }]));
+  assert.equal(reg.pass, true, JSON.stringify(reg.failed));
+  assert.equal(js(H.evaluateSellerSheetsInvariants_({ CUS002: hui }, [{ seller_id: 'CUS002', currency: 'USD', current_balance: 1, seller_hold_balance: 370.42 }])).pass, false,
+    'a projection that does not match Seller Balances fails');
   const phieu = hui.blocks.PhieuDoiSoat;
   assert.deepEqual(js(phieu.info).slice(0, 1).concat([phieu.info[3], phieu.info[4], phieu.info[5]]), ['HUI (CUS002)', 3501.76, '69 GD', 370.42]);
   assert.ok(near(phieu.b[0], 3860.51) && near(phieu.b[1], 156.31) && near(phieu.b[2], 296.336) && near(phieu.b[3], 370.42) && near(phieu.b[10], 3037.444));

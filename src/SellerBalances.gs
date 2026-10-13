@@ -23,20 +23,6 @@ const SELLER_BALANCES = Object.freeze({
   maxReportedErrors: 30,
 });
 
-/** Current production regression (after Phase 2J). Report only. */
-const SELLER_BALANCES_REGRESSION = Object.freeze({
-  snapshot: 'Production after Phase 2J (no adjustments, no payouts)',
-  balance_rows: 4,
-  currency_counts: { USD: 4 },
-  balances: {
-    'CUS001|USD': { settled_amount: 1919.3986, available_amount: 1919.3986, paid_amount: 0, seller_hold_balance: 234.073, adjustments: 0, current_balance: 1919.3986 },
-    'CUS002|USD': { settled_amount: 3037.444, available_amount: 3037.444, paid_amount: 0, seller_hold_balance: 370.42, adjustments: 0, current_balance: 3037.444 },
-    'CUS003|USD': { settled_amount: 256.7666, available_amount: 256.7666, paid_amount: 0, seller_hold_balance: 31.313, adjustments: 0, current_balance: 256.7666 },
-    'CUS004|USD': { settled_amount: 3156.4424, available_amount: 3156.4424, paid_amount: 0, seller_hold_balance: 384.932, adjustments: 0, current_balance: 3156.4424 },
-  },
-  totals: { settled_total: 8370.0516, available_total: 8370.0516, current_balance_total: 8370.0516, hold_total: 1020.738, paid_total: 0, adjustment_total: 0 },
-});
-
 /* ----------------------------- Pure helpers ----------------------------- */
 
 function emptyBalanceErrors_() {
@@ -157,22 +143,32 @@ function summarizeSellerBalances_(rows) {
     hold_total: sum('seller_hold_balance'), adjustment_total: sum('adjustments'), current_balance_total: sum('current_balance') };
 }
 
-function evaluateSellerBalancesRegression_(rows, summary) {
-  const exp = SELLER_BALANCES_REGRESSION;
+/**
+ * Runtime invariants of Seller Balances (report.regression). State-independent: they hold before and after any valid
+ * payout, adjustment or settlement (no production snapshot is compared at runtime; fixtures live in the tests).
+ *   current_balance = settled_amount + adjustments - paid_amount;  available_amount = current_balance;
+ *   paid_amount >= 0;  seller_hold_balance >= 0 (± 0.00005);  one row per seller + currency;  summary totals = SUM(rows).
+ */
+function evaluateSellerBalancesInvariants_(rows, summary) {
   const checks = [];
-  const add = function (n, e, a, pass) { checks.push({ name: n, expected: e, actual: a, pass: pass }); };
-  add('balance_rows', exp.balance_rows, summary.balance_rows, summary.balance_rows === exp.balance_rows);
-  add('currency_counts', exp.currency_counts, summary.currency_counts, JSON.stringify(exp.currency_counts) === JSON.stringify(summary.currency_counts));
-  const byKey = {};
-  rows.forEach(function (r) { byKey[r.seller_id + '|' + r.currency] = r; });
-  Object.keys(exp.balances).forEach(function (k) {
-    Object.keys(exp.balances[k]).forEach(function (f) {
-      const a = byKey[k] ? byKey[k][f] : null;
-      add(k + '.' + f, exp.balances[k][f], a, isFiniteNumber_(a) && Math.abs(a - exp.balances[k][f]) < 0.00005);
-    });
-  });
-  Object.keys(exp.totals).forEach(function (k) { add('totals.' + k, exp.totals[k], summary[k], Math.abs(summary[k] - exp.totals[k]) < 0.00005); });
-  return { snapshot: exp.snapshot, pass: checks.every(function (c) { return c.pass; }),
+  const tol = 50;
+  const m = function (v) { return isFiniteNumber_(v) ? Math.round(v * 1e6) : NaN; };
+  const add = function (n, problems) { checks.push({ name: n, pass: problems.length === 0, detail: problems.slice(0, 10).join(' | ') || 'ok' }); };
+  const key = function (r) { return trimmedText_(r.seller_id) + '|' + trimmedText_(r.currency); };
+  add('current_balance = settled + adjustments - paid', rows.filter(function (r) {
+    return !(Math.abs(m(r.current_balance) - (m(r.settled_amount) + m(r.adjustments) - m(r.paid_amount))) <= tol);
+  }).map(key));
+  add('available_amount = current_balance', rows.filter(function (r) { return !(Math.abs(m(r.available_amount) - m(r.current_balance)) <= tol); }).map(key));
+  add('paid_amount >= 0', rows.filter(function (r) { return !(m(r.paid_amount) >= -tol); }).map(key));
+  add('seller_hold_balance >= 0', rows.filter(function (r) { return !(m(r.seller_hold_balance) >= -tol); }).map(key));
+  const seen = {};
+  add('one row per seller + currency', rows.filter(function (r) { const k = key(r); const dup = !!seen[k]; seen[k] = true; return dup; }).map(key));
+  const totals = [['settled_total', 'settled_amount'], ['available_total', 'available_amount'], ['paid_total', 'paid_amount'], ['hold_total', 'seller_hold_balance'],
+    ['adjustment_total', 'adjustments'], ['current_balance_total', 'current_balance']];
+  add('summary totals = SUM(rows)', totals.filter(function (t) {
+    return !(Math.abs(m(summary[t[0]]) - rows.reduce(function (acc, r) { return acc + m(r[t[1]]); }, 0)) <= tol);
+  }).map(function (t) { return t[0]; }).concat(summary.balance_rows === rows.length ? [] : ['balance_rows']));
+  return { snapshot: 'invariants', pass: checks.every(function (c) { return c.pass; }),
     failed: checks.filter(function (c) { return !c.pass; }).map(function (c) { return c.name; }), checks: checks };
 }
 
@@ -316,7 +312,8 @@ function buildSellerBalancesReport_() {
       updatedIdx) === tableChecksumExcluding_(input.current.grid.values, updatedIdx);
     if (!report.target_match) report.errors.push('Seller Balances is stale (run normalizeSellerBalances).');
     if (input.built.rows.some(function (r) { return r.current_balance < 0; })) report.warnings.push('Some seller balances are negative.');
-    report.regression = evaluateSellerBalancesRegression_(input.built.rows, summary);
+    report.regression = evaluateSellerBalancesInvariants_(input.built.rows, summary);
+    if (!report.regression.pass) report.errors.push('Seller Balances invariants failed: ' + report.regression.failed.join(', '));
   } catch (err) {
     report.errors.push(err && err.message ? err.message : String(err));
   }

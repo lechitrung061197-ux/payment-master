@@ -226,7 +226,7 @@ test('15: allocations never reduce a balance: Seller Balances deducts only the e
   assert.ok(near(js(v.summary.per_seller_remaining).CUS002, b.current_balance), 'remaining obligations = balance (payout counted once)');
 });
 
-test('19: production regression with zero payouts (report only): dues equal the seller shares, everything UNPAID', () => {
+test('19: production fixture with zero payouts: dues equal the seller shares, everything UNPAID; runtime invariants pass', () => {
   const items = [item('CUS001', 'ST-KH001-PAYPAL-000001', 1000), item('CUS001', 'ST-KH001-PAYPAL-000002', 919.3986),
     item('CUS002', 'ST-KH001-PAYPAL-000001', 2132.2706), item('CUS002', 'ST-KH001-PAYPAL-000002', 905.1734),
     item('CUS003', 'ST-KH001-PAYPAL-000001', 256.7666), item('CUS004', 'ST-KH001-PAYPAL-000002', 3156.4424)];
@@ -235,8 +235,20 @@ test('19: production regression with zero payouts (report only): dues equal the 
   const v = H.validateSellerPayoutAllocations_({ allocations: [], payouts: [], items, settlements, adjustments: [] });
   assert.equal(errs(v), '');
   assert.deepEqual(js(v.summary.payment_status_counts), { UNPAID: 6 });
-  const reg = js(H.evaluateSellerAllocationsRegression_(v));
+  const reg = js(H.evaluateSellerAllocationsInvariants_(v, []));
   assert.equal(reg.pass, true, JSON.stringify(reg.failed));
+  // the CUS002 production payout (2P.2): CONFIRMED 3037.444 = 2132.2706 -> settlement #1 + 905.1734 -> settlement #2
+  const id = 'SP-OPS-0C99D9F9B016F5A6';
+  const payout = { seller_payout_id: id, seller_id: 'CUS002', currency: 'USD', amount: 3037.444, status: 'CONFIRMED', payout_date: D('2026-10-13T04:00:00Z') };
+  const alloc = (sid, amt) => ({ allocation_id: H.sellerAllocationId_(id, 'SETTLEMENT', sid), seller_payout_id: id, seller_id: 'CUS002', target_type: 'SETTLEMENT',
+    target_id: sid, payment_source: 'PAYPAL', currency: 'USD', allocated_amount: amt });
+  const allocs = [alloc('ST-KH001-PAYPAL-000001', 2132.2706), alloc('ST-KH001-PAYPAL-000002', 905.1734)];
+  const paid = H.validateSellerPayoutAllocations_({ allocations: allocs, payouts: [payout], items, settlements, adjustments: [] });
+  assert.equal(errs(paid), '');
+  assert.equal(js(H.evaluateSellerAllocationsInvariants_(paid, [payout])).pass, true, 'a valid payout never fails the runtime report');
+  assert.deepEqual(js(paid.summary.payment_status_counts), { PAID: 2, UNPAID: 4 });
+  const broken = js(H.evaluateSellerAllocationsInvariants_(paid, [{ ...payout, amount: 3100 }]));
+  assert.deepEqual(broken.failed, ['effective payout allocation = payout amount']);
   assert.deepEqual(js(v.states).filter((s) => s.seller_id === 'CUS002').map((s) => [s.source_settlement_number, s.due_amount, s.paid_amount, s.payment_status]),
     [[1, 2132.2706, 0, 'UNPAID'], [2, 905.1734, 0, 'UNPAID']]);
 });

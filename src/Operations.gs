@@ -43,10 +43,10 @@ const OPERATIONS = Object.freeze({
     ['payout_date', 'Payout Date', 'dd/MM/yyyy'],
     ['amount', 'Amount', 'In Currency, > 0; at most "Available to draft" of the seller'],
     ['payout_currency', 'Payout Currency', 'Blank = same as Currency'],
-    ['fx_rate', 'FX Rate', 'Same currency: 1 (automatic). Other currency: required, > 0'],
-    ['payout_amount', 'Payout Amount', 'Same currency: = Amount (automatic). Other currency: required, > 0'],
-    ['payment_method', 'Payment Method', 'e.g. Bank transfer'],
-    ['reference', 'Reference', 'Bank / wallet reference'],
+    ['fx_rate', 'FX Rate', 'Same currency: 1 (automatic). Other currency: payout-currency units per 1 Currency unit, > 0'],
+    ['payout_amount', 'Payout Amount', 'Same currency: = Amount (automatic). Other currency: = Amount × FX Rate (FX = payout-currency units per 1 Currency unit)'],
+    ['payment_method', 'Payment Method', 'e.g. Bank transfer. Optional for a DRAFT, required to mark it SENT'],
+    ['reference', 'Reference', 'Bank / wallet reference. Optional for a DRAFT, required (and unique) to mark it SENT'],
     ['notes', 'Notes', 'Optional'],
   ]),
   tokenRow: 29,
@@ -65,7 +65,13 @@ const OPERATIONS = Object.freeze({
   payoutIdPrefix: 'SP-OPS-',
   recentClosedLimit: 20,
   auditScanRows: 3000,
-  activeStatuses: Object.freeze(['DRAFT', 'SENT', 'CONFIRMED']),
+  // Open / resumable payouts (never dropped from lists). CONFIRMED is closed: shown among the recent closed payouts
+  // (bounded by recentClosedLimit), still reversible.
+  openStatuses: Object.freeze(['DRAFT', 'SENT']),
+  // A payment proof (method + reference) belongs to one payout; only a CANCELLED payout releases it for reuse.
+  proofReleasingStatuses: Object.freeze(['CANCELLED']),
+  fxToleranceMin: 0.01,
+  fxToleranceRelative: 1e-6,
   // Allowed transitions: target status -> allowed current statuses.
   transitions: Object.freeze({ SENT: ['DRAFT'], CONFIRMED: ['SENT'], CANCELLED: ['DRAFT'], REVERSED: ['SENT', 'CONFIRMED'] }),
   auditActions: Object.freeze({ DRAFT: 'SELLER_PAYOUT_DRAFT_CREATED', SENT: 'SELLER_PAYOUT_SENT', CONFIRMED: 'SELLER_PAYOUT_CONFIRMED',
@@ -127,6 +133,35 @@ function operationsNumber_(value) {
 
 function operationsMicros_(v) {
   return isFiniteNumber_(v) ? Math.round(v * 1e6) : 0;
+}
+
+/**
+ * Cross-currency consistency. fx_rate = payout-currency units per 1 accounting-currency unit, so
+ * payout_amount ≈ amount × fx_rate within max(0.01, |amount × fx_rate| × 1e-6). '' when consistent.
+ */
+function operationsFxConsistencyError_(amount, fx, payoutAmount, currency, payoutCurrency) {
+  if (!isFiniteNumber_(amount) || !isFiniteNumber_(fx) || !isFiniteNumber_(payoutAmount)) return '';
+  const expected = amount * fx;
+  const tolerance = Math.max(OPERATIONS.fxToleranceMin, Math.abs(expected) * OPERATIONS.fxToleranceRelative);
+  if (Math.abs(payoutAmount - expected) <= tolerance) return '';
+  return 'Payout Amount ' + payoutAmount + ' ' + payoutCurrency + ' must equal Amount × FX Rate = ' + amount + ' × ' + fx + ' = ' +
+    Math.round(expected * 1e6) / 1e6 + ' ' + payoutCurrency + ' (± ' + Math.round(tolerance * 1e6) / 1e6 + '; FX = ' + payoutCurrency + ' per 1 ' + currency + ').';
+}
+
+/** Normalized payment proof key (method + reference, trimmed, single spaces, upper case); '' when the reference is blank. */
+function operationsProofKey_(method, reference) {
+  const norm = function (v) { return trimmedText_(v).replace(/\s+/g, ' ').toUpperCase(); };
+  return norm(reference) === '' ? '' : norm(method) + '|' + norm(reference);
+}
+
+/** Other payouts (any status except CANCELLED) already carrying the same normalized method + reference. */
+function operationsDuplicateProof_(payouts, payoutId, method, reference) {
+  const key = operationsProofKey_(method, reference);
+  if (key === '') return [];
+  return (payouts || []).filter(function (p) {
+    return trimmedText_(p.seller_payout_id) !== trimmedText_(payoutId) && OPERATIONS.proofReleasingStatuses.indexOf(trimmedText_(p.status)) < 0 &&
+      operationsProofKey_(p.payment_method, p.reference) === key;
+  }).map(function (p) { return trimmedText_(p.seller_payout_id) + ' (' + trimmedText_(p.status) + ')'; });
 }
 
 /**
@@ -213,6 +248,10 @@ function parseOperationsForm_(form, ctx) {
   } else {
     if (fx === null || !(fx > 0)) errors.push('Payout in ' + payoutCurrency + ': FX Rate is required (> 0).');
     if (payoutAmount === null || !(payoutAmount > 0)) errors.push('Payout in ' + payoutCurrency + ': Payout Amount is required (> 0).');
+    if (fx > 0 && payoutAmount > 0 && amount !== null) {
+      const fxError = operationsFxConsistencyError_(amount, fx, payoutAmount, currency, payoutCurrency);
+      if (fxError) errors.push(fxError);
+    }
   }
   return { errors: errors, payout: { seller_id: sellerId, currency: currency, payout_key: dateKey, amount: amount, payout_currency: payoutCurrency,
     fx_rate: fx, payout_amount: payoutAmount, payment_method: trimmedText_(form.payment_method), reference: trimmedText_(form.reference),
@@ -276,6 +315,10 @@ function planOperationsDraft_(form, input) {
     items: input.items, settlements: input.settlements, adjustments: input.adjustments, dateKeyOf: dateKeyOf, digestHex: input.digestHex });
   const planErrors = flattenAllocationErrors_(check.errors);
   if (planErrors.length > 0) return fail('The DRAFT + FIFO plan would be invalid; nothing written: ' + planErrors.slice(0, 5).join(' | '));
+  const duplicates = operationsDuplicateProof_(input.payouts, input.payoutId, p.payment_method, p.reference);
+  if (duplicates.length > 0) {
+    return fail('Payment method + reference "' + p.payment_method + ' / ' + p.reference + '" is already used by ' + duplicates.join(', ') + '.');
+  }
   return { status: 'READY', error: null, payout: payout, rows: plan.rows, line: l, parsed: p };
 }
 
@@ -297,6 +340,30 @@ function operationsPayoutFieldErrors_(p, sellerIds, dateKeyOf) {
   } else {
     if (!isFiniteNumber_(p.fx_rate) || !(p.fx_rate > 0)) errors.push('Seller Payout ' + id + ': fx_rate must be a positive number for a ' + payoutCurrency + ' payout.');
     if (!isFiniteNumber_(p.payout_amount) || !(p.payout_amount > 0)) errors.push('Seller Payout ' + id + ': payout_amount must be a positive number for a ' + payoutCurrency + ' payout.');
+    const fxError = p.fx_rate > 0 && p.payout_amount > 0 ? operationsFxConsistencyError_(p.amount, p.fx_rate, p.payout_amount, currency, payoutCurrency) : '';
+    if (fxError) errors.push('Seller Payout ' + id + ': ' + fxError);
+  }
+  return errors;
+}
+
+/**
+ * Checks only DRAFT -> SENT needs (pure): the payout date is not after Master today (America/New_York date key), and a
+ * payment proof (method + reference) is present and not used by another non-CANCELLED payout.
+ */
+function operationsSendErrors_(payout, payouts, todayKey, dateKeyOf) {
+  const errors = [];
+  const id = trimmedText_(payout.seller_payout_id);
+  const key = sellerDateKeyOrNull_(payout.payout_date, dateKeyOf || masterDateKey_);
+  if (key && todayKey && key > todayKey) {
+    errors.push('Payout date ' + formatOperationsDate_(key) + ' is in the future (Master today ' + formatOperationsDate_(todayKey) + ', ' + APP.TIMEZONE +
+      '); it cannot be marked SENT before that date.');
+  }
+  if (trimmedText_(payout.payment_method) === '') errors.push('Seller Payout ' + id + ': payment_method is required to mark it SENT (payment proof).');
+  if (trimmedText_(payout.reference) === '') errors.push('Seller Payout ' + id + ': reference is required to mark it SENT (payment proof).');
+  const duplicates = operationsDuplicateProof_(payouts, id, payout.payment_method, payout.reference);
+  if (duplicates.length > 0) {
+    errors.push('Seller Payout ' + id + ': payment method + reference "' + trimmedText_(payout.payment_method) + ' / ' + trimmedText_(payout.reference) +
+      '" is already used by ' + duplicates.join(', ') + '.');
   }
   return errors;
 }
@@ -305,7 +372,8 @@ function operationsPayoutFieldErrors_(p, sellerIds, dateKeyOf) {
  * Plans one status transition (pure). Financial transitions (SENT / CONFIRMED / REVERSED) require a valid ledger before
  * and after the simulated change and a clean simulated Seller Balances rebuild; SENT additionally requires the payout to
  * be fully allocated. CANCELLED (DRAFT only) has no financial effect.
- * @param {{payouts, allocations, items, settlements, adjustments, validation, sellerIds, columns, reason?, dateKeyOf?,
+ * SENT also needs a payout date not after Master today and a unique payment proof (operationsSendErrors_).
+ * @param {{payouts, allocations, items, settlements, adjustments, validation, sellerIds, columns, reason?, todayKey?, dateKeyOf?,
  *          digestHex?}} input
  * @return {{status: string, error: ?string, payout: ?Object, from: ?string, to: string, allocations: Array, after: ?Object}}
  */
@@ -339,6 +407,8 @@ function planSellerPayoutTransition_(payoutId, toStatus, input) {
     if (Math.abs(allocated - amount) > SELLER_ALLOCATIONS.toleranceMicros) {
       return fail('Seller Payout ' + id + ' is not fully allocated (' + allocated / 1e6 + ' of ' + amount / 1e6 + '); it stays DRAFT.');
     }
+    const sendErrors = operationsSendErrors_(payout, input.payouts, input.todayKey || masterDateKey_(new Date()), dateKeyOf);
+    if (sendErrors.length > 0) return fail(sendErrors.join(' ') + ' It stays DRAFT.');
   }
   const afterErrors = flattenAllocationErrors_(after.errors);
   if (afterErrors.length > 0) return fail('Seller Payout ' + id + ' cannot become ' + toStatus + ' (' + afterErrors.length + ' error(s)): ' + afterErrors.slice(0, 5).join(' | '));
@@ -420,8 +490,8 @@ function buildOperationsView_(input) {
   const withKey = (input.payouts || []).filter(function (p) { return trimmedText_(p.seller_payout_id) !== ''; }).map(function (p) {
     return { p: p, key: sellerDateKeyOrNull_(p.payout_date, dateKeyOf) || '', id: trimmedText_(p.seller_payout_id) };
   }).sort(function (a, b) { return compareCanonicalValues_(b.key, a.key) || compareCanonicalValues_(b.id, a.id); });
-  const active = withKey.filter(function (x) { return OPERATIONS.activeStatuses.indexOf(trimmedText_(x.p.status)) >= 0; });
-  const closed = withKey.filter(function (x) { return OPERATIONS.activeStatuses.indexOf(trimmedText_(x.p.status)) < 0; }).slice(0, OPERATIONS.recentClosedLimit);
+  const active = withKey.filter(function (x) { return OPERATIONS.openStatuses.indexOf(trimmedText_(x.p.status)) >= 0; });
+  const closed = withKey.filter(function (x) { return OPERATIONS.openStatuses.indexOf(trimmedText_(x.p.status)) < 0; }).slice(0, OPERATIONS.recentClosedLimit);
   const shown = active.concat(closed).sort(function (a, b) { return compareCanonicalValues_(b.key, a.key) || compareCanonicalValues_(b.id, a.id); });
   const payouts = shown.map(function (x) {
     const p = x.p;
@@ -920,7 +990,7 @@ function runSellerPayoutTransition_(select, toStatus, reason) {
       const input = readSellerAllocationInputs_(ss);
       plan = planSellerPayoutTransition_(payoutId, toStatus, { payouts: input.payouts, allocations: input.allocations, items: input.items,
         settlements: input.settlements, adjustments: input.adjustments, validation: input.validation, sellerIds: operationsSellerIds_(ss),
-        columns: getColumnNames_(SHEETS.SELLER_BALANCES), reason: reason });
+        columns: getColumnNames_(SHEETS.SELLER_BALANCES), reason: reason, todayKey: masterDateKey_(new Date()) });
       if (plan.status !== 'READY') throw new Error(plan.error + ' Nothing changed.');
       if (selected.status !== undefined && trimmedText_(selected.status) !== plan.from) {
         throw new Error('The Operations row shows ' + selected.status + ' but Seller Payout ' + payoutId + ' is ' + plan.from +
@@ -978,6 +1048,48 @@ function runSellerPayoutTransition_(select, toStatus, reason) {
       seller_balances: result.seller_balances, ledger: result.ledger, health: result.health, seller_sheet: result.seller_sheet,
       followup: result.status }, operationsPayoutAuditFields_(plan.payout, plan.allocations)));
     if (!ok) operationsAudit_(OPERATIONS.failedAction, payoutId, plan.from, toStatus, result);
+    return result;
+  });
+}
+
+/**
+ * Records the payment proof (payment_method + reference) of a DRAFT, so it can be prepared without them and completed
+ * before SENT. Only a DRAFT, only these two fields, both required, unique among non-CANCELLED payouts; expectedStatus is
+ * the status the caller shows (stale -> rejected). Audited SELLER_PAYOUT_PROOF_UPDATED. Never throws.
+ */
+function runSetPayoutProof_(payoutId, expectedStatus, method, reference) {
+  const id = trimmedText_(payoutId);
+  return withOperationsLock_('SET_PAYMENT_PROOF', function (ss) {
+    const m = trimmedText_(method);
+    const r = trimmedText_(reference);
+    const result = { status: 'FAILED', operation: 'SET_PAYMENT_PROOF', seller_payout_id: id, old_status: '', new_status: '', warnings: [] };
+    if (m === '' || r === '') throw new Error('Payment method and reference are both required; nothing changed.');
+    let old = null;
+    let payout = null;
+    withOperationsScriptLock_(function () {
+      const table = readSellerPayoutRows_(ss);
+      const matches = table.rows.filter(function (p) { return trimmedText_(p.seller_payout_id) === id; });
+      if (matches.length !== 1) throw new Error('Expected exactly one Seller Payout ' + (id || '(blank)') + ', found ' + matches.length + '; nothing changed.');
+      payout = matches[0];
+      const status = trimmedText_(payout.status);
+      if (status !== SELLER_ALLOCATIONS.draftStatus) throw new Error('Seller Payout ' + id + ' is ' + status + '; only a DRAFT\'s payment proof can be set. Nothing changed.');
+      if (trimmedText_(expectedStatus) !== status) throw new Error('Seller Payout ' + id + ' changed meanwhile (now ' + status + '); reload it. Nothing changed.');
+      const duplicates = operationsDuplicateProof_(table.rows, id, m, r);
+      if (duplicates.length > 0) throw new Error('Payment method + reference "' + m + ' / ' + r + '" is already used by ' + duplicates.join(', ') + '; nothing changed.');
+      old = { payment_method: trimmedText_(payout.payment_method), reference: trimmedText_(payout.reference) };
+      if (old.payment_method === m && old.reference === r) return;
+      table.sheet.getRange(payout._row, table.columns.indexOf('payment_method') + 1).setValue(m);
+      table.sheet.getRange(payout._row, table.columns.indexOf('reference') + 1).setValue(r);
+    });
+    result.old_status = SELLER_ALLOCATIONS.draftStatus;
+    result.new_status = SELLER_ALLOCATIONS.draftStatus;
+    if (old.payment_method === m && old.reference === r) {
+      result.status = 'NO_CHANGE';
+      return result;
+    }
+    result.status = 'SUCCESS';
+    operationsAudit_('SELLER_PAYOUT_PROOF_UPDATED', id, SELLER_ALLOCATIONS.draftStatus, SELLER_ALLOCATIONS.draftStatus, { seller_payout_id: id,
+      seller_id: trimmedText_(payout.seller_id), old_payment_method: old.payment_method, old_reference: old.reference, payment_method: m, reference: r });
     return result;
   });
 }

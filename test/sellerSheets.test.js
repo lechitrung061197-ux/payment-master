@@ -107,6 +107,7 @@ function installSync(o) {
     readSellerDestinations_: () => ({ rows: destRows, sellers: SELLERS, parsed: H.parseSellerDestinations_(destRows, SELLERS, { masterId: MASTER_ID, protectedIds: [] }) }),
     readSellerSheetsGates_: () => { env.gateCalls++; return o.gates || { current: true, gates: {}, reasons: [] }; },
     buildSellerSnapshotsFromMaster_: (_ss, sellers) => H.buildSellerOutputs_({ ...master, sellers, dateKeyOf: NY }),
+    readSellerOutputBalances_: () => master.balances,
     sellerHiddenIds_: () => [MASTER_ID, KH001_SOURCE],
   });
 }
