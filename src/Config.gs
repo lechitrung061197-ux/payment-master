@@ -736,8 +736,9 @@ const DEFAULT_SETTINGS = Object.freeze([
   ['seller_output_folder_id', '', 'STRING', 'Drive folder that receives seller sheets created by createSellerSheet.'],
   ['scheduled_sync_morning_hour', 8, 'NUMBER', 'Hour (0-23) of the morning runScheduledPaymentPipeline run, in scheduled_sync_timezone.'],
   ['scheduled_sync_afternoon_hour', 17, 'NUMBER', 'Hour (0-23) of the afternoon runScheduledPaymentPipeline run, in scheduled_sync_timezone.'],
-  ['scheduled_sync_timezone', 'Asia/Ho_Chi_Minh', 'STRING',
-    'Time zone of the scheduled pipeline hours. Re-run installScheduledPaymentPipelineTriggers after changing the schedule.'],
+  ['scheduled_sync_timezone', APP.TIMEZONE, 'STRING',
+    'IANA time zone of the scheduled pipeline hours = the Master timezone (DST handled by Apps Script). Re-run ' +
+    'installScheduledPaymentPipelineTriggers after changing the schedule.'],
   ['source.INTERNAL.naive_timestamp_timezone', '', 'STRING',
     'Timezone for internal CSV timestamps without an offset (e.g. "2026-10-01 12:00:00"). Blank = such ' +
     'timestamps are rejected. Timestamps with Z or an offset never use it.'],

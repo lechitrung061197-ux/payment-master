@@ -458,6 +458,20 @@ function installScheduledPaymentPipelineTriggers() {
   return result;
 }
 
+/** Explicit Settings update: scheduled_sync_timezone Asia/Ho_Chi_Minh (retired default) -> the Master timezone. Then reinstall triggers. */
+function migrateScheduledPipelineTimezoneToMaster() {
+  const result = runScheduleTimezoneMigration_();
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+/** Read-only: exactly two pipeline triggers, installed with the current Settings schedule in the Master timezone. */
+function verifyScheduledPaymentPipelineTriggers() {
+  const report = buildPipelineTriggersReport_();
+  Logger.log(JSON.stringify(report, null, 2));
+  return report;
+}
+
 /** Removes the pipeline triggers (other triggers are untouched). */
 function removeScheduledPaymentPipelineTriggers() {
   const removed = removePaymentPipelineTriggers_();

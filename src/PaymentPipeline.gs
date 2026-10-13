@@ -23,8 +23,11 @@
  * a complete adapter fails the run closed before any fetch (audited with the provider id); disabled providers are never
  * fetched or normalized.
  *
- * Schedule: Settings scheduled_sync_morning_hour / scheduled_sync_afternoon_hour / scheduled_sync_timezone;
- * installScheduledPaymentPipelineTriggers() replaces this pipeline's triggers (idempotent, never duplicates).
+ * Schedule: Settings scheduled_sync_morning_hour / scheduled_sync_afternoon_hour / scheduled_sync_timezone (default: the
+ * Master timezone APP.TIMEZONE, America/New_York; an IANA region name, so DST is handled by Apps Script - fixed UTC
+ * offsets are rejected); installScheduledPaymentPipelineTriggers() replaces this pipeline's triggers (idempotent, never
+ * duplicates). migrateScheduledPipelineTimezoneToMaster() moves the retired default (Asia/Ho_Chi_Minh) to the Master
+ * timezone explicitly; setup never overwrites an existing Settings value.
  */
 
 const PAYMENT_PIPELINE = Object.freeze({
@@ -37,6 +40,9 @@ const PAYMENT_PIPELINE = Object.freeze({
   // Stage results that count as success (anything else stops the pipeline).
   okStatuses: Object.freeze(['SUCCESS', 'NO_CHANGE', 'PASS']),
   moneyToleranceMicros: 5000, // 0.005: MATCHED amount mismatch tolerance (Payment Matches convention)
+  // Retired scheduled_sync_timezone defaults that the explicit migration may move to the Master timezone.
+  retiredScheduleTimezones: Object.freeze(['Asia/Ho_Chi_Minh']),
+  triggersInstalledAction: 'PIPELINE_TRIGGERS_INSTALLED',
 });
 
 /**
@@ -92,8 +98,17 @@ function parsePipelineSchedule_(settings) {
   const afternoon = hour(PAYMENT_PIPELINE.afternoonHourSetting);
   const timeZone = String(settings[PAYMENT_PIPELINE.timezoneSetting] || '').trim();
   if (timeZone === '') errors.push(PAYMENT_PIPELINE.timezoneSetting + ' is blank');
+  else if (!isIanaRegionTimeZone_(timeZone)) {
+    errors.push(PAYMENT_PIPELINE.timezoneSetting + ' must be an IANA region time zone such as ' + APP.TIMEZONE +
+      ' (found "' + timeZone + '"); fixed UTC offsets would ignore daylight saving time');
+  }
   if (morning !== null && afternoon !== null && morning === afternoon) errors.push('morning and afternoon hours must differ');
   return { morning: morning, afternoon: afternoon, timeZone: timeZone, errors: errors };
+}
+
+/** "Area/Location" IANA names only: no fixed offsets (GMT+7, UTC-05:00, Etc/GMT-7, UTC). */
+function isIanaRegionTimeZone_(tz) {
+  return /^[A-Za-z]+(\/[A-Za-z0-9_\-]+)+$/.test(tz) && !/^Etc\//i.test(tz) && !/^(GMT|UTC)/i.test(tz);
 }
 
 /** Classifies a raw-sync summary ({provider, <tab>: status}): FAILED if any tab failed. */
@@ -409,9 +424,99 @@ function installPaymentPipelineTriggers_() {
   });
   const installed = ScriptApp.getProjectTriggers().filter(function (t) { return t.getHandlerFunction() === PAYMENT_PIPELINE.handler; }).length;
   const result = { removed: removed, created: 2, installed: installed, morning_hour: schedule.morning, afternoon_hour: schedule.afternoon,
-    time_zone: schedule.timeZone };
-  pipelineAudit_('PIPELINE_TRIGGERS_INSTALLED', '', 'SUCCESS', result);
+    time_zone: schedule.timeZone, master_timezone: APP.TIMEZONE, warnings: [] };
+  if (schedule.timeZone !== APP.TIMEZONE) {
+    result.warnings.push('scheduled_sync_timezone ' + schedule.timeZone + ' differs from the Master timezone ' + APP.TIMEZONE +
+      '; run migrateScheduledPipelineTimezoneToMaster() if this is the retired default.');
+  }
+  pipelineAudit_(PAYMENT_PIPELINE.triggersInstalledAction, '', 'SUCCESS', result);
   return result;
+}
+
+/**
+ * Explicit, audited Settings update: scheduled_sync_timezone from a retired default (Asia/Ho_Chi_Minh) to the Master
+ * timezone (APP.TIMEZONE). Already the Master timezone -> NO_CHANGE; any other (operator-chosen) value -> FAILED, not
+ * touched. Hours, other Settings (source.KH001.timezone included) and triggers are not changed: run
+ * installScheduledPaymentPipelineTriggers() afterwards. Never throws.
+ */
+function runScheduleTimezoneMigration_() {
+  const key = PAYMENT_PIPELINE.timezoneSetting;
+  const result = { status: 'FAILED', setting: key, old_value: null, new_value: null, master_timezone: APP.TIMEZONE, next_step: null, error: null };
+  const lock = LockService.getScriptLock();
+  const locked = lock.tryLock(CANONICAL_LOCK_TIMEOUT_MS);
+  try {
+    if (!locked) throw new Error('Could not acquire script lock within ' + CANONICAL_LOCK_TIMEOUT_MS + ' ms; nothing changed.');
+    const sheet = getSpreadsheet_().getSheetByName(SHEETS.SETTINGS);
+    if (!sheet) throw new Error('Settings tab not found. Run setupMaster first.');
+    const index = readSettingKeys_(sheet).indexOf(key);
+    if (index < 0) throw new Error(key + ' is missing in Settings; run setupMaster (it seeds ' + APP.TIMEZONE + ').');
+    const row = 2 + index;
+    const current = String(sheet.getRange(row, getColumnIndex_(SHEETS.SETTINGS, 'value')).getValue()).trim();
+    result.old_value = current;
+    if (current === APP.TIMEZONE) {
+      result.status = 'NO_CHANGE';
+      result.new_value = current;
+    } else if (PAYMENT_PIPELINE.retiredScheduleTimezones.indexOf(current) >= 0) {
+      sheet.getRange(row, getColumnIndex_(SHEETS.SETTINGS, 'value')).setValue(APP.TIMEZONE);
+      sheet.getRange(row, getColumnIndex_(SHEETS.SETTINGS, 'description')).setValue(findDefaultSetting_(key)[3]);
+      sheet.getRange(row, getColumnIndex_(SHEETS.SETTINGS, 'updated_at')).setValue(new Date());
+      result.status = 'SUCCESS';
+      result.new_value = APP.TIMEZONE;
+    } else {
+      result.error = key + ' is "' + current + '" (not a retired default); left unchanged. Edit it intentionally if needed.';
+    }
+    if (result.status !== 'FAILED') result.next_step = 'Run installScheduledPaymentPipelineTriggers() so the two triggers use ' + APP.TIMEZONE + '.';
+  } catch (err) {
+    result.error = err && err.message ? err.message : String(err);
+  } finally {
+    try {
+      appendAuditLog_({ action: 'PIPELINE_SCHEDULE_TIMEZONE_' + (result.status === 'SUCCESS' ? 'MIGRATED' : result.status), entityType: 'SETTINGS',
+        entityId: key, oldStatus: result.old_value || '', newStatus: result.new_value || '', details: result });
+    } catch (auditErr) {
+      Logger.log('Failed to write audit entry: %s', auditErr);
+    }
+    if (locked) lock.releaseLock();
+  }
+  return result;
+}
+
+/**
+ * Read-only: the pipeline's installed triggers vs. Settings. Apps Script triggers do not expose their hour / time zone,
+ * so the schedule is checked against the latest PIPELINE_TRIGGERS_INSTALLED audit row. Never throws.
+ */
+function buildPipelineTriggersReport_() {
+  const report = { pass: false, trigger_count: 0, schedule: null, last_install: null, master_timezone: APP.TIMEZONE, errors: [] };
+  try {
+    report.trigger_count = ScriptApp.getProjectTriggers().filter(function (t) { return t.getHandlerFunction() === PAYMENT_PIPELINE.handler; }).length;
+    const schedule = parsePipelineSchedule_(readSettingsMap_());
+    report.schedule = { morning_hour: schedule.morning, afternoon_hour: schedule.afternoon, time_zone: schedule.timeZone };
+    schedule.errors.forEach(function (e) { report.errors.push(e); });
+    if (report.trigger_count !== 2) report.errors.push('expected exactly 2 pipeline triggers, found ' + report.trigger_count);
+    if (schedule.timeZone !== APP.TIMEZONE) report.errors.push('scheduled_sync_timezone ' + schedule.timeZone + ' is not the Master timezone ' + APP.TIMEZONE);
+    const audit = getSpreadsheet_().getSheetByName(SHEETS.AUDIT_LOG);
+    const last = audit ? audit.getLastRow() : 0;
+    if (last >= 2) {
+      const n = Math.min(last - 1, 3000);
+      const rows = audit.getRange(last - n + 1, 1, n, 8).getValues();
+      for (let i = rows.length - 1; i >= 0; i--) {
+        if (String(rows[i][1]) !== PAYMENT_PIPELINE.triggersInstalledAction) continue;
+        let d = {};
+        try { d = JSON.parse(String(rows[i][7] || '{}')) || {}; } catch (e) { d = {}; }
+        report.last_install = { at: rows[i][0], morning_hour: d.morning_hour, afternoon_hour: d.afternoon_hour, time_zone: d.time_zone };
+        break;
+      }
+    }
+    const li = report.last_install;
+    if (!li) report.errors.push('no ' + PAYMENT_PIPELINE.triggersInstalledAction + ' audit row found');
+    else if (li.morning_hour !== schedule.morning || li.afternoon_hour !== schedule.afternoon || li.time_zone !== schedule.timeZone) {
+      report.errors.push('the last trigger install (' + li.morning_hour + '/' + li.afternoon_hour + ' ' + li.time_zone + ') differs from Settings; ' +
+        'run installScheduledPaymentPipelineTriggers()');
+    }
+  } catch (err) {
+    report.errors.push(err && err.message ? err.message : String(err));
+  }
+  report.pass = report.errors.length === 0;
+  return report;
 }
 
 /** Deletes every trigger of this pipeline (other triggers are untouched). @return {number} removed */

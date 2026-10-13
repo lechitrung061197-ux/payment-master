@@ -232,7 +232,7 @@ function installScriptApp(settings, existing) {
   context.appendAuditLog_ = () => {};
   return { triggers, created };
 }
-const SCHEDULE = { scheduled_sync_morning_hour: 8, scheduled_sync_afternoon_hour: 17, scheduled_sync_timezone: 'Asia/Ho_Chi_Minh' };
+const SCHEDULE = { scheduled_sync_morning_hour: 8, scheduled_sync_afternoon_hour: 17, scheduled_sync_timezone: 'America/New_York' };
 
 test('triggers: installer creates exactly two daily triggers from Settings and is idempotent (no duplicates, others untouched)', () => {
   const s = installScriptApp(SCHEDULE, [{ handler: 'onOpen' }, { handler: 'runScheduledPaymentPipeline', hour: 3 }]);
@@ -240,7 +240,7 @@ test('triggers: installer creates exactly two daily triggers from Settings and i
   assert.deepEqual([r1.removed, r1.created, r1.installed], [1, 2, 2]);
   for (let i = 0; i < 3; i++) H.installPaymentPipelineTriggers_();
   const mine = s.triggers.filter((t) => t.handler === 'runScheduledPaymentPipeline');
-  assert.deepEqual(mine.map((t) => [t.hour, t.minute, t.everyDays, t.tz]), [[8, 0, 1, 'Asia/Ho_Chi_Minh'], [17, 0, 1, 'Asia/Ho_Chi_Minh']]);
+  assert.deepEqual(mine.map((t) => [t.hour, t.minute, t.everyDays, t.tz]), [[8, 0, 1, 'America/New_York'], [17, 0, 1, 'America/New_York']]);
   assert.equal(s.triggers.filter((t) => t.handler === 'onOpen').length, 1);
   assert.equal(H.removePaymentPipelineTriggers_(), 2);
   assert.equal(s.triggers.length, 1);
@@ -251,7 +251,7 @@ test('triggers: installer creates exactly two daily triggers from Settings and i
   installScriptApp({ ...SCHEDULE, scheduled_sync_timezone: '' });
   assert.throws(() => H.installPaymentPipelineTriggers_(), /scheduled_sync_timezone is blank/);
   assert.deepEqual(js(vm.runInContext('DEFAULT_SETTINGS', context)).filter((x) => x[0].startsWith('scheduled_sync_')).map((x) => [x[0], x[1]]),
-    [['scheduled_sync_morning_hour', 8], ['scheduled_sync_afternoon_hour', 17], ['scheduled_sync_timezone', 'Asia/Ho_Chi_Minh']]);
+    [['scheduled_sync_morning_hour', 8], ['scheduled_sync_afternoon_hour', 17], ['scheduled_sync_timezone', 'America/New_York']]);
 });
 
 // ---- health invariants ------------------------------------------------------------------------------------

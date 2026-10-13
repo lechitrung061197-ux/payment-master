@@ -730,10 +730,23 @@ is skipped (`PIPELINE_SKIPPED_LOCKED`) and never runs in parallel.
   seller_hold` on every leg and item; payout allocations valid; paid ≤ obligation; Seller Balances reconcile to
   Settlement Items + APPLIED adjustments − valid seller payouts.
 - **Schedule** (Settings, seeded): `scheduled_sync_morning_hour` (8), `scheduled_sync_afternoon_hour` (17),
-  `scheduled_sync_timezone` (`Asia/Ho_Chi_Minh`). `installScheduledPaymentPipelineTriggers()` replaces this
-  pipeline's triggers with exactly two daily time-driven triggers (idempotent — re-running never duplicates;
-  other triggers untouched); `removeScheduledPaymentPipelineTriggers()` removes them. Requires the
-  `script.scriptapp` scope.
+  `scheduled_sync_timezone` (`America/New_York` = the Master timezone `APP.TIMEZONE`; Phase 2O.2). The time zone
+  must be an IANA region name — fixed offsets (`GMT+7`, `UTC-05:00`, `Etc/GMT-7`, `UTC`) are rejected — so
+  08:00 / 17:00 stay New York wall-clock hours across daylight saving time (handled by Apps Script, no UTC offset
+  arithmetic). `installScheduledPaymentPipelineTriggers()` replaces this pipeline's triggers with exactly two
+  daily time-driven triggers (idempotent — re-running never duplicates; other triggers untouched; warns when the
+  schedule time zone is not the Master timezone); `removeScheduledPaymentPipelineTriggers()` removes them;
+  `verifyScheduledPaymentPipelineTriggers()` (read-only) checks there are exactly 2 and that the last install
+  (audited `PIPELINE_TRIGGERS_INSTALLED`) matches Settings in the Master timezone. Requires the `script.scriptapp`
+  scope.
+- **Timezone migration (2O.2)**: setup never overwrites an existing Settings value, so a Master seeded with the
+  retired default `Asia/Ho_Chi_Minh` is moved explicitly by `migrateScheduledPipelineTimezoneToMaster()`
+  (`Asia/Ho_Chi_Minh` → `America/New_York`, description + `updated_at` refreshed, audited
+  `PIPELINE_SCHEDULE_TIMEZONE_MIGRATED`; already New York → `NO_CHANGE`; any other value → `FAILED`, untouched),
+  then `installScheduledPaymentPipelineTriggers()`. Hours, triggers and `source.KH001.timezone`
+  (`America/Los_Angeles`, the provider's source timezone used only to read KH001 dates) are not touched. All
+  Master-generated dates (Operations default payout date, payout dates, Seller Terms "today", import batch ids)
+  already use `APP.TIMEZONE`.
 - **Provider paid ≠ seller paid.** Provider paid (did the provider pay VNS?) comes only from Settlements
   (`source_paid_amount`, `source_payment_date` → AVAILABLE). Seller paid (did VNS pay the seller?) comes only from
   Seller Payouts + Seller Payout Allocations (`validateSellerPayoutAllocations_` in SellerPayoutAllocations.gs). A
