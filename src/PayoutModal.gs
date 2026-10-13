@@ -1,6 +1,6 @@
 /**
  * PayoutModal.gs
- * Server side of the "New Payout" modal (HtmlService, src/PayoutModal.html). The modal is a UI only:
+ * Server side of the "New Payout" modal (HtmlService, src/PayoutModalView.html). The modal is a UI only:
  *
  * - It is not an accounting authority. Every endpoint re-reads the canonical Master (Seller Balances, Seller Payouts,
  *   Seller Payout Allocations, Settlement Items, Settlements, Adjustments); numbers sent by the browser are never trusted.
@@ -18,7 +18,8 @@
  */
 
 const PAYOUT_MODAL = Object.freeze({
-  htmlFile: 'src/PayoutModal',
+  // Apps Script file names must be unique across .gs and .html, so the page cannot be named PayoutModal too.
+  htmlFile: 'src/PayoutModalView',
   title: 'New Payout',
   width: 980,
   height: 760,

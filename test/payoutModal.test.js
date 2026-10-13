@@ -101,7 +101,7 @@ test('6: the payout date default is the New York date, never the browser / Vietn
   } finally {
     sim.ctx.Date = RealDate;
   }
-  const html = fs.readFileSync(path.join(SRC, 'PayoutModal.html'), 'utf8');
+  const html = fs.readFileSync(path.join(SRC, 'PayoutModalView.html'), 'utf8');
   assert.ok(!/new Date|Date\.now|getTimezoneOffset|toLocaleDateString|Intl\.DateTimeFormat/.test(html), 'the browser never computes dates');
 });
 
@@ -253,8 +253,9 @@ test('16: accounting regression unchanged (no payout: 168 items, 8370.0516 / 102
 });
 
 test('HTML: a UI only - calls only the whitelisted endpoints, renders with textContent, no client accounting', () => {
-  assert.equal(call('PAYOUT_MODAL.htmlFile'), 'src/PayoutModal');
-  const html = fs.readFileSync(path.join(SRC, 'PayoutModal.html'), 'utf8');
+  assert.equal(call('PAYOUT_MODAL.htmlFile'), 'src/PayoutModalView');
+  assert.ok(fs.existsSync(path.join(SRC, 'PayoutModalView.html')), 'the file HtmlService opens exists');
+  const html = fs.readFileSync(path.join(SRC, 'PayoutModalView.html'), 'utf8');
   const called = [...html.matchAll(/call\('(\w+)'/g)].map((m) => m[1]);
   assert.deepEqual([...new Set(called)].sort(), ['payoutModalBootstrap', 'payoutModalCreateDraft', 'payoutModalPayout', 'payoutModalPreview',
     'payoutModalRetryAllocation', 'payoutModalSeller', 'payoutModalTransition'].sort());
@@ -262,4 +263,10 @@ test('HTML: a UI only - calls only the whitelisted endpoints, renders with textC
   assert.ok(!/innerHTML|outerHTML|insertAdjacentHTML|document\.write/.test(html), 'no HTML injection sinks');
   assert.ok(!/setValue|getRange|Seller Payouts|status\s*:\s*'SENT'/.test(html), 'no direct sheet access / status payloads');
   assert.ok(/google\.script\.run/.test(html));
+});
+
+test('Apps Script project file names are unique across .gs and .html (clasp push would be rejected otherwise)', () => {
+  const names = fs.readdirSync(SRC).filter((f) => /\.(gs|html)$/.test(f)).map((f) => f.replace(/\.(gs|html)$/, ''));
+  const dupes = names.filter((n, i) => names.indexOf(n) !== i);
+  assert.deepEqual(dupes, []);
 });

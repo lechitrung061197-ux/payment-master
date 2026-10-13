@@ -62,7 +62,8 @@ src/
   SellerSheets.gs               Seller child sheet sync / verify (owned-range renderer, _Sync commit)
   SellerProvisioning.gs         Template-based seller sheet provisioning + seller-sheet menu helpers
   Operations.gs                 Operations tab (operator view + payout form) and controlled payout transitions
-  PayoutModal.gs / .html        "New Payout" modal (HtmlService): UI over the Operations workflow (Phase 2P)
+  PayoutModal.gs                "New Payout" modal server endpoints (Phase 2P)
+  PayoutModalView.html          "New Payout" modal page (HtmlService; .gs and .html names must differ in Apps Script)
   Main.gs           Public entry points and the "Payment Master" menu
 test/               Node tests (npm test, not pushed); test/helpers/masterSim.js = production-shaped
                     end-to-end Master simulation used by the integration tests
