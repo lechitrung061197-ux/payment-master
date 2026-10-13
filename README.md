@@ -62,6 +62,7 @@ src/
   SellerSheets.gs               Seller child sheet sync / verify (owned-range renderer, _Sync commit)
   SellerProvisioning.gs         Template-based seller sheet provisioning + seller-sheet menu helpers
   Operations.gs                 Operations tab (operator view + payout form) and controlled payout transitions
+  PayoutModal.gs / .html        "New Payout" modal (HtmlService): UI over the Operations workflow (Phase 2P)
   Main.gs           Public entry points and the "Payment Master" menu
 test/               Node tests (npm test, not pushed); test/helpers/masterSim.js = production-shaped
                     end-to-end Master simulation used by the integration tests
@@ -889,9 +890,32 @@ ever created):
   allocation targets, reason, follow-up results), `SELLER_PAYOUT_OPERATION_FAILED` (validation error),
   `SELLER_PAYOUT_OPERATION_SKIPPED_LOCKED`, plus the reused runners' own rows.
 
-**Menu `Payment Master`**: Sync (Run Full Sync, Verify Health, Sync Seller Sheets) · Payouts (Refresh
-Operations, Create Draft + FIFO, New Payout Request, Mark Selected SENT / CONFIRMED, Cancel Selected DRAFT, Reverse Selected Payout,
-Verify Seller Payouts) · Sellers (Create Seller Sheet, Sync Seller Sheets, Verify Seller Sheets) · View
+**New Payout modal (Phase 2P)** — `Payment Master > Payouts > New Payout` opens an HtmlService modal; the
+Operations form stays as a fallback under `Payouts > Advanced`. The modal is a UI only:
+
+- **Flow**: choose an ACTIVE seller → the server returns its payable line per currency (current balance, hold,
+  DRAFT reserved, available_to_draft, open obligations, effective paid, payment state; a single currency is
+  auto-selected) and its open obligations in FIFO order (type, target, date, due, paid, remaining, DRAFT claimed,
+  status) → Amount (`Pay Full` = available_to_draft; `0 < amount ≤ available_to_draft`), Payout Date (`dd/MM/yyyy`,
+  default = the Master date in America/New_York from the server — the browser clock is never used), payout
+  currency (same currency → fx 1 and payout amount = amount automatically), method, reference, notes →
+  **Preview FIFO** (server-side `planOperationsDraft_` / `planFifoAllocation_` on fresh canonical data: per
+  obligation remaining, allocated, remaining after and PAID / PARTIAL after the payout; writes nothing) →
+  **Create Draft** → the payout panel shows id, seller, amount, allocation and status with only the valid actions:
+  DRAFT → Mark SENT / Cancel (Retry Allocation instead of Mark SENT while not fully allocated), SENT → Confirm /
+  Reverse, CONFIRMED → Reverse. Active payouts are listed so a DRAFT can be resumed after the modal is reopened.
+- **Backend**: `createDraftRequest_` (shared with the Operations form: request token → `SP-OPS-…`, validation,
+  DRAFT row, `runSellerPayoutFifo_`, full allocation, idempotency, audit with `channel: MODAL`); transitions are
+  named actions (`SEND / CONFIRM / CANCEL / REVERSE`) mapped to `runSellerPayoutTransition_` with the status the
+  modal shows (stale → rejected); the client can never send a status. Every endpoint re-reads the canonical
+  Master; browser numbers are never trusted (e.g. a stale "available" is re-checked). DocumentLock → ScriptLock as
+  before. A complete request returns `next_token`; an incomplete one keeps the token (retry, never a second DRAFT).
+  Endpoints: `payoutModalBootstrap`, `payoutModalSeller`, `payoutModalPreview`, `payoutModalCreateDraft`,
+  `payoutModalPayout`, `payoutModalTransition`, `payoutModalRetryAllocation`.
+
+**Menu `Payment Master`**: Sync (Run Full Sync, Verify Health, Sync Seller Sheets) · Payouts (New Payout, Refresh
+Operations, Mark Selected SENT / CONFIRMED, Cancel Selected DRAFT, Reverse Selected Payout,
+Verify Seller Payouts; Advanced: Create Draft from Operations Form, New Payout Request) · Sellers (Create Seller Sheet, Sync Seller Sheets, Verify Seller Sheets) · View
 (Operator View, Technical View).
 
 **Views** (menu only; `setupMaster` never changes visibility): **Operator View** shows Operations, Dashboard,

@@ -788,76 +788,87 @@ function rotateOperationsRequest_(sheet) {
 function runCreateDraftFromOperations_() {
   return withOperationsLock_('CREATE_DRAFT', function (ss) {
     const sheet = operationsSheetOrThrow_(ss);
-    const form = readOperationsForm_(sheet);
-    if (form.token === '') throw new Error('Request token is missing; run Refresh Operations. Nothing changed.');
-    const payoutId = operationsPayoutId_(form.token);
-    const result = { status: 'FAILED', operation: 'CREATE_DRAFT', seller_payout_id: payoutId, old_status: '', new_status: '', warnings: [],
-      request: 'NEW', draft_created: false };
-    assertOperationsAccountingCurrent_(ss);
-    let created = false;
-    let payout = null;
-    withOperationsScriptLock_(function () {
-      const input = readSellerAllocationInputs_(ss);
-      const sellers = readSellersDraft_(ss).parsed.sellers;
-      const balances = readSchemaTableObjects_(ss, SHEETS.SELLER_BALANCES, sellerBalancesTab_()).rows;
-      const existing = input.payouts.filter(function (p) { return trimmedText_(p.seller_payout_id) === payoutId; });
-      if (existing.length > 0) {
-        // Retry of the same request: the payout exists; it must be exactly what the form says (notes included).
-        result.request = 'RETRY';
-        const lines = buildOperationsLines_({ balances: balances, states: input.validation.states, payouts: input.payouts, allocations: input.allocations });
-        const parsed = parseOperationsForm_(form, { sellers: sellers, lines: lines, dateKeyOf: masterDateKey_ });
-        if (existing.length > 1 || parsed.errors.length > 0 || !operationsPayoutMatchesForm_(existing[0], parsed.payout, masterDateKey_)) {
-          throw new Error('Request token already used by Seller Payout ' + payoutId + ' with other values; nothing changed. Restore the values of ' +
-            'that request to retry it, or use Payouts > New Payout Request to start a new one.');
-        }
-        if (trimmedText_(existing[0].status) !== SELLER_ALLOCATIONS.draftStatus) {
-          throw new Error('Seller Payout ' + payoutId + ' (this request) is already ' + existing[0].status +
-            '; nothing changed. Use Payouts > New Payout Request to start a new one.');
-        }
-        payout = existing[0];
-        return;
-      }
-      const plan = planOperationsDraft_(form, { sellers: sellers, balances: balances, payouts: input.payouts, allocations: input.allocations,
-        items: input.items, settlements: input.settlements, adjustments: input.adjustments, validation: input.validation, payoutId: payoutId,
-        now: new Date(Math.floor(Date.now() / 1000) * 1000) });
-      if (plan.status !== 'READY') throw new Error(plan.error + ' Nothing changed.');
-      appendSellerPayoutRow_(ss, plan.payout);
-      payout = plan.payout;
-      created = true;
-      // The canonical DRAFT row exists from here on: audit it now, before FIFO (allocation still pending).
-      operationsAudit_(OPERATIONS.auditActions.DRAFT, payoutId, '', SELLER_ALLOCATIONS.draftStatus,
-        Object.assign({ request: 'NEW', allocation_status: 'PENDING' }, operationsPayoutAuditFields_(payout, [])));
-    });
-    result.draft_created = true; // a canonical DRAFT row exists (created now or by an earlier attempt of this request)
-    result.draft_created_now = created;
-    result.payout_status = SELLER_ALLOCATIONS.draftStatus;
-    result.new_status = SELLER_ALLOCATIONS.draftStatus;
-    // FIFO: the existing allocator (own script lock); oldest obligation first. It never changes the payout status.
-    const fifo = runSellerPayoutFifo_(payoutId);
-    result.fifo_status = fifo.status;
-    const after = readSellerAllocationInputs_(ss);
-    const own = after.allocations.filter(function (a) { return trimmedText_(a.seller_payout_id) === payoutId; });
-    const allocated = own.reduce(function (sum, a) { return sum + operationsMicros_(a.allocated_amount); }, 0);
-    result.allocations = own.map(function (a) { return { target_type: a.target_type, target_id: a.target_id, allocated_amount: a.allocated_amount }; });
-    Object.assign(result, operationsPayoutAuditFields_(payout, own));
-    result.allocated_amount = allocated / 1e6;
-    const full = fifo.status !== 'FAILED' && Math.abs(allocated - operationsMicros_(payout.amount)) <= SELLER_ALLOCATIONS.toleranceMicros;
-    if (!full) {
-      result.allocation_status = allocated > 0 ? 'PARTIAL' : 'NONE';
-      result.fifo_error = fifo.error || (fifo.warnings || []).join(' ') || null;
-      result.required_action = 'Fix the cause, then click Create Draft + FIFO again with the same form (same request token) to retry this DRAFT; ' +
-        'or cancel the DRAFT (Cancel Selected DRAFT) and start a New Payout Request.';
-      result.error = 'DRAFT ' + payoutId + (created ? ' was created' : ' exists') + ' but is not fully allocated (' + allocated / 1e6 + ' of ' + payout.amount +
-        ')' + (result.fifo_error ? ': ' + result.fifo_error : '') + '. It has no financial effect and cannot be marked SENT. ' + result.required_action;
-      return result; // token kept: the next click retries this same payout
-    }
-    result.allocation_status = 'FULL';
-    // NO_CHANGE: retry of a request that was already complete; SUCCESS: new DRAFT or a retry that completed the allocation.
-    result.status = !created && fifo.status === 'NO_CHANGE' ? 'NO_CHANGE' : 'SUCCESS';
-    if (!created) result.warnings.push('Same request token: Seller Payout ' + payoutId + ' already exists; no second payout created.');
-    rotateOperationsRequest_(sheet); // the request is complete: a further click cannot repeat it
+    const result = createDraftRequest_(ss, readOperationsForm_(sheet), 'OPERATIONS_FORM');
+    if (result.allocation_status === 'FULL') rotateOperationsRequest_(sheet); // the request is complete: a further click cannot repeat it
     return result;
   });
+}
+
+/**
+ * The guarded DRAFT + FIFO workflow shared by the Operations form and the payout modal. Caller holds the DOCUMENT lock.
+ * form = { token, seller, currency, payout_date, amount, payout_currency, fx_rate, payout_amount, payment_method, reference,
+ * notes } (raw input; re-validated here against freshly read canonical data). Throws (nothing written) on any validation
+ * failure; returns FAILED with draft_created when the DRAFT exists but is not fully allocated (retry with the same token).
+ * allocation_status FULL = the request is complete (the caller may then issue a new token).
+ */
+function createDraftRequest_(ss, form, channel) {
+  if (trimmedText_(form.token) === '') throw new Error('Request token is missing; run Refresh Operations. Nothing changed.');
+  const payoutId = operationsPayoutId_(form.token);
+  const result = { status: 'FAILED', operation: 'CREATE_DRAFT', channel: channel, seller_payout_id: payoutId, old_status: '', new_status: '', warnings: [],
+    request: 'NEW', draft_created: false };
+  assertOperationsAccountingCurrent_(ss);
+  let created = false;
+  let payout = null;
+  withOperationsScriptLock_(function () {
+    const input = readSellerAllocationInputs_(ss);
+    const sellers = readSellersDraft_(ss).parsed.sellers;
+    const balances = readSchemaTableObjects_(ss, SHEETS.SELLER_BALANCES, sellerBalancesTab_()).rows;
+    const existing = input.payouts.filter(function (p) { return trimmedText_(p.seller_payout_id) === payoutId; });
+    if (existing.length > 0) {
+      // Retry of the same request: the payout exists; it must be exactly what the form says (notes included).
+      result.request = 'RETRY';
+      const lines = buildOperationsLines_({ balances: balances, states: input.validation.states, payouts: input.payouts, allocations: input.allocations });
+      const parsed = parseOperationsForm_(form, { sellers: sellers, lines: lines, dateKeyOf: masterDateKey_ });
+      if (existing.length > 1 || parsed.errors.length > 0 || !operationsPayoutMatchesForm_(existing[0], parsed.payout, masterDateKey_)) {
+        throw new Error('Request token already used by Seller Payout ' + payoutId + ' with other values; nothing changed. Restore the values of ' +
+          'that request to retry it, or use Payouts > New Payout Request to start a new one.');
+      }
+      if (trimmedText_(existing[0].status) !== SELLER_ALLOCATIONS.draftStatus) {
+        throw new Error('Seller Payout ' + payoutId + ' (this request) is already ' + existing[0].status +
+          '; nothing changed. Use Payouts > New Payout Request to start a new one.');
+      }
+      payout = existing[0];
+      return;
+    }
+    const plan = planOperationsDraft_(form, { sellers: sellers, balances: balances, payouts: input.payouts, allocations: input.allocations,
+      items: input.items, settlements: input.settlements, adjustments: input.adjustments, validation: input.validation, payoutId: payoutId,
+      now: new Date(Math.floor(Date.now() / 1000) * 1000) });
+    if (plan.status !== 'READY') throw new Error(plan.error + ' Nothing changed.');
+    appendSellerPayoutRow_(ss, plan.payout);
+    payout = plan.payout;
+    created = true;
+    // The canonical DRAFT row exists from here on: audit it now, before FIFO (allocation still pending).
+    operationsAudit_(OPERATIONS.auditActions.DRAFT, payoutId, '', SELLER_ALLOCATIONS.draftStatus,
+      Object.assign({ request: 'NEW', channel: channel, allocation_status: 'PENDING' }, operationsPayoutAuditFields_(payout, [])));
+  });
+  result.draft_created = true; // a canonical DRAFT row exists (created now or by an earlier attempt of this request)
+  result.draft_created_now = created;
+  result.payout_status = SELLER_ALLOCATIONS.draftStatus;
+  result.new_status = SELLER_ALLOCATIONS.draftStatus;
+  // FIFO: the existing allocator (own script lock); oldest obligation first. It never changes the payout status.
+  const fifo = runSellerPayoutFifo_(payoutId);
+  result.fifo_status = fifo.status;
+  const after = readSellerAllocationInputs_(ss);
+  const own = after.allocations.filter(function (a) { return trimmedText_(a.seller_payout_id) === payoutId; });
+  const allocated = own.reduce(function (sum, a) { return sum + operationsMicros_(a.allocated_amount); }, 0);
+  result.allocations = own.map(function (a) { return { target_type: a.target_type, target_id: a.target_id, allocated_amount: a.allocated_amount }; });
+  Object.assign(result, operationsPayoutAuditFields_(payout, own));
+  result.allocated_amount = allocated / 1e6;
+  const full = fifo.status !== 'FAILED' && Math.abs(allocated - operationsMicros_(payout.amount)) <= SELLER_ALLOCATIONS.toleranceMicros;
+  if (!full) {
+    result.allocation_status = allocated > 0 ? 'PARTIAL' : 'NONE';
+    result.fifo_error = fifo.error || (fifo.warnings || []).join(' ') || null;
+    result.required_action = 'Fix the cause, then click Create Draft + FIFO again with the same form (same request token) to retry this DRAFT; ' +
+      'or cancel the DRAFT (Cancel Selected DRAFT) and start a New Payout Request.';
+    result.error = 'DRAFT ' + payoutId + (created ? ' was created' : ' exists') + ' but is not fully allocated (' + allocated / 1e6 + ' of ' + payout.amount +
+      ')' + (result.fifo_error ? ': ' + result.fifo_error : '') + '. It has no financial effect and cannot be marked SENT. ' + result.required_action;
+    return result; // token kept: the next click retries this same payout
+  }
+  result.allocation_status = 'FULL';
+  // NO_CHANGE: retry of a request that was already complete; SUCCESS: new DRAFT or a retry that completed the allocation.
+  result.status = !created && fifo.status === 'NO_CHANGE' ? 'NO_CHANGE' : 'SUCCESS';
+  if (!created) result.warnings.push('Same request token: Seller Payout ' + payoutId + ' already exists; no second payout created.');
+  return result;
 }
 
 /**

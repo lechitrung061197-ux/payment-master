@@ -369,14 +369,16 @@ function onOpen() {
       .addItem('Verify Health', 'menuVerifyHealth')
       .addItem('Sync Seller Sheets', 'menuSyncSellerSheets'))
     .addSubMenu(ui.createMenu('Payouts')
+      .addItem('New Payout', 'menuOpenPayoutModal')
       .addItem('Refresh Operations', 'menuRefreshOperations')
-      .addItem('Create Draft + FIFO', 'menuCreateDraftPayout')
-      .addItem('New Payout Request (reset form)', 'menuNewPayoutRequest')
       .addItem('Mark Selected SENT', 'menuMarkSelectedPayoutSent')
       .addItem('Mark Selected CONFIRMED', 'menuMarkSelectedPayoutConfirmed')
       .addItem('Cancel Selected DRAFT', 'menuCancelSelectedPayout')
       .addItem('Reverse Selected Payout', 'menuReverseSelectedPayout')
-      .addItem('Verify Seller Payouts', 'menuVerifySellerPayouts'))
+      .addItem('Verify Seller Payouts', 'menuVerifySellerPayouts')
+      .addSubMenu(ui.createMenu('Advanced')
+        .addItem('Create Draft from Operations Form', 'menuCreateDraftPayout')
+        .addItem('New Payout Request (reset form)', 'menuNewPayoutRequest')))
     .addSubMenu(ui.createMenu('Sellers')
       .addItem('Create Seller Sheet', 'menuCreateSellerSheet')
       .addItem('Sync Seller Sheets', 'menuSyncSellerSheets')
@@ -658,4 +660,50 @@ function menuApplyTechnicalView() {
   const r = applyTechnicalView();
   operationsAlert_('Technical View', r.status + (r.error ? '\n' + r.error : '\nShown: ' + r.shown.length + ' tab(s)'));
   return r;
+}
+
+/* ---------------------------------------------------------------------------
+ * "New Payout" modal (HtmlService). UI only: these endpoints re-read the canonical Master and reuse the guarded
+ * Operations workflow (createDraftRequest_, runSellerPayoutFifo_, runSellerPayoutTransition_).
+ * ------------------------------------------------------------------------- */
+
+/** Menu: opens the New Payout modal. */
+function menuOpenPayoutModal() {
+  const html = HtmlService.createHtmlOutputFromFile(PAYOUT_MODAL.htmlFile).setWidth(PAYOUT_MODAL.width).setHeight(PAYOUT_MODAL.height);
+  SpreadsheetApp.getUi().showModalDialog(html, PAYOUT_MODAL.title);
+}
+
+/** Modal: ACTIVE sellers, Master (New York) date, a request token, active payouts. */
+function payoutModalBootstrap() {
+  return runPayoutModalBootstrap_();
+}
+
+/** Modal: payable lines, open obligations (FIFO) and active payouts of one ACTIVE seller. */
+function payoutModalSeller(sellerId) {
+  return runPayoutModalSeller_(sellerId);
+}
+
+/** Modal: FIFO preview of a payout payload (same plan as Create Draft; writes nothing). */
+function payoutModalPreview(payload) {
+  return runPayoutModalPreview_(payload);
+}
+
+/** Modal: Create Draft (guarded, idempotent by request token). */
+function payoutModalCreateDraft(payload) {
+  return runPayoutModalCreate_(payload);
+}
+
+/** Modal: current canonical view of one payout. */
+function payoutModalPayout(payoutId) {
+  return runPayoutModalPayout_(payoutId);
+}
+
+/** Modal: a named lifecycle action (SEND / CONFIRM / CANCEL / REVERSE) with the status the modal shows. */
+function payoutModalTransition(payoutId, action, expectedStatus, reason) {
+  return runPayoutModalTransition_(payoutId, action, expectedStatus, reason);
+}
+
+/** Modal: reruns FIFO for an incomplete DRAFT (resume). */
+function payoutModalRetryAllocation(payoutId) {
+  return runPayoutModalRetryAllocation_(payoutId);
 }

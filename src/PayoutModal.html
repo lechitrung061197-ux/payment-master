@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html>
+<head>
+<base target="_top">
+<meta charset="utf-8">
+<style>
+  :root { --fg: #1f2328; --muted: #656d76; --line: #d0d7de; --bg: #f6f8fa; --accent: #0b57d0; --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e; }
+  * { box-sizing: border-box; }
+  body { font: 13px/1.45 Arial, Helvetica, sans-serif; color: var(--fg); margin: 0; padding: 12px 16px; }
+  h2 { font-size: 14px; margin: 16px 0 6px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+  .field { display: flex; flex-direction: column; min-width: 150px; }
+  .field label { color: var(--muted); font-size: 12px; margin-bottom: 2px; }
+  input, select, textarea { font: inherit; padding: 5px 7px; border: 1px solid var(--line); border-radius: 4px; }
+  input[disabled] { background: var(--bg); color: var(--muted); }
+  button { font: inherit; padding: 6px 12px; border: 1px solid var(--line); border-radius: 4px; background: #fff; cursor: pointer; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button.danger { color: var(--bad); border-color: var(--bad); }
+  button[disabled] { opacity: .5; cursor: default; }
+  table { border-collapse: collapse; width: 100%; margin-top: 4px; }
+  th, td { border-bottom: 1px solid var(--line); padding: 4px 6px; text-align: left; }
+  th { background: var(--bg); font-weight: 600; font-size: 12px; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .cards { display: flex; gap: 8px; flex-wrap: wrap; }
+  .card { border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; min-width: 120px; }
+  .card .k { color: var(--muted); font-size: 11px; }
+  .card .v { font-weight: 600; }
+  .msg { margin: 8px 0; padding: 6px 10px; border-radius: 4px; white-space: pre-wrap; }
+  .msg.ok { background: #dafbe1; } .msg.err { background: #ffebe9; } .msg.info { background: var(--bg); }
+  .muted { color: var(--muted); }
+  .pill { display: inline-block; padding: 0 6px; border-radius: 10px; font-size: 11px; border: 1px solid var(--line); }
+  .hidden { display: none; }
+  #payoutPanel { border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px; margin-top: 10px; }
+</style>
+</head>
+<body>
+  <div class="muted" id="dateNote"></div>
+  <div id="msg" class="msg info">Loading…</div>
+
+  <div class="row">
+    <div class="field"><label for="seller">Seller (ACTIVE)</label><select id="seller"></select></div>
+    <div class="field"><label for="currency">Currency</label><select id="currency"></select></div>
+  </div>
+  <div class="cards" id="summary"></div>
+
+  <h2>Open obligations (FIFO order)</h2>
+  <table id="obligations"><thead><tr><th>Type</th><th>Target</th><th>Date</th><th class="num">Due</th><th class="num">Paid</th>
+    <th class="num">Remaining</th><th class="num">DRAFT claimed</th><th>Status</th></tr></thead><tbody></tbody></table>
+
+  <h2>Payout</h2>
+  <div class="row">
+    <div class="field"><label for="amount">Amount</label><input id="amount" inputmode="decimal" autocomplete="off"></div>
+    <button id="payFull" type="button">Pay Full</button>
+    <div class="field"><label for="payoutDate">Payout Date (dd/MM/yyyy, New York)</label><input id="payoutDate" autocomplete="off"></div>
+  </div>
+  <div class="row">
+    <div class="field"><label for="payoutCurrency">Payout currency</label><input id="payoutCurrency" autocomplete="off"></div>
+    <div class="field"><label for="fxRate">FX rate</label><input id="fxRate" inputmode="decimal" autocomplete="off"></div>
+    <div class="field"><label for="payoutAmount">Payout amount</label><input id="payoutAmount" inputmode="decimal" autocomplete="off"></div>
+  </div>
+  <div class="row">
+    <div class="field"><label for="method">Payment method</label><input id="method" autocomplete="off"></div>
+    <div class="field"><label for="reference">Reference</label><input id="reference" autocomplete="off"></div>
+    <div class="field" style="flex:1"><label for="notes">Notes</label><input id="notes" autocomplete="off"></div>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <button id="previewBtn" type="button">Preview FIFO</button>
+    <button id="createBtn" type="button" class="primary" disabled>Create Draft</button>
+    <span class="muted" id="previewNote"></span>
+  </div>
+  <table id="preview" class="hidden"><thead><tr><th>Target</th><th>Date</th><th class="num">Remaining</th><th class="num">Allocated</th>
+    <th class="num">Remaining after</th><th>After payout</th></tr></thead><tbody></tbody></table>
+
+  <div id="payoutPanel" class="hidden">
+    <h2 style="margin-top:4px">Payout <span id="pId"></span> <span class="pill" id="pStatus"></span></h2>
+    <div id="pInfo" class="muted"></div>
+    <table id="pAlloc"><thead><tr><th>Allocated to</th><th class="num">Amount</th></tr></thead><tbody></tbody></table>
+    <div class="row" style="margin-top:8px">
+      <div class="field" style="flex:1"><label for="reason">Reason (required to Reverse, optional to Cancel)</label><input id="reason" autocomplete="off"></div>
+    </div>
+    <div class="row" id="actions" style="margin-top:8px"></div>
+  </div>
+
+  <h2>Active payouts (resume)</h2>
+  <table id="active"><thead><tr><th>Payout</th><th>Seller</th><th>Date</th><th class="num">Amount</th><th>Status</th><th>Allocation</th><th></th></tr></thead><tbody></tbody></table>
+
+<script>
+  // UI only: every number shown comes from the server; every write is a server call that re-validates against the canonical Master.
+  var S = { token: '', today: '', seller: null, lines: [], obligations: {}, payout: null, busy: false, previewOk: false };
+  var $ = function (id) { return document.getElementById(id); };
+  var ACTION_LABELS = { SEND: 'Mark SENT', CONFIRM: 'Confirm', CANCEL: 'Cancel', REVERSE: 'Reverse', RETRY_ALLOCATION: 'Retry Allocation' };
+
+  function fmt(n) { return (typeof n === 'number' && isFinite(n)) ? n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 }) : ''; }
+  function msg(text, kind) { var m = $('msg'); m.textContent = text; m.className = 'msg ' + (kind || 'info'); }
+  function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
+  function cell(tr, text, num) { var td = document.createElement('td'); td.textContent = text === undefined || text === null ? '' : String(text); if (num) td.className = 'num'; tr.appendChild(td); return td; }
+  function setBusy(b) { S.busy = b; ['payFull', 'previewBtn', 'createBtn'].forEach(function (id) { $(id).disabled = b || (id === 'createBtn' && !S.previewOk); });
+    Array.prototype.forEach.call(document.querySelectorAll('#actions button, #active button'), function (x) { x.disabled = b; }); }
+  function call(fn, args, ok) {
+    setBusy(true);
+    google.script.run.withSuccessHandler(function (r) { setBusy(false); ok(r || { status: 'FAILED', error: 'No response' }); })
+      .withFailureHandler(function (e) { setBusy(false); msg('Server error: ' + (e && e.message ? e.message : e), 'err'); })[fn].apply(null, args);
+  }
+  function line() { var c = $('currency').value; return S.lines.filter(function (l) { return l.currency === c; })[0] || null; }
+  function sameCurrency() { var pc = $('payoutCurrency').value.trim().toUpperCase(); return pc === '' || pc === $('currency').value; }
+  function invalidatePreview() { S.previewOk = false; $('createBtn').disabled = true; $('preview').classList.add('hidden'); $('previewNote').textContent = ''; }
+  function syncFx() {
+    var same = sameCurrency();
+    $('fxRate').disabled = same; $('payoutAmount').disabled = same;
+    if (same) { $('fxRate').value = '1'; $('payoutAmount').value = $('amount').value; }
+  }
+  function payload() {
+    return { token: S.token, seller_id: S.seller ? S.seller.seller_id : '', currency: $('currency').value, payout_date: $('payoutDate').value.trim(),
+      amount: $('amount').value.trim(), payout_currency: $('payoutCurrency').value.trim().toUpperCase(),
+      fx_rate: sameCurrency() ? '' : $('fxRate').value.trim(), payout_amount: sameCurrency() ? '' : $('payoutAmount').value.trim(),
+      payment_method: $('method').value.trim(), reference: $('reference').value.trim(), notes: $('notes').value.trim() };
+  }
+  function clientAmountError() {
+    var l = line(); var a = Number($('amount').value.trim());
+    if (!l) return 'Select a seller and currency.';
+    if (!/^\d+(\.\d+)?$/.test($('amount').value.trim()) || !(a > 0)) return 'Amount must be a positive number.';
+    if (a > l.available_to_draft + 0.00005) return 'Amount exceeds available to draft (' + fmt(l.available_to_draft) + ').';
+    return '';
+  }
+
+  function renderSummary() {
+    var s = $('summary'); clear(s); var l = line(); if (!l) return;
+    [['Seller', l.seller_id + ' · ' + l.seller_name], ['Currency', l.currency], ['Current balance', fmt(l.current_balance)], ['Hold', fmt(l.seller_hold_balance)],
+      ['DRAFT reserved', fmt(l.draft_reserved)], ['Available to draft', fmt(l.available_to_draft)], ['Open obligations', l.open_obligations],
+      ['Effective paid', fmt(l.effective_paid)], ['Payment state', l.payment_state]].forEach(function (kv) {
+      var c = document.createElement('div'); c.className = 'card';
+      var k = document.createElement('div'); k.className = 'k'; k.textContent = kv[0];
+      var v = document.createElement('div'); v.className = 'v'; v.textContent = String(kv[1]);
+      c.appendChild(k); c.appendChild(v); s.appendChild(c);
+    });
+    var tb = $('obligations').tBodies[0]; clear(tb);
+    (S.obligations[l.currency] || []).forEach(function (o) {
+      var tr = document.createElement('tr');
+      cell(tr, o.target_type); cell(tr, o.target_id + (o.settlement_number ? ' (#' + o.settlement_number + ')' : '')); cell(tr, o.date);
+      cell(tr, fmt(o.due_amount), true); cell(tr, fmt(o.paid_amount), true); cell(tr, fmt(o.remaining_amount), true); cell(tr, fmt(o.draft_claimed), true);
+      cell(tr, o.payment_status); tb.appendChild(tr);
+    });
+    if (!$('payoutCurrency').value) $('payoutCurrency').value = l.currency;
+    syncFx();
+  }
+  function renderActive(list) {
+    var tb = $('active').tBodies[0]; clear(tb);
+    (list || []).forEach(function (p) {
+      var tr = document.createElement('tr');
+      cell(tr, p.seller_payout_id); cell(tr, p.seller_id); cell(tr, p.payout_date); cell(tr, fmt(p.amount) + ' ' + p.currency, true); cell(tr, p.status);
+      cell(tr, p.allocation_status);
+      var td = cell(tr, ''); var b = document.createElement('button'); b.type = 'button'; b.textContent = 'Open';
+      b.onclick = function () { call('payoutModalPayout', [p.seller_payout_id], function (r) { if (r.status === 'SUCCESS') renderPayout(r.payout); else msg(r.error, 'err'); }); };
+      td.appendChild(b); tb.appendChild(tr);
+    });
+  }
+  function renderPayout(p) {
+    S.payout = p; $('payoutPanel').classList.remove('hidden');
+    $('pId').textContent = p.seller_payout_id; $('pStatus').textContent = p.status;
+    $('pInfo').textContent = p.seller_id + ' · ' + fmt(p.amount) + ' ' + p.currency + ' · ' + p.payout_date +
+      (p.payout_currency && p.payout_currency !== p.currency ? ' · paid ' + fmt(p.payout_amount) + ' ' + p.payout_currency + ' @ ' + p.fx_rate : '') +
+      ' · ' + p.payment_method + ' ' + p.reference + ' · allocation ' + p.allocation_status + ' (' + fmt(p.allocated_amount) + ')';
+    var tb = $('pAlloc').tBodies[0]; clear(tb);
+    p.allocations.forEach(function (a) { var tr = document.createElement('tr'); cell(tr, a.target_type + ' ' + a.target_id); cell(tr, fmt(a.allocated_amount), true); tb.appendChild(tr); });
+    var box = $('actions'); clear(box);
+    p.actions.forEach(function (a) {
+      var b = document.createElement('button'); b.type = 'button'; b.textContent = ACTION_LABELS[a] || a;
+      if (a === 'SEND' || a === 'CONFIRM') b.className = 'primary';
+      if (a === 'REVERSE' || a === 'CANCEL') b.className = 'danger';
+      b.onclick = function () { act(a); }; box.appendChild(b);
+    });
+    if (p.actions.length === 0) { var n = document.createElement('span'); n.className = 'muted'; n.textContent = 'No further action for ' + p.status + '.'; box.appendChild(n); }
+  }
+  function act(a) {
+    var p = S.payout; if (!p || S.busy) return;
+    var reason = $('reason').value.trim();
+    if (a === 'REVERSE' && reason === '') { msg('A reason is required to reverse.', 'err'); return; }
+    var q = { SEND: 'Mark ' + p.seller_payout_id + ' SENT? The seller balance is reduced by ' + fmt(p.amount) + ' ' + p.currency + '.',
+      CONFIRM: 'Confirm ' + p.seller_payout_id + '? The balance is not reduced again.', CANCEL: 'Cancel DRAFT ' + p.seller_payout_id + '? No financial effect.',
+      REVERSE: 'Reverse ' + p.seller_payout_id + '? The balance and obligation statuses are restored.', RETRY_ALLOCATION: '' }[a];
+    if (q && !window.confirm(q)) return;
+    var done = function (r) { report(r); if (r.payout) renderPayout(r.payout); refreshSeller(); };
+    if (a === 'RETRY_ALLOCATION') call('payoutModalRetryAllocation', [p.seller_payout_id], done);
+    else call('payoutModalTransition', [p.seller_payout_id, a, p.status, reason], done);
+  }
+  function report(r) {
+    var ok = r.status === 'SUCCESS' || r.status === 'NO_CHANGE';
+    var parts = [r.status + (r.seller_payout_id ? ' · ' + r.seller_payout_id : '')];
+    if (r.error) parts.push(r.error);
+    ['seller_balances', 'ledger', 'health', 'seller_sheet'].forEach(function (k) { if (r[k]) parts.push(k + ': ' + r[k]); });
+    (r.warnings || []).forEach(function (w) { parts.push(w); });
+    msg(parts.join('\n'), ok ? 'ok' : 'err');
+  }
+  function refreshSeller(keepForm) {
+    if (!S.seller) return;
+    call('payoutModalSeller', [S.seller.seller_id], function (r) {
+      if (r.status !== 'SUCCESS') { msg(r.error, 'err'); return; }
+      S.lines = r.lines; S.obligations = r.obligations;
+      var cur = $('currency'); var keep = cur.value; clear(cur);
+      r.lines.forEach(function (l) { var o = document.createElement('option'); o.value = l.currency; o.textContent = l.currency; cur.appendChild(o); });
+      cur.value = r.default_currency || (r.lines.some(function (l) { return l.currency === keep; }) ? keep : (r.lines[0] ? r.lines[0].currency : ''));
+      cur.disabled = r.lines.length <= 1;
+      if (!keepForm) invalidatePreview();
+      renderSummary(); renderActive(r.active_payouts);
+      if (r.ledger_errors && r.ledger_errors.length) msg('Ledger has errors (fix first): ' + r.ledger_errors.join(' | '), 'err');
+    });
+  }
+
+  $('seller').onchange = function () {
+    var id = $('seller').value; S.seller = null; $('payoutCurrency').value = ''; invalidatePreview(); clear($('summary')); clear($('obligations').tBodies[0]);
+    if (!id) return;
+    S.seller = { seller_id: id }; refreshSeller(); msg('Seller ' + id + ' loaded from the Master.', 'info');
+  };
+  $('currency').onchange = function () { $('payoutCurrency').value = $('currency').value; invalidatePreview(); renderSummary(); };
+  ['amount', 'payoutDate', 'payoutCurrency', 'fxRate', 'payoutAmount', 'method', 'reference', 'notes'].forEach(function (id) {
+    $(id).oninput = function () { if (id === 'amount' || id === 'payoutCurrency') syncFx(); invalidatePreview(); };
+  });
+  $('payFull').onclick = function () { var l = line(); if (!l) return; $('amount').value = String(l.available_to_draft); syncFx(); invalidatePreview(); };
+  $('previewBtn').onclick = function () {
+    var e = clientAmountError(); if (e) { msg(e, 'err'); return; }
+    call('payoutModalPreview', [payload()], function (r) {
+      var tb = $('preview').tBodies[0]; clear(tb);
+      if (r.status !== 'READY') { msg('Preview: ' + r.error, 'err'); invalidatePreview(); return; }
+      r.preview.forEach(function (x) {
+        var tr = document.createElement('tr');
+        cell(tr, x.target_type + ' ' + x.target_id + (x.settlement_number ? ' (#' + x.settlement_number + ')' : '')); cell(tr, x.date);
+        cell(tr, fmt(x.remaining_amount), true); cell(tr, fmt(x.allocated_amount), true); cell(tr, fmt(x.remaining_after), true);
+        cell(tr, x.allocated_amount > 0 ? x.status_after : '—'); tb.appendChild(tr);
+      });
+      $('preview').classList.remove('hidden');
+      $('previewNote').textContent = 'Amount ' + fmt(r.amount) + ' ' + r.currency + ' on ' + r.payout_date + ' (server FIFO plan; nothing written).';
+      S.previewOk = true; $('createBtn').disabled = false; msg('Preview ready. Review, then Create Draft.', 'info');
+    });
+  };
+  $('createBtn').onclick = function () {
+    if (S.busy || !S.previewOk) return;
+    var e = clientAmountError(); if (e) { msg(e, 'err'); return; }
+    call('payoutModalCreateDraft', [payload()], function (r) {
+      report(r);
+      if (r.payout) renderPayout(r.payout);
+      if (r.next_token) { S.token = r.next_token; $('amount').value = ''; $('reference').value = ''; $('notes').value = ''; syncFx(); }
+      invalidatePreview(); refreshSeller(true);
+    });
+  };
+
+  call('payoutModalBootstrap', [], function (r) {
+    if (r.status !== 'SUCCESS') { msg(r.error, 'err'); return; }
+    S.token = r.token; S.today = r.today;
+    $('dateNote').textContent = 'Master date ' + r.today + ' (' + r.master_timezone + '). Numbers are read from the Master; every action is re-validated there.';
+    $('payoutDate').value = r.today;
+    var sel = $('seller'); clear(sel);
+    var o0 = document.createElement('option'); o0.value = ''; o0.textContent = '— select —'; sel.appendChild(o0);
+    r.sellers.forEach(function (s) { var o = document.createElement('option'); o.value = s.seller_id; o.textContent = s.seller_id + ' · ' + s.seller_name; sel.appendChild(o); });
+    renderActive(r.active_payouts);
+    msg('Select a seller.', 'info');
+  });
+</script>
+</body>
+</html>

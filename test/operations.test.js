@@ -495,10 +495,12 @@ test('menu: one "Payment Master" menu (Sync / Payouts / Sellers / View); every h
   assert.equal(ui.menu.name, 'Payment Master');
   assert.deepEqual(ui.menu.subs.map((m) => [m.name, m.items.map((i) => i[0])]), [
     ['Sync', ['Run Full Sync', 'Verify Health', 'Sync Seller Sheets']],
-    ['Payouts', ['Refresh Operations', 'Create Draft + FIFO', 'New Payout Request (reset form)', 'Mark Selected SENT', 'Mark Selected CONFIRMED', 'Cancel Selected DRAFT', 'Reverse Selected Payout', 'Verify Seller Payouts']],
+    ['Payouts', ['New Payout', 'Refresh Operations', 'Mark Selected SENT', 'Mark Selected CONFIRMED', 'Cancel Selected DRAFT', 'Reverse Selected Payout', 'Verify Seller Payouts']],
     ['Sellers', ['Create Seller Sheet', 'Sync Seller Sheets', 'Verify Seller Sheets']],
     ['View', ['Operator View', 'Technical View']]]);
-  ui.menu.subs.forEach((m) => m.items.forEach(([, fn]) => assert.equal(typeof sim.ctx[fn], 'function', fn)));
+  const advanced = ui.menu.subs.find((m) => m.name === 'Payouts').subs.find((m) => m.name === 'Advanced');
+  assert.deepEqual(advanced.items.map((i) => i[0]), ['Create Draft from Operations Form', 'New Payout Request (reset form)']);
+  ui.menu.subs.concat([advanced]).forEach((m) => m.items.forEach(([, fn]) => assert.equal(typeof sim.ctx[fn], 'function', fn)));
   const d = draft('CUS001', 100);
   sim.selectPayout(d.seller_payout_id);
   answer = 'NO';
