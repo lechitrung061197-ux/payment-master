@@ -16,12 +16,14 @@
  *   Provider Transactions partition must be current (dependency gate) before write/NO_CHANGE.
  * - No settlement items, seller allocation, balances, payouts or receipt confirmation.
  *
- * IMMUTABILITY BOUNDARY: Settlements are a REBUILDABLE observed provider settlement layer.
- * Every run rebuilds the KH001 partition from the current raw tabs, so a later provider edit
- * to section D or DoiSoat_GD changes the affected settlement. Before Settlement Items are
- * created/frozen (Phase 2E) a commit/lock boundary must be added so a committed settlement
- * cannot silently mutate. Each row's source_fingerprint (settlement-specific, see
- * computeKh001SettlementFingerprint_) is the revision identity for that boundary.
+ * IMMUTABILITY BOUNDARY (Phase 2Q): every run rebuilds the KH001 partition from the current raw tabs, but a FROZEN
+ * settlement is never silently rewritten. A stored settlement is frozen when source_paid_amount > 0, when Settlement
+ * Items exist for it, or when a Seller Payout Allocation targets it. Before the swap, each frozen settlement is
+ * compared with the proposed rebuild (identity / period / payment date, transaction membership and count, gross,
+ * processing fee, net, provider fee, provider hold created, transaction payout, source paid amount); any difference,
+ * or a frozen settlement missing from the rebuild, fails the run before anything is written (the canonical rows stay).
+ * New settlement numbers append normally; non-frozen settlements may still be rebuilt. A later refund / reversal of a
+ * settled payment is an event (Provider Events), never a removal from a frozen settlement.
  *
  * The first part of this file is pure (unit-tested in Node); the I/O part follows.
  */
@@ -100,6 +102,13 @@ function kh001SettlementId_(settlementNumber) {
   const n = String(settlementNumber);
   return KH001_SETTLEMENTS.idPrefix + ('000000' + n).slice(-Math.max(6, n.length));
 }
+
+/** Fields of a frozen settlement that a rebuild may never change (dates compared as Master date keys). */
+const KH001_FROZEN_SETTLEMENT_FIELDS = Object.freeze([
+  'settlement_id', 'source_settlement_number', 'period_start_date', 'period_end_date', 'source_payment_date', 'currency',
+  'transaction_count', 'gross_amount', 'processing_fee_amount', 'net_amount', 'provider_fee_amount', 'provider_hold_created_amount',
+  'transaction_payout_amount', 'source_paid_amount',
+]);
 
 /** Section-D fields of one settlement, in canonical fingerprint order. */
 const KH001_SETTLEMENT_FINGERPRINT_HISTORY_FIELDS = Object.freeze([
@@ -485,8 +494,65 @@ function buildKh001Settlements_(settlementsValues, reconciledValues, ptIndex, op
 
   // Current section-D row of each settlement: diagnostic only (never stored or fingerprinted).
   const sourceRows = history.map(function (s) { return { settlement_number: s.number, source_row: s.row }; });
+  // Transaction membership per settlement (frozen-settlement gate; not stored).
+  const membership = {};
+  history.forEach(function (s) { membership[kh001SettlementId_(s.number)] = s.inputs.map(function (i) { return i.transaction_id; }).sort(); });
   return { rows: rows, errors: errors, warnings: warnings, holdReconciliation: holdReconciliation,
-    includedTransactions: included, sourceRows: sourceRows };
+    includedTransactions: included, sourceRows: sourceRows, membership: membership };
+}
+
+/**
+ * Frozen settlements among the stored KH001 rows: settlement_id -> reasons (provider paid, Settlement Items, seller
+ * payout allocations).
+ */
+function findFrozenSettlements_(storedRows, settlementItems, allocations) {
+  const frozen = {};
+  const add = function (id, reason) {
+    const k = trimmedText_(id);
+    if (k === '') return;
+    frozen[k] = frozen[k] || [];
+    if (frozen[k].indexOf(reason) < 0) frozen[k].push(reason);
+  };
+  (storedRows || []).forEach(function (r) { if (isFiniteNumber_(r.source_paid_amount) && r.source_paid_amount > 0) add(r.settlement_id, 'source_paid_amount > 0'); });
+  (settlementItems || []).forEach(function (i) { add(i.settlement_id, 'Settlement Items'); });
+  (allocations || []).forEach(function (a) { if (trimmedText_(a.target_type) === 'SETTLEMENT') add(a.target_id, 'Seller Payout Allocations'); });
+  return frozen;
+}
+
+/**
+ * Compares frozen stored settlements with the proposed rebuild (pure). Returns violation messages (empty = OK).
+ * @param {Array<Object>} proposedRows built settlement objects (dates as provider date keys)
+ * @param {Array<Object>} storedRows stored KH001 settlement objects (dates as Master date values)
+ * @param {Object<string, Array<string>>} frozen from findFrozenSettlements_
+ * @param {Object<string, Array<string>>} storedMembership settlement_id -> transaction ids known downstream (items / legs)
+ * @param {Object<string, Array<string>>} proposedMembership settlement_id -> transaction ids of the rebuild
+ */
+function checkFrozenSettlements_(proposedRows, storedRows, frozen, storedMembership, proposedMembership, dateKeyOf) {
+  const keyOf = dateKeyOf || masterDateKey_;
+  const norm = function (field, v) {
+    if (isBlankCell_(v)) return '';
+    if (KH001_SETTLEMENTS.dateColumns.indexOf(field) >= 0) return isDateValue_(v) ? keyOf(v) : String(v);
+    if (isFiniteNumber_(v)) return 'N' + Math.round(v * 1e6);
+    return 'S' + String(v);
+  };
+  const proposedById = {};
+  proposedRows.forEach(function (r) { proposedById[String(r.settlement_id)] = r; });
+  const violations = [];
+  storedRows.filter(function (r) { return frozen[trimmedText_(r.settlement_id)]; }).forEach(function (stored) {
+    const id = trimmedText_(stored.settlement_id);
+    const label = 'Frozen settlement ' + id + ' (' + frozen[id].join(', ') + ')';
+    const proposed = proposedById[id];
+    if (!proposed) { violations.push(label + ' is missing from the rebuild'); return; }
+    const changed = KH001_FROZEN_SETTLEMENT_FIELDS.filter(function (f) { return norm(f, stored[f]) !== norm(f, proposed[f]); });
+    if (changed.length > 0) {
+      violations.push(label + ' would change: ' + changed.map(function (f) { return f + ' ' + stored[f] + ' -> ' + proposed[f]; }).join('; '));
+    }
+    const inRebuild = {};
+    (proposedMembership[id] || []).forEach(function (t) { inRebuild[t] = true; });
+    const removed = (storedMembership[id] || []).filter(function (t) { return !inRebuild[t]; });
+    if (removed.length > 0) violations.push(label + ' would lose transaction(s) ' + removed.slice(0, 10).join(', '));
+  });
+  return violations;
 }
 
 function assertNoSettlementErrors_(errors) {
@@ -606,6 +672,42 @@ function masterDateFromKey_(key) {
   return Utilities.parseDate(key, APP.TIMEZONE, 'yyyy-MM-dd');
 }
 
+/**
+ * Frozen-settlement gate inputs (read-only): stored KH001 settlements, frozen ids and the downstream transaction
+ * membership (Settlement Items + Payment Legs).
+ */
+function readFrozenSettlementContext_(ss) {
+  const columns = getColumnNames_(SHEETS.SETTLEMENTS);
+  const sheet = ss.getSheetByName(SHEETS.SETTLEMENTS);
+  if (!sheet) throw new Error('Settlements tab not found.');
+  const stored = tableRowsFromGrid_(readSheetGrid_(sheet).values, columns, SHEETS.SETTLEMENTS)
+    .map(function (r) { return rowToObject_(r, columns); })
+    .filter(function (r) { return r.provider_id === KH001_SETTLEMENTS.providerId; });
+  const items = readSchemaTableObjects_(ss, SHEETS.SETTLEMENT_ITEMS, settlementItemsTab_()).rows;
+  const legs = readSchemaTableObjects_(ss, SHEETS.PAYMENT_LEGS, paymentLegsTab_()).rows;
+  const allocations = readPlainTableObjects_(ss, SHEETS.SELLER_PAYOUT_ALLOCATIONS);
+  const membership = {};
+  items.concat(legs).forEach(function (x) {
+    const id = trimmedText_(x.settlement_id);
+    const tx = trimmedText_(x.external_transaction_id);
+    if (id === '' || tx === '') return;
+    membership[id] = membership[id] || [];
+    if (membership[id].indexOf(tx) < 0) membership[id].push(tx);
+  });
+  return { stored: stored, frozen: findFrozenSettlements_(stored, items, allocations), membership: membership };
+}
+
+/** Throws (before any write) when the rebuild would change a frozen settlement. Returns the frozen ids. */
+function assertFrozenSettlementsUnchanged_(ss, built) {
+  const ctx = readFrozenSettlementContext_(ss);
+  const violations = checkFrozenSettlements_(built.rows, ctx.stored, ctx.frozen, ctx.membership, built.membership, masterDateKey_);
+  if (violations.length > 0) {
+    throw new Error('Frozen settlement guard: the rebuild would change ' + violations.length + ' frozen settlement(s); nothing written: ' +
+      violations.slice(0, KH001_SETTLEMENTS.maxReportedErrors).join(' | '));
+  }
+  return Object.keys(ctx.frozen).sort();
+}
+
 /** Reads every input needed for KH001 settlements, including the PT dependency. Read-only. */
 function readKh001SettlementsInputs_(ss) {
   const read = function (name) {
@@ -682,6 +784,8 @@ function runKh001SettlementsNormalizer_() {
     details.hold_reconciliation = built.holdReconciliation;
     details.settlement_source_rows = built.sourceRows;
     details.warnings = built.warnings;
+    // Frozen-settlement gate: before the swap (a violation leaves the canonical partition untouched).
+    details.frozen_settlements = assertFrozenSettlementsUnchanged_(ss, built);
 
     const result = replaceCanonicalPartition_(ss, {
       table: table,
@@ -734,6 +838,8 @@ function buildKh001SettlementsReport_() {
     pass: false,
     errors: [],
     regression: null,
+    frozen_settlements: [],
+    frozen_violations: [],
   };
   try {
     const ss = getSpreadsheet_();
@@ -759,6 +865,16 @@ function buildKh001SettlementsReport_() {
         columns, SETTLEMENT_SORT_COLUMNS, 'normalized_at');
     } else {
       report.errors.push('Normalizer validation failed with ' + buildErrors.length + ' error(s).');
+    }
+    try {
+      const frozenCtx = readFrozenSettlementContext_(ss);
+      report.frozen_settlements = Object.keys(frozenCtx.frozen).sort().map(function (id) { return { settlement_id: id, reasons: frozenCtx.frozen[id] }; });
+      if (buildErrors.length === 0) {
+        report.frozen_violations = checkFrozenSettlements_(built.rows, frozenCtx.stored, frozenCtx.frozen, frozenCtx.membership, built.membership, masterDateKey_);
+        if (report.frozen_violations.length > 0) report.errors.push('Frozen settlement guard: ' + report.frozen_violations.length + ' violation(s).');
+      }
+    } catch (frozenErr) {
+      report.errors.push('Frozen settlement check failed: ' + (frozenErr && frozenErr.message ? frozenErr.message : String(frozenErr)));
     }
     report.hold_balance_reconciliation = built.holdReconciliation;
     report.provider_adjustments = built.rows.map(function (r) {

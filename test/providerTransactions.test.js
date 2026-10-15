@@ -16,7 +16,7 @@ const Utilities = {
   computeDigest: (_alg, text) => [...crypto.createHash('sha256').update(text, 'utf8').digest()].map((b) => (b > 127 ? b - 256 : b)),
 };
 const context = vm.createContext({ Utilities });
-for (const f of ['Config', 'Utils', 'RawSnapshot', 'CanonicalTable', 'Kh001ProviderTransactions']) {
+for (const f of ['Config', 'Utils', 'RawSnapshot', 'CanonicalTable', 'Kh001ProviderTransactions', 'Kh001ProviderEvents']) {
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'src', f + '.gs'), 'utf8'), context, { filename: f + '.gs' });
 }
 const H = context;
@@ -55,7 +55,7 @@ function baseInputs() {
   const paypal = [
     PP_HEADER,
     ppRow({}),
-    ppRow({ 'Transaction ID': '80B6789902665252D', Status: 'Pending', Gross: 78.73, Fee: 0, Net: 78.73,
+    ppRow({ 'Transaction ID': '80B6789902665252D', Status: 'Pending', 'Balance Impact': 'Memo', Gross: 78.73, Fee: 0, Net: 78.73,
       'Thời gian': D('2026-10-03T01:00:00Z') }),
     ppRow({ 'Transaction ID': 'TXR', Type: 'Payment Refund', 'Nhóm GD': 'Hoàn tiền', Gross: -10, Fee: 0.3, Net: -9.7 }),
     ppRow({ 'Transaction ID': 'TXS', Type: 'Payment Received', 'Nhóm GD': 'Khác' }),

@@ -312,10 +312,15 @@ interpretation is left to the future KH001 normalizer (`source.KH001.timezone`).
 Entry points: `normalizeKh001ProviderTransactions()` and read-only
 `verifyKh001ProviderTransactions()`. Reads only Master raw tabs, never the external sheet.
 
-- **Primary source:** `Raw KH001 PayPal`. One row per row whose `Nhóm GD` is exactly
-  `Thanh toán` (NFC-normalized). Status is not filtered (Pending included); `Type` is kept
-  as `raw_type`. Headers are looked up by name (row 1); missing/duplicate required
-  headers fail.
+- **Primary source:** `Raw KH001 PayPal`. A Provider Transaction is a **payment entity**, not a raw row
+  (Phase 2Q): one row per `Thanh toán` row classified PAYMENT — `Express Checkout Payment` or
+  `Direct Credit Card Payment`, `Completed/Credit` or `Pending/Memo`. A later `Reversed/Memo` row with the
+  same Transaction ID is a `PAYMENT_REVERSAL` event of that payment (Provider Events), never a second payment,
+  and never replaces the payment's economics. Any other `Thanh toán` combination fails (fail closed). `Type` is
+  kept as `raw_type`. Headers are looked up by name (row 1); missing/duplicate required headers fail.
+- **Typed source only:** Gross / Fee / Net must be numbers and `Thời gian` a date in the raw tab; text such as
+  `"56.98"` or a text date is never coerced (no `Number()` on strings) and keeps failing until the source is
+  imported correctly.
 - **Enrichment only:** `Raw KH001 Reconciled` (header row 6). Exact `Transaction ID` join.
   `Khớp` → `RECONCILED`, `Lệch số tiền` → `AMOUNT_MISMATCH`, no row → `PROVIDER_ONLY`;
   any other status on a joined row fails (`Unmapped KH001 reconciliation status`).
@@ -345,9 +350,18 @@ Source: `Raw KH001 PayPal` only (Provider Transactions is read for referential i
 
 | Nhóm GD | event_type | Verified Type | Status / Balance Impact | Link |
 | --- | --- | --- | --- | --- |
-| Thanh toán | PAYMENT | Express Checkout Payment | Completed/Credit, Pending/Memo | own Transaction ID |
-| Reserve PP | RESERVE_HOLD | Reserve Hold | Completed/Debit | Reference Txn ID (required) |
-| Rút tiền | WITHDRAWAL | General Withdrawal | Completed/Debit | none |
+| Thanh toán | PAYMENT | Express Checkout Payment, Direct Credit Card Payment | Completed/Credit, Pending/Memo | own Transaction ID |
+| Thanh toán | PAYMENT_REVERSAL | Express Checkout Payment, Direct Credit Card Payment | Reversed/Memo | own Transaction ID = the payment (a PAYMENT row with it must exist) |
+| Reserve PP | RESERVE_HOLD | Reserve Hold | Completed/Debit | Reference Txn ID = Txn gốc = payment |
+| Reserve PP | RESERVE_RELEASE | Reserve Release | Completed/Credit | Txn gốc = payment; Reference = payment or another event of it (e.g. the hold) |
+| Hoàn tiền | REFUND | Payment Refund | Completed/Debit | same as RESERVE_RELEASE |
+| Tạm giữ dispute | DISPUTE_HOLD | General Hold | Completed/Debit | same as RESERVE_RELEASE |
+| Rút tiền | WITHDRAWAL | General Withdrawal, User Initiated Withdrawal | Completed/Debit | none |
+| Rút tiền | WITHDRAWAL_REVERSAL | Reversal of ACH Withdrawal Transaction | Denied/Memo | Reference Txn ID = exactly one WITHDRAWAL |
+
+- Phase 2Q: payment-linked events (`RESERVE_HOLD`, `RESERVE_RELEASE`, `REFUND`, `DISPUTE_HOLD`, `PAYMENT_REVERSAL`)
+  carry the original payment in `related_external_transaction_id` / `provider_transaction_id`. They are captured
+  only: no seller-side financial effect (Seller Balances, payouts and settlements are not changed by them).
 
 - Any other non-blank `Nhóm GD`, Type or Status/Balance Impact combination fails; a row with
   a Transaction ID but blank `Nhóm GD` also fails. No silent `OTHER`.
@@ -362,10 +376,13 @@ Source: `Raw KH001 PayPal` only (Provider Transactions is read for referential i
   non-normal swap state on it fails the run.
 - **RESERVE_HOLD is the actual PayPal reserve, not the KH001 contractual hold.** No
   percentage is derived; settlements and withdrawal allocation are out of scope.
-- IDs `PE-KH001-PAYPAL-<Transaction ID>`; unique `provider_id + payment_source +
-  external_event_id`; `source_fingerprint = SHA-256(paypal_raw_checksum | KH001_PROVIDER_EVENTS_V1)`.
+- IDs `PE-KH001-PAYPAL-<Transaction ID>` (legacy ids unchanged); a payment reversal, which reuses the payment's
+  Transaction ID, is `PE-KH001-PAYPAL-<Transaction ID>-REVERSAL`. A Transaction ID may appear twice only as
+  PAYMENT + PAYMENT_REVERSAL; any other reuse fails. Unique `provider_id + payment_source + provider_event_id`;
+  `source_fingerprint = SHA-256(paypal_raw_checksum | KH001_PROVIDER_EVENTS_V1)` (unchanged: previously accepted
+  rows normalize byte-identically, so no churn).
 - Written with the same provider-partition replace and crash-safe swap as Provider
-  Transactions (sorted by `provider_id, payment_source, event_at, external_event_id`).
+  Transactions (sorted by `provider_id, payment_source, event_at, external_event_id, provider_event_id`).
 - Verify: generic checks decide `pass`; the October 2026 `regression` section is report only.
 
 ## Settlements (KH001 settlement headers)
@@ -415,11 +432,16 @@ Order: `syncKh001Raw` → `normalizeKh001ProviderTransactions` → `normalizeKh0
   raw checksums are recorded only in the operation-level audit.
 - The section-D sheet row is not stored (row position is not a stable identity); the
   verifier/audit report the current row as diagnostic `settlement_source_rows` only.
-- **Immutability boundary:** Settlements is still a *rebuildable observed* provider
-  settlement layer — a later provider edit changes the affected settlement on the next run.
-  Before Settlement Items are created/frozen (Phase 2E), a commit/lock boundary must prevent
-  a committed settlement from silently mutating; the settlement-specific fingerprint is the
-  revision identity for that boundary.
+- **Frozen settlements (Phase 2Q):** a stored settlement is FROZEN when `source_paid_amount > 0`, Settlement
+  Items exist for it, or a Seller Payout Allocation targets it. Before the swap, every frozen settlement is
+  compared with the rebuild: settlement id / number, period dates, payment date, currency, transaction count,
+  gross, processing fee, net, provider fee, provider hold created, transaction payout, source paid amount, and
+  transaction membership (every transaction known downstream in Settlement Items / Payment Legs must still be
+  in it). Any difference, or a frozen settlement missing from the rebuild, fails `SETTLEMENT_REFRESH`
+  ("Frozen settlement guard …; nothing written") and the canonical partition stays as it was. New settlement
+  numbers append; non-frozen settlements may still be rebuilt. A later refund / reversal of a settled payment
+  is a Provider Event, never a removal from a frozen settlement. `verifyKh001Settlements()` reports
+  `frozen_settlements` (with reasons) and `frozen_violations`.
 - The KH001 Provider Transactions partition must be current before any write or NO_CHANGE.
   Written with the shared provider-partition replace and crash-safe swap.
 
@@ -825,8 +847,11 @@ it (balances, amounts, statuses and seller ownership always come from the canoni
 operation the truth lives in Seller Payouts + Seller Payout Allocations; the tab is re-rendered from them.
 
 **Layout** (`setupMaster` writes labels / help / input formats only; operator input in column B is never
-overwritten): rows 5–16 **System status** (Master schema version, latest pipeline run + status and latest
-health check from the Audit Log, providers (enabled + raw sync), total seller available / hold (Seller Balances),
+overwritten): rows 5–17 **System status** (Master schema version; **Latest pipeline**, **Accounting state**,
+**Health**, **Publishing** — Phase 2Q: when the latest run failed before its health gate they read FAILED /
+LAST_KNOWN_GOOD / STALE (`last PASS <time>`) / BLOCKED, a PASS is shown as current only for the current
+pipeline state, failed at the health gate → CHECK_FAILED / FAIL / BLOCKED; providers (enabled + raw sync), total
+seller available / hold (Seller Balances),
 effective payouts (SENT / CONFIRMED), DRAFT payouts, open payout obligations, ACTIVE seller destinations);
 rows 18–30 **New payout form** (Seller dropdown of ACTIVE sellers, Currency, Payout Date `dd/MM/yyyy` (a text
 cell, parsed strictly — never re-read by the en_US locale), Amount, Payout Currency, FX Rate, Payout Amount,

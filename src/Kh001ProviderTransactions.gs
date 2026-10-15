@@ -2,8 +2,13 @@
  * Kh001ProviderTransactions.gs
  * KH001 normalizer: Master raw tabs -> canonical Provider Transactions (KH001 partition).
  *
- * - Primary source: "Raw KH001 PayPal" (RAW_PP). One canonical row per row whose
- *   "Nhóm GD" is exactly "Thanh toán". Status is NOT filtered (Pending is included).
+ * - Primary source: "Raw KH001 PayPal" (RAW_PP). A Provider Transaction is a PAYMENT entity, not a raw row: one
+ *   canonical row per "Thanh toán" row classified PAYMENT (Express Checkout / Direct Credit Card Payment,
+ *   Completed+Credit or Pending+Memo; classifyKh001PaypalRow_). A later Reversed+Memo row with the same Transaction ID
+ *   is a PAYMENT_REVERSAL event of that payment (Provider Events), never a second payment, and never changes the
+ *   payment's economics. Any other "Thanh toán" combination fails (fail closed).
+ * - Amounts and dates must already be numbers / dates in the raw tab: no text is coerced (Number("56.98") is never
+ *   applied); a wrongly typed source keeps failing until it is imported correctly.
  * - "Raw KH001 Reconciled" (DoiSoat_GD) only enriches rows (exact Transaction ID join).
  *   Reconciled rows without a RAW_PP payment (e.g. "Thiếu trên PayPal") create nothing.
  * - Reads only Master raw tabs; never opens the external KH001 spreadsheet.
@@ -159,9 +164,12 @@ function buildKh001ProviderTransactions_(paypalValues, reconciledValues, sourceF
     const row = paypalValues[r];
     const sheetRow = r + 1;
     if (normalizeLabel_(row[col(pp, 'Nhóm GD')]) !== paymentGroup) continue;
+    const id = canonicalText_(row[col(pp, 'Transaction ID')]);
+    const classified = classifyKh001PaypalRow_(row[col(pp, 'Nhóm GD')], row[col(pp, 'Type')], row[col(pp, 'Status')], row[col(pp, 'Balance Impact')]);
+    if (classified.error) { errors.push('Raw KH001 PayPal row ' + sheetRow + (id ? ' (' + id + ')' : '') + ': ' + classified.error); continue; }
+    if (classified.rule.eventType !== 'PAYMENT') continue; // PAYMENT_REVERSAL: an event of the existing payment
     paymentRows++;
 
-    const id = canonicalText_(row[col(pp, 'Transaction ID')]);
     if (id === '') { errors.push('Raw KH001 PayPal row ' + sheetRow + ': blank Transaction ID'); continue; }
     if (seen[id]) {
       errors.push('Duplicate payment Transaction ID ' + id + ' (rows ' + seen[id] + ', ' + sheetRow + ')');

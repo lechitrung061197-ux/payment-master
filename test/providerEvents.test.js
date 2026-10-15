@@ -73,7 +73,7 @@ test('Thanh toán -> PAYMENT, Reserve PP -> RESERVE_HOLD, Rút tiền -> WITHDRA
 });
 
 test('unknown non-blank Nhóm GD is rejected (no silent OTHER)', () => {
-  for (const g of ['Hoàn tiền', 'Dispute', 'Khác']) {
+  for (const g of ['Refund', 'Dispute', 'Khác']) {
     const b = build(set(inputs(), 1, 'Nhóm GD', g));
     assert.match(errorsOf(b), new RegExp('unmapped Nhóm GD "' + g + '"'));
     assert.throws(() => H.assertNoEventErrors_(b.errors), /KH001 provider events normalization failed/);
@@ -87,13 +87,13 @@ test('a Transaction ID with blank Nhóm GD is rejected rather than dropped', () 
 });
 
 test('unverified raw Type is rejected', () => {
-  assert.match(errorsOf(build(set(inputs(), 1, 'Type', 'Website Payment'))), /unverified Type "Website Payment" for PAYMENT/);
-  assert.match(errorsOf(build(set(inputs(), 4, 'Type', 'User Initiated Withdrawal'))), /unverified Type .* for WITHDRAWAL/);
+  assert.match(errorsOf(build(set(inputs(), 1, 'Type', 'Website Payment'))), /unverified Type "Website Payment" for Nhóm GD "Thanh toán"/);
+  assert.match(errorsOf(build(set(inputs(), 4, 'Type', 'Wire Withdrawal'))), /unverified Type "Wire Withdrawal" for Nhóm GD "Rút tiền"/);
 });
 
 test('unverified Status / Balance Impact combination is rejected', () => {
-  assert.match(errorsOf(build(set(inputs(), 1, 'Balance Impact', 'Memo'))), /unverified Status\/Balance Impact "Completed\/Memo" for PAYMENT/);
-  assert.match(errorsOf(build(set(inputs(), 3, 'Status', 'Pending'))), /"Pending\/Debit" for RESERVE_HOLD/);
+  assert.match(errorsOf(build(set(inputs(), 1, 'Balance Impact', 'Memo'))), /unverified Status\/Balance Impact "Completed\/Memo" for Thanh toán \/ Express Checkout Payment/);
+  assert.match(errorsOf(build(set(inputs(), 3, 'Status', 'Pending'))), /"Pending\/Debit" for Reserve PP \/ Reserve Hold/);
 });
 
 // ---- Money ----------------------------------------------------------------------
@@ -139,7 +139,7 @@ test('unverified Balance Impact sign is rejected (Debit with positive net)', () 
 test('duplicate external event ID is rejected', () => {
   const g = inputs();
   g[5] = row({});
-  assert.match(errorsOf(build(g)), /Duplicate event Transaction ID PAY1 \(rows 2, 6\)/);
+  assert.match(errorsOf(build(g)), /Duplicate event Transaction ID PAY1 \(rows 2, 6; PAYMENT \+ PAYMENT\)/);
 });
 
 test('PAYMENT provider_event_id and provider_transaction_id are deterministic', () => {
@@ -242,7 +242,7 @@ test('checkProviderEventRows_ finds invariant, balance-effect, relationship and 
   assert.deepEqual(e.amount_invariant, ['PAY1']);
   assert.deepEqual(e.balance_impact, ['PAY1', '80B6789902665252D']);
   assert.equal(e.relationship.length, 1);
-  assert.deepEqual(e.duplicate, ['03652371D0702611V']);
+  assert.deepEqual(e.duplicate, ['PE-KH001-PAYPAL-03652371D0702611V', '03652371D0702611V (RESERVE_HOLD + RESERVE_HOLD)']);
 });
 
 test('summary: counts, per-type totals (signed), balance effect vs net', () => {

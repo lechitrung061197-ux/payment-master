@@ -82,7 +82,8 @@ const ENUMS = Object.freeze({
   PROVIDER_RECONCILIATION_STATUS: ['RECONCILED', 'AMOUNT_MISMATCH', 'PROVIDER_ONLY'],
   // Canonical provider ledger event types. Only values verified against real data are
   // listed; new types are added together with a verified normalizer mapping.
-  PROVIDER_EVENT_TYPE: ['PAYMENT', 'RESERVE_HOLD', 'WITHDRAWAL'],
+  PROVIDER_EVENT_TYPE: ['PAYMENT', 'PAYMENT_REVERSAL', 'REFUND', 'RESERVE_HOLD', 'RESERVE_RELEASE', 'DISPUTE_HOLD', 'WITHDRAWAL',
+    'WITHDRAWAL_REVERSAL'],
   SELLER_STATUS: ['ACTIVE', 'INACTIVE'],
   // Seller child spreadsheet destination (output only). Only ACTIVE destinations are synced.
   SELLER_DESTINATION_STATUS: ['ACTIVE', 'INACTIVE'],
@@ -650,8 +651,9 @@ const SCHEMA = Object.freeze([
     sheet: SHEETS.PROVIDER_EVENTS,
     description: 'Canonical provider ledger events, all providers, with signed provider amounts ' +
       '(gross_amount + fee_amount = net_amount). balance_effect_amount is the actual provider ' +
-      'balance movement (0 for Memo). Unique key: provider_id + payment_source + external_event_id. ' +
-      'RESERVE_HOLD is the provider reserve, not a contractual hold.',
+      'balance movement (0 for Memo). Unique key: provider_id + payment_source + provider_event_id (a payment and its ' +
+      'PAYMENT_REVERSAL share external_event_id). RESERVE_HOLD is the provider reserve, not a contractual hold. ' +
+      'Refund / reversal / reserve release / dispute hold events have no seller-side effect.',
     columns: [
       col_('provider_event_id', T.ID),
       col_('provider_id', T.ID),

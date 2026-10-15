@@ -32,7 +32,9 @@ const OPERATIONS = Object.freeze({
   refreshedRow: 3,
   statusHeaderRow: 5,
   statusStartRow: 6,
-  statusLabels: Object.freeze(['Master schema version', 'Latest pipeline run', 'Latest pipeline status', 'Latest health check',
+  // Rows 6-17 (row 18 = form header). Latest pipeline / Accounting state / Health / Publishing follow
+  // operationsPipelineState_: a health PASS is shown as current only when it belongs to the current pipeline state.
+  statusLabels: Object.freeze(['Master schema version', 'Latest pipeline', 'Accounting state', 'Health', 'Publishing',
     'Providers', 'Total seller available', 'Total seller hold', 'Effective seller payouts (SENT / CONFIRMED)', 'DRAFT payouts',
     'Open payout obligations', 'Active seller destinations']),
   formHeaderRow: 18,
@@ -359,6 +361,48 @@ function operationsMoney_(byCurrency) {
 }
 
 /**
+ * Pipeline / accounting / health / publishing semantics from the audit trail (pure).
+ *   latest pipeline SUCCESS + latest health PASS     -> CURRENT / PASS / OK
+ *   latest pipeline SUCCESS + a later health FAIL     -> CHECK_FAILED / FAIL / BLOCKED
+ *   FAILED at HEALTH_CHECK                            -> CHECK_FAILED / FAIL / BLOCKED
+ *   FAILED at SELLER_SHEETS_SYNC                      -> CURRENT / (health of the run) / FAILED
+ *   FAILED at any earlier stage                       -> LAST_KNOWN_GOOD / STALE (last PASS <ts>) / BLOCKED
+ * An older PASS is never shown as current; the audit history itself is untouched.
+ * @param {{pipeline: ?Object, skipped: ?Object, health: ?Object, last_pass: ?Object}} audit
+ * @return {{pipeline: Array, accounting: Array, health: Array, publishing: Array}} [value, detail] pairs
+ */
+function operationsPipelineState_(audit, fmt) {
+  const f = fmt || function (v) { return String(v || ''); };
+  const p = audit.pipeline;
+  const h = audit.health;
+  const lastPassText = audit.last_pass ? 'last PASS ' + f(audit.last_pass.at) : 'no PASS on record';
+  if (!p) {
+    return { pipeline: ['never', ''], accounting: ['UNKNOWN', 'no pipeline run on record'],
+      health: [h ? h.status : 'never', h ? 'checked ' + f(h.at) : ''], publishing: ['UNKNOWN', ''] };
+  }
+  const pipeline = [p.status, f(p.at) + ' · ' + p.run_id + (p.stage ? ' · failed at ' + p.stage : '') + (p.error ? ' · ' + p.error : '') +
+    (audit.skipped ? ' · a later run was skipped (lock held) ' + f(audit.skipped.at) : '')];
+  if (p.status === 'SUCCESS') {
+    if (h && h.status === 'FAIL') {
+      return { pipeline: pipeline, accounting: ['CHECK_FAILED', 'a health check after the last pipeline run failed'],
+        health: ['FAIL', 'checked ' + f(h.at) + ' · ' + lastPassText], publishing: ['BLOCKED', 'seller sheets are published only when health passes'] };
+    }
+    return { pipeline: pipeline, accounting: ['CURRENT', 'pipeline ' + f(p.at)], health: ['PASS', 'checked ' + f(h ? h.at : p.at)],
+      publishing: ['OK', 'seller sheets synced by the last run'] };
+  }
+  if (p.stage === 'HEALTH_CHECK') {
+    return { pipeline: pipeline, accounting: ['CHECK_FAILED', 'the last run failed its health gate'],
+      health: ['FAIL', 'checked ' + f(h ? h.at : p.at) + ' · ' + lastPassText], publishing: ['BLOCKED', 'seller sheets not published'] };
+  }
+  if (p.stage === 'SELLER_SHEETS_SYNC') {
+    return { pipeline: pipeline, accounting: ['CURRENT', 'pipeline ' + f(p.at)], health: [h ? h.status : 'PASS', 'checked ' + f(h ? h.at : p.at)],
+      publishing: ['FAILED', 'seller sheet sync failed; see the run audit'] };
+  }
+  return { pipeline: pipeline, accounting: ['LAST_KNOWN_GOOD', 'the last run stopped before its health gate; canonical tables are unchanged since the last good run'],
+    health: ['STALE', lastPassText], publishing: ['BLOCKED', 'no seller sheet is published until a run passes'] };
+}
+
+/**
  * Pure render model of the Operations tab from canonical data.
  * @param {{schemaVersion, pipeline, health, providers, sellers, balances, payouts, allocations, states, activeDestinations, dateKeyOf?}} input
  * @return {{status: Array<Array>, payable: Array<Array>, payouts: Array<Array>, lines: Object}}
@@ -386,17 +430,17 @@ function buildOperationsView_(input) {
   const draftCount = keys.reduce(function (a, k) { return a + lines[k].draft_count; }, 0);
   const openCount = keys.reduce(function (a, k) { return a + lines[k].open_count; }, 0);
   const openRemaining = operationsMoney_(sum('open_remaining', function (l) { return l.open_remaining > 0; }));
-  const pipeline = input.pipeline || {};
-  const health = input.health || {};
+  const state = operationsPipelineState_(input.audit || { pipeline: null, skipped: null, health: null, last_pass: null }, input.formatAt);
   const providers = (input.providers || []).map(function (p) {
     return p.providerId + ': ' + (p.enabled ? 'ENABLED · ' + (p.problems.length === 0 ? 'raw sync OK' : p.problems.slice(0, 2).join('; ')) : 'DISABLED');
   });
   const destinations = input.activeDestinations || [];
   const status = [
     [input.schemaVersion === null || input.schemaVersion === undefined ? '' : input.schemaVersion, 'expected ' + APP.SCHEMA_VERSION],
-    [pipeline.at || 'never', pipeline.run_id || ''],
-    [pipeline.status || '', pipeline.error || ''],
-    [health.status || 'never', health.at || ''],
+    state.pipeline,
+    state.accounting,
+    state.health,
+    state.publishing,
     [providers.join(' | ') || 'none', ''],
     [available.value, available.detail],
     [hold.value, hold.detail],
@@ -518,6 +562,12 @@ function ensureOperationsLayout_(ss) {
   return sheet;
 }
 
+/** Audit timestamp as text in the Master timezone (dd/MM/yyyy HH:mm). */
+function operationsTimestamp_(v) {
+  if (isDateValue_(v) && isFinite(v.getTime())) return Utilities.formatDate(v, APP.TIMEZONE, 'dd/MM/yyyy HH:mm');
+  return String(v === null || v === undefined ? '' : v);
+}
+
 /** Reads the form (column B) and the request token. */
 function readOperationsForm_(sheet) {
   const O = OPERATIONS;
@@ -530,23 +580,26 @@ function readOperationsForm_(sheet) {
 
 /** Latest pipeline run and health check from the tail of the Audit Log (read-only). */
 function readOperationsAuditStatus_(ss) {
-  const out = { pipeline: null, health: null };
+  const out = { pipeline: null, skipped: null, health: null, last_pass: null };
   const sheet = ss.getSheetByName(SHEETS.AUDIT_LOG);
   if (!sheet) return out;
   const last = sheet.getLastRow();
   if (last < 2) return out;
   const n = Math.min(last - 1, OPERATIONS.auditScanRows);
   const rows = sheet.getRange(last - n + 1, 1, n, 8).getValues();
-  for (let i = rows.length - 1; i >= 0 && (!out.pipeline || !out.health); i--) {
+  for (let i = rows.length - 1; i >= 0 && (!out.pipeline || !out.health || !out.last_pass); i--) {
     const action = String(rows[i][1]);
-    if (!out.pipeline && ['PIPELINE_SUCCESS', 'PIPELINE_FAILED', 'PIPELINE_SKIPPED_LOCKED'].indexOf(action) >= 0) {
-      let error = '';
-      try { error = String((JSON.parse(String(rows[i][7] || '{}')) || {}).error || ''); } catch (e) { error = ''; }
-      out.pipeline = { at: rows[i][0], status: String(rows[i][5]), run_id: String(rows[i][3]), error: error.slice(0, 200) };
+    if (!out.pipeline && action === 'PIPELINE_SKIPPED_LOCKED' && !out.skipped) out.skipped = { at: rows[i][0] };
+    if (!out.pipeline && (action === 'PIPELINE_SUCCESS' || action === 'PIPELINE_FAILED')) {
+      let d = {};
+      try { d = JSON.parse(String(rows[i][7] || '{}')) || {}; } catch (e) { d = {}; }
+      out.pipeline = { at: rows[i][0], status: String(rows[i][5]), run_id: String(rows[i][3]), stage: d.stage ? String(d.stage) : '',
+        error: String(d.error || '').slice(0, 200) };
     }
     if (!out.health && (action === 'HEALTH_CHECK_PASS' || action === 'HEALTH_CHECK_FAIL')) {
       out.health = { at: rows[i][0], status: action === 'HEALTH_CHECK_PASS' ? 'PASS' : 'FAIL' };
     }
+    if (!out.last_pass && action === 'HEALTH_CHECK_PASS') out.last_pass = { at: rows[i][0] };
   }
   return out;
 }
@@ -560,7 +613,7 @@ function renderOperations_(ss, lastResult) {
     try { return f(); } catch (err) { problems.push(label + ': ' + (err && err.message ? err.message : String(err))); return fallback; }
   };
   const settings = attempt('Settings', function () { return readSettingsMap_(); }, {});
-  const audit = attempt('Audit Log', function () { return readOperationsAuditStatus_(ss); }, { pipeline: null, health: null });
+  const audit = attempt('Audit Log', function () { return readOperationsAuditStatus_(ss); }, { pipeline: null, skipped: null, health: null, last_pass: null });
   const sources = pipelineRawSources_();
   const providers = attempt('Providers', function () {
     const raw = readRawSyncHealth_(ss);
@@ -577,17 +630,17 @@ function renderOperations_(ss, lastResult) {
     return readSellerDestinations_(ss).parsed.active.map(function (d) { return d.seller_id; });
   }, []);
   if (ledger && flattenAllocationErrors_(ledger.validation.errors).length > 0) problems.push('Seller Payout Allocations has validation errors (see Verify Seller Payouts).');
-  const view = buildOperationsView_({ schemaVersion: settings.schema_version, pipeline: audit.pipeline, health: audit.health, providers: providers,
+  const view = buildOperationsView_({ schemaVersion: settings.schema_version, audit: audit, formatAt: operationsTimestamp_, providers: providers,
     sellers: sellers, balances: balances, payouts: ledger ? ledger.payouts : [], allocations: ledger ? ledger.allocations : [],
     states: ledger ? ledger.validation.states : [], activeDestinations: destinations });
 
   const now = new Date();
   sheet.getRange(O.refreshedRow, 2, 1, 2).setValues([[now, problems.length ? 'WARNING: ' + problems.join(' | ').slice(0, 900) : 'ok']]);
   sheet.getRange(O.refreshedRow, 2).setNumberFormat(FORMATS.DATETIME);
+  sheet.getRange(O.statusStartRow, 1, O.statusLabels.length, 1).setValues(O.statusLabels.map(function (l) { return [l]; })); // labels follow the semantics
+  sheet.getRange(O.statusStartRow + 1, 2, 5, 2).setNumberFormat('@'); // pipeline / accounting / health / publishing / providers: text
   sheet.getRange(O.statusStartRow, 2, view.status.length, 2).setValues(view.status);
-  sheet.getRange(O.statusStartRow + 1, 2).setNumberFormat(FORMATS.DATETIME); // latest pipeline run (value)
-  sheet.getRange(O.statusStartRow + 3, 3).setNumberFormat(FORMATS.DATETIME); // latest health check (detail)
-  [5, 6, 7, 8].forEach(function (i) { sheet.getRange(O.statusStartRow + i, 2).setNumberFormat(FORMATS.AMOUNT4); });
+  [6, 7, 8, 9].forEach(function (i) { sheet.getRange(O.statusStartRow + i, 2).setNumberFormat(FORMATS.AMOUNT4); });
 
   // Form helpers (inputs are never overwritten, only blank defaults and dropdown lists).
   const fieldRow = function (key) { return O.formStartRow + O.formFields.map(function (f) { return f[0]; }).indexOf(key); };

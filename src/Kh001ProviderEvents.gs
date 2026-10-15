@@ -2,9 +2,22 @@
  * Kh001ProviderEvents.gs
  * KH001 normalizer: "Raw KH001 PayPal" -> canonical Provider Events (KH001 partition).
  *
- * - One event per raw row with a non-blank "Nhóm GD". Only verified groups are mapped
- *   (Thanh toán -> PAYMENT, Reserve PP -> RESERVE_HOLD, Rút tiền -> WITHDRAWAL); any other
- *   group, raw Type, Status/Balance Impact combination fails normalization.
+ * - One event per raw row with a non-blank "Nhóm GD". Only verified (group, Type, Status, Balance Impact)
+ *   combinations are mapped (KH001_PROVIDER_EVENTS.rules); anything else fails normalization (fail closed):
+ *     Thanh toán / Express Checkout | Direct Credit Card Payment / Completed+Credit, Pending+Memo -> PAYMENT
+ *     Thanh toán / Express Checkout | Direct Credit Card Payment / Reversed+Memo -> PAYMENT_REVERSAL
+ *     Reserve PP / Reserve Hold / Completed+Debit -> RESERVE_HOLD; Reserve Release / Completed+Credit -> RESERVE_RELEASE
+ *     Hoàn tiền / Payment Refund / Completed+Debit -> REFUND
+ *     Tạm giữ dispute / General Hold / Completed+Debit -> DISPUTE_HOLD
+ *     Rút tiền / General Withdrawal | User Initiated Withdrawal / Completed+Debit -> WITHDRAWAL
+ *     Rút tiền / Reversal of ACH Withdrawal Transaction / Denied+Memo -> WITHDRAWAL_REVERSAL
+ * - A PAYMENT_REVERSAL reuses the payment's Transaction ID: it is an event of the existing payment (its own id
+ *   PE-...-<txn>-REVERSAL), never a second payment; the payment's economics are not touched. Every other event keeps
+ *   PE-KH001-PAYPAL-<Transaction ID> (legacy ids unchanged). Any other reuse of a Transaction ID fails.
+ * - REFUND / RESERVE_RELEASE / DISPUTE_HOLD link to the original payment: Txn gốc = the payment's Transaction ID
+ *   (an existing Provider Transaction); Reference Txn ID = that payment or another event of it (e.g. the reserve
+ *   hold). RESERVE_HOLD keeps its rule (Txn gốc = Reference Txn ID = payment). WITHDRAWAL_REVERSAL links to its
+ *   WITHDRAWAL event (Reference Txn ID). Events never create a seller-side financial effect.
  * - PayPal signed amounts are kept as-is (Fee stays negative): gross + fee = net.
  * - balance_effect_amount follows Balance Impact: Credit/Debit = net, Memo = 0.
  * - PAYMENT / RESERVE_HOLD must link to an existing Provider Transaction; WITHDRAWAL has no link.
@@ -31,19 +44,36 @@ const KH001_PROVIDER_EVENTS = Object.freeze({
   amountTolerance: 0.005,
   maxReportedErrors: 20,
   /**
-   * Verified mappings only. relation:
-   *   SELF      provider_transaction_id = own Transaction ID;      Txn gốc == Transaction ID
-   *   REFERENCE provider_transaction_id = Reference Txn ID;       Txn gốc == Reference Txn ID
-   *   NONE      no provider transaction;                          Txn gốc == Transaction ID
+   * Verified mappings only (group + Type + Status/Balance Impact). relation:
+   *   SELF        provider_transaction_id = own Transaction ID;   Txn gốc == Transaction ID
+   *   REVERSAL    same as SELF, and a PAYMENT row with the same Transaction ID must exist
+   *   REFERENCE   provider_transaction_id = Reference Txn ID;     Txn gốc == Reference Txn ID
+   *   ROOT        provider_transaction_id = Txn gốc (original payment); Reference Txn ID = Txn gốc or another
+   *               event row of that payment
+   *   WITHDRAWAL  no provider transaction; Reference Txn ID = a WITHDRAWAL event in the same raw
+   *   NONE        no provider transaction;                        Txn gốc == Transaction ID
    */
   rules: [
-    { group: 'Thanh toán', eventType: 'PAYMENT', rawTypes: ['Express Checkout Payment'],
+    { group: 'Thanh toán', eventType: 'PAYMENT', rawTypes: ['Express Checkout Payment', 'Direct Credit Card Payment'],
       statusImpacts: [['Completed', 'Credit'], ['Pending', 'Memo']], relation: 'SELF' },
+    { group: 'Thanh toán', eventType: 'PAYMENT_REVERSAL', rawTypes: ['Express Checkout Payment', 'Direct Credit Card Payment'],
+      statusImpacts: [['Reversed', 'Memo']], relation: 'REVERSAL' },
     { group: 'Reserve PP', eventType: 'RESERVE_HOLD', rawTypes: ['Reserve Hold'],
       statusImpacts: [['Completed', 'Debit']], relation: 'REFERENCE' },
-    { group: 'Rút tiền', eventType: 'WITHDRAWAL', rawTypes: ['General Withdrawal'],
+    { group: 'Reserve PP', eventType: 'RESERVE_RELEASE', rawTypes: ['Reserve Release'],
+      statusImpacts: [['Completed', 'Credit']], relation: 'ROOT' },
+    { group: 'Hoàn tiền', eventType: 'REFUND', rawTypes: ['Payment Refund'],
+      statusImpacts: [['Completed', 'Debit']], relation: 'ROOT' },
+    { group: 'Tạm giữ dispute', eventType: 'DISPUTE_HOLD', rawTypes: ['General Hold'],
+      statusImpacts: [['Completed', 'Debit']], relation: 'ROOT' },
+    { group: 'Rút tiền', eventType: 'WITHDRAWAL', rawTypes: ['General Withdrawal', 'User Initiated Withdrawal'],
       statusImpacts: [['Completed', 'Debit']], relation: 'NONE' },
+    { group: 'Rút tiền', eventType: 'WITHDRAWAL_REVERSAL', rawTypes: ['Reversal of ACH Withdrawal Transaction'],
+      statusImpacts: [['Denied', 'Memo']], relation: 'WITHDRAWAL' },
   ],
+  reversalIdSuffix: '-REVERSAL',
+  /** Event types linked to an original payment (Provider Transaction) through related_external_transaction_id. */
+  paymentLinkedTypes: ['RESERVE_HOLD', 'RESERVE_RELEASE', 'REFUND', 'DISPUTE_HOLD'],
   /** Balance Impact -> how net_amount moves the provider balance. */
   balanceImpacts: { Credit: 'NET', Debit: 'NET', Memo: 'ZERO' },
 });
@@ -74,8 +104,9 @@ const KH001_PROVIDER_EVENTS_REGRESSION = Object.freeze({
 
 /* ----------------------------- Pure helpers ----------------------------- */
 
-function kh001ProviderEventId_(externalEventId) {
-  return KH001_PROVIDER_EVENTS.idPrefix + externalEventId;
+/** Deterministic event id: PE-KH001-PAYPAL-<Transaction ID>; a payment reversal (same Transaction ID) gets -REVERSAL. */
+function kh001ProviderEventId_(externalEventId, eventType) {
+  return KH001_PROVIDER_EVENTS.idPrefix + externalEventId + (eventType === 'PAYMENT_REVERSAL' ? KH001_PROVIDER_EVENTS.reversalIdSuffix : '');
 }
 
 /** SHA-256 of the raw PayPal checksum + normalizer version; independent of time. */
@@ -87,6 +118,26 @@ function computeKh001EventsFingerprint_(paypalChecksum, digestHex) {
 function findKh001EventRule_(group) {
   const key = normalizeLabel_(group);
   return KH001_PROVIDER_EVENTS.rules.find(function (r) { return normalizeLabel_(r.group) === key; }) || null;
+}
+
+/**
+ * The verified rule for one raw row, or { error } (unmapped group / unverified Type / unverified Status+Balance Impact).
+ * Shared by Provider Transactions (which payment rows are payments) and Provider Events.
+ */
+function classifyKh001PaypalRow_(group, rawType, status, impact) {
+  const g = normalizeLabel_(group);
+  const t = normalizeLabel_(rawType);
+  const st = normalizeLabel_(status);
+  const im = normalizeLabel_(impact);
+  const inGroup = KH001_PROVIDER_EVENTS.rules.filter(function (r) { return normalizeLabel_(r.group) === g; });
+  if (inGroup.length === 0) return { error: 'unmapped Nhóm GD "' + g + '"', kind: 'mapping' };
+  const typed = inGroup.filter(function (r) { return r.rawTypes.map(normalizeLabel_).indexOf(t) >= 0; });
+  if (typed.length === 0) return { error: 'unverified Type "' + t + '" for Nhóm GD "' + g + '"', kind: 'mapping' };
+  const rule = typed.filter(function (r) {
+    return r.statusImpacts.some(function (c) { return normalizeLabel_(c[0]) === st && normalizeLabel_(c[1]) === im; });
+  })[0];
+  if (!rule) return { error: 'unverified Status/Balance Impact "' + st + '/' + im + '" for ' + g + ' / ' + t, kind: 'mapping' };
+  return { rule: rule };
 }
 
 /**
@@ -126,7 +177,16 @@ function checkEventRelationship_(event, ptIndex) {
       ? null
       : 'WITHDRAWAL ' + event.external_event_id + ' must not link to a provider transaction';
   }
-  const expectedTxId = event.event_type === 'PAYMENT' ? event.external_event_id : event.related_external_transaction_id;
+  if (event.event_type === 'WITHDRAWAL_REVERSAL') {
+    return event.provider_transaction_id === '' && event.related_external_transaction_id !== ''
+      ? null
+      : 'WITHDRAWAL_REVERSAL ' + event.external_event_id + ' must reference its withdrawal and no provider transaction';
+  }
+  const self = event.event_type === 'PAYMENT' || event.event_type === 'PAYMENT_REVERSAL';
+  if (event.event_type === 'PAYMENT_REVERSAL' && event.related_external_transaction_id !== event.external_event_id) {
+    return 'PAYMENT_REVERSAL ' + event.external_event_id + ' must relate to its own payment Transaction ID';
+  }
+  const expectedTxId = self ? event.external_event_id : event.related_external_transaction_id;
   if (!expectedTxId) return event.event_type + ' ' + event.external_event_id + ' has no related transaction';
   if (event.provider_transaction_id !== kh001ProviderTransactionId_(expectedTxId)) {
     return event.event_type + ' ' + event.external_event_id + ' has provider_transaction_id ' +
@@ -172,6 +232,7 @@ function buildKh001ProviderEvents_(paypalValues, ptIndex, sourceFingerprint) {
   const errors = emptyEventErrors_();
   const seen = {};
   const rows = [];
+  const pending = [];
   let eventRows = 0;
 
   for (let r = cfg.paypalHeaderRow; r < paypalValues.length; r++) {
@@ -187,26 +248,19 @@ function buildKh001ProviderEvents_(paypalValues, ptIndex, sourceFingerprint) {
     eventRows++;
     const label = 'Row ' + sheetRow + (id ? ' (' + id + ')' : '');
 
-    const rule = findKh001EventRule_(group);
-    if (!rule) { errors.mapping.push(label + ': unmapped Nhóm GD "' + group + '"'); continue; }
-    if (id === '') { errors.data.push(label + ': blank Transaction ID'); continue; }
-    if (seen[id]) { errors.duplicate.push('Duplicate event Transaction ID ' + id + ' (rows ' + seen[id] + ', ' + sheetRow + ')'); continue; }
-    seen[id] = sheetRow;
-
-    const rawType = normalizeLabel_(row[col('Type')]);
-    const status = normalizeLabel_(row[col('Status')]);
     const impact = normalizeLabel_(row[col('Balance Impact')]);
-    if (rule.rawTypes.map(normalizeLabel_).indexOf(rawType) < 0) {
-      errors.mapping.push(label + ': unverified Type "' + rawType + '" for ' + rule.eventType);
+    const classified = classifyKh001PaypalRow_(group, row[col('Type')], row[col('Status')], impact);
+    if (classified.error) { errors.mapping.push(label + ': ' + classified.error); continue; }
+    const rule = classified.rule;
+    if (id === '') { errors.data.push(label + ': blank Transaction ID'); continue; }
+    // A Transaction ID may appear twice only as PAYMENT + PAYMENT_REVERSAL of the same payment.
+    const prior = seen[id];
+    if (prior && !(prior.types.length === 1 && [prior.types[0], rule.eventType].sort().join() === 'PAYMENT,PAYMENT_REVERSAL')) {
+      errors.duplicate.push('Duplicate event Transaction ID ' + id + ' (rows ' + prior.rows.join(', ') + ', ' + sheetRow + '; ' +
+        prior.types.concat([rule.eventType]).join(' + ') + ')');
       continue;
     }
-    const comboOk = rule.statusImpacts.some(function (c) {
-      return normalizeLabel_(c[0]) === status && normalizeLabel_(c[1]) === impact;
-    });
-    if (!comboOk) {
-      errors.mapping.push(label + ': unverified Status/Balance Impact "' + status + '/' + impact + '" for ' + rule.eventType);
-      continue;
-    }
+    if (prior) { prior.types.push(rule.eventType); prior.rows.push(sheetRow); } else seen[id] = { types: [rule.eventType], rows: [sheetRow] };
 
     const gross = row[col('Gross')];
     const fee = row[col('Fee')];
@@ -229,7 +283,21 @@ function buildKh001ProviderEvents_(paypalValues, ptIndex, sourceFingerprint) {
     const root = canonicalText_(row[col('Txn gốc')]);
     let related = '';
     let providerTransactionId = '';
-    if (rule.relation === 'REFERENCE') {
+    if (rule.relation === 'ROOT' || rule.relation === 'WITHDRAWAL') {
+      // Resolved after all rows are read (the reference may be another event row of the same raw).
+      pending.push({ rule: rule, label: label, id: id, root: root, reference: reference, row: row, sheetRow: sheetRow, at: at, effect: effect,
+        gross: gross, fee: fee, net: net });
+      continue;
+    }
+    if (rule.relation === 'REVERSAL') {
+      if (root !== id) { errors.relationship.push(label + ': Txn gốc "' + root + '" != Transaction ID "' + id + '"'); continue; }
+      if (reference !== '' && reference !== id) {
+        errors.relationship.push(label + ': PAYMENT_REVERSAL Reference Txn ID "' + reference + '" != Transaction ID "' + id + '"');
+        continue;
+      }
+      related = id;
+      providerTransactionId = kh001ProviderTransactionId_(id);
+    } else if (rule.relation === 'REFERENCE') {
       if (reference === '') { errors.relationship.push(label + ': ' + rule.eventType + ' requires Reference Txn ID'); continue; }
       if (root !== reference) {
         errors.relationship.push(label + ': Txn gốc "' + root + '" != Reference Txn ID "' + reference + '"');
@@ -246,7 +314,7 @@ function buildKh001ProviderEvents_(paypalValues, ptIndex, sourceFingerprint) {
     }
 
     const event = {
-      provider_event_id: kh001ProviderEventId_(id),
+      provider_event_id: kh001ProviderEventId_(id, rule.eventType),
       provider_id: cfg.providerId,
       payment_source: cfg.paymentSource,
       gateway_id: canonicalText_(row[col('Mã cổng')]),
@@ -273,6 +341,78 @@ function buildKh001ProviderEvents_(paypalValues, ptIndex, sourceFingerprint) {
     if (linkError) { errors.relationship.push(label + ': ' + linkError); continue; }
     rows.push(event);
   }
+
+  // Events whose link may go through another event row of the same raw (ROOT / WITHDRAWAL relations).
+  const rawById = {};
+  for (let r = cfg.paypalHeaderRow; r < paypalValues.length; r++) {
+    const rid = canonicalText_(paypalValues[r][col('Transaction ID')]);
+    if (rid !== '' && normalizeLabel_(paypalValues[r][col('Nhóm GD')]) !== '') {
+      (rawById[rid] = rawById[rid] || []).push({ root: canonicalText_(paypalValues[r][col('Txn gốc')]),
+        type: (classifyKh001PaypalRow_(paypalValues[r][col('Nhóm GD')], paypalValues[r][col('Type')], paypalValues[r][col('Status')],
+          paypalValues[r][col('Balance Impact')]).rule || {}).eventType });
+    }
+  }
+  pending.forEach(function (p) {
+    let related;
+    let providerTransactionId = '';
+    if (p.rule.relation === 'ROOT') {
+      if (p.root === '') { errors.relationship.push(p.label + ': ' + p.rule.eventType + ' requires Txn gốc (the original payment)'); return; }
+      if (p.root === p.id) { errors.relationship.push(p.label + ': ' + p.rule.eventType + ' Txn gốc must be the original payment, not itself'); return; }
+      if (p.reference === '') { errors.relationship.push(p.label + ': ' + p.rule.eventType + ' requires Reference Txn ID'); return; }
+      const viaEvent = (rawById[p.reference] || []).some(function (x) { return x.root === p.root && x.type; });
+      if (p.reference !== p.root && !viaEvent) {
+        errors.relationship.push(p.label + ': Reference Txn ID "' + p.reference + '" is neither Txn gốc "' + p.root + '" nor an event of that payment');
+        return;
+      }
+      related = p.root;
+      providerTransactionId = kh001ProviderTransactionId_(p.root);
+    } else {
+      const target = (rawById[p.reference] || []).filter(function (x) { return x.type === 'WITHDRAWAL'; });
+      if (p.reference === '' || target.length !== 1) {
+        errors.relationship.push(p.label + ': WITHDRAWAL_REVERSAL Reference Txn ID "' + p.reference + '" must be exactly one WITHDRAWAL in Raw KH001 PayPal');
+        return;
+      }
+      if (p.root !== p.id && p.root !== p.reference) {
+        errors.relationship.push(p.label + ': Txn gốc "' + p.root + '" is neither the reversal nor its withdrawal');
+        return;
+      }
+      related = p.reference;
+    }
+    const event = {
+      provider_event_id: kh001ProviderEventId_(p.id, p.rule.eventType),
+      provider_id: cfg.providerId,
+      payment_source: cfg.paymentSource,
+      gateway_id: canonicalText_(p.row[col('Mã cổng')]),
+      external_event_id: p.id,
+      related_external_transaction_id: related,
+      provider_transaction_id: providerTransactionId,
+      event_type: p.rule.eventType,
+      event_at: p.at,
+      external_status: canonicalText_(p.row[col('Status')]),
+      currency: canonicalText_(p.row[col('Currency')]),
+      gross_amount: p.gross,
+      fee_amount: p.fee,
+      net_amount: p.net,
+      balance_impact: canonicalText_(p.row[col('Balance Impact')]),
+      balance_effect_amount: p.effect.amount,
+      raw_type: canonicalText_(p.row[col('Type')]),
+      raw_group: canonicalText_(p.row[col('Nhóm GD')]),
+      source_paypal_row: p.sheetRow,
+      source_fingerprint: sourceFingerprint,
+      normalizer_version: cfg.normalizerVersion,
+      normalized_at: '',
+    };
+    const linkError = checkEventRelationship_(event, ptIndex);
+    if (linkError) { errors.relationship.push(p.label + ': ' + linkError); return; }
+    rows.push(event);
+  });
+  // A reversal needs the payment it reverses (same Transaction ID) among the events.
+  rows.filter(function (e) { return e.event_type === 'PAYMENT_REVERSAL'; }).forEach(function (e) {
+    if (!rows.some(function (x) { return x.event_type === 'PAYMENT' && x.external_event_id === e.external_event_id; })) {
+      errors.relationship.push('PAYMENT_REVERSAL ' + e.external_event_id + ' has no PAYMENT row with the same Transaction ID');
+    }
+  });
+  rows.sort(function (a, b) { return a.source_paypal_row - b.source_paypal_row; });
   return { rows: rows, eventRows: eventRows, errors: errors };
 }
 
@@ -292,9 +432,20 @@ function assertNoEventErrors_(errors) {
 function checkProviderEventRows_(rows, ptIndex) {
   const errors = emptyEventErrors_();
   const counts = {};
+  const byExternal = {};
+  const withdrawals = {};
+  rows.forEach(function (e) {
+    if (e.event_type === 'WITHDRAWAL') withdrawals[String(e.external_event_id)] = true;
+    (byExternal[String(e.external_event_id)] = byExternal[String(e.external_event_id)] || []).push(String(e.event_type));
+  });
   rows.forEach(function (e) {
     const id = String(e.external_event_id);
-    counts[id] = (counts[id] || 0) + 1;
+    const eventId = String(e.provider_event_id);
+    counts[eventId] = (counts[eventId] || 0) + 1;
+    if (eventId !== kh001ProviderEventId_(id, e.event_type)) errors.mapping.push(eventId + ' is not the deterministic id of ' + id + ' / ' + e.event_type);
+    if (e.event_type === 'WITHDRAWAL_REVERSAL' && !withdrawals[String(e.related_external_transaction_id)]) {
+      errors.relationship.push('WITHDRAWAL_REVERSAL ' + id + ' references no stored WITHDRAWAL ' + e.related_external_transaction_id);
+    }
     if (!isFiniteNumber_(e.gross_amount) || !isFiniteNumber_(e.fee_amount) || !isFiniteNumber_(e.net_amount) ||
         !signedInvariantHolds_(e.gross_amount, e.fee_amount, e.net_amount)) {
       errors.amount_invariant.push(id);
@@ -316,6 +467,10 @@ function checkProviderEventRows_(rows, ptIndex) {
     if (link) errors.relationship.push(link);
   });
   errors.duplicate = Object.keys(counts).filter(function (k) { return counts[k] > 1; }).sort();
+  Object.keys(byExternal).sort().forEach(function (k) {
+    const types = byExternal[k].slice().sort();
+    if (types.length > 1 && types.join() !== 'PAYMENT,PAYMENT_REVERSAL') errors.duplicate.push(k + ' (' + types.join(' + ') + ')');
+  });
   return errors;
 }
 
@@ -401,8 +556,10 @@ function evaluateKh001ProviderEventsRegression_(summary, source) {
 
 /* ---------------------------------- I/O --------------------------------- */
 
-const PROVIDER_EVENT_KEY_COLUMNS = ['provider_id', 'payment_source', 'external_event_id'];
-const PROVIDER_EVENT_SORT_COLUMNS = ['provider_id', 'payment_source', 'event_at', 'external_event_id'];
+// provider_event_id is unique (a payment and its reversal share external_event_id). The extra sort column only
+// breaks ties between those two, so the order (and checksum) of existing rows is unchanged.
+const PROVIDER_EVENT_KEY_COLUMNS = ['provider_id', 'payment_source', 'provider_event_id'];
+const PROVIDER_EVENT_SORT_COLUMNS = ['provider_id', 'payment_source', 'event_at', 'external_event_id', 'provider_event_id'];
 
 function providerEventsTab_() {
   return { targetSheet: SHEETS.PROVIDER_EVENTS, stagingSheet: '__STAGE_PROVIDER_EVENTS' };
