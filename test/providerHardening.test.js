@@ -45,7 +45,11 @@ const lifecycle = () => [
     'Thời gian': D('2026-10-07T15:00:00Z') }),
   raw({ 'Transaction ID': 'WD1', 'Txn gốc': 'WD1', Type: 'General Withdrawal', 'Nhóm GD': 'Rút tiền', 'Balance Impact': 'Debit', Gross: -100, Fee: 0, Net: -100 }),
   raw({ 'Transaction ID': 'WD2', 'Txn gốc': 'WD2', Type: 'User Initiated Withdrawal', 'Nhóm GD': 'Rút tiền', 'Balance Impact': 'Debit', Gross: -40, Fee: 0, Net: -40 }),
-  raw({ 'Transaction ID': 'WDR1', 'Reference Txn ID': 'WD1', 'Txn gốc': 'WDR1', Type: 'Reversal of ACH Withdrawal Transaction', 'Nhóm GD': 'Rút tiền',
+  // exact production row (KH001 raw): no Reference Txn ID, Txn gốc = itself, Denied / Memo
+  raw({ 'Transaction ID': '81502526255606823', 'Reference Txn ID': '', 'Txn gốc': '81502526255606823', Type: 'Reversal of ACH Withdrawal Transaction',
+    'Nhóm GD': 'Rút tiền', Status: 'Denied', 'Balance Impact': 'Memo', Gross: -3341.75, Fee: 0, Net: -3341.75 }),
+  // optional future shape: a reversal that does carry a Reference Txn ID to a verified withdrawal
+  raw({ 'Transaction ID': 'WDR2', 'Reference Txn ID': 'WD1', 'Txn gốc': 'WDR2', Type: 'Reversal of ACH Withdrawal Transaction', 'Nhóm GD': 'Rút tiền',
     Status: 'Denied', 'Balance Impact': 'Memo', Gross: 100, Fee: 0, Net: 100 }),
 ];
 const buildPT = (grid) => H.buildKh001ProviderTransactions_(grid, RECONCILED, FP);
@@ -78,11 +82,19 @@ test('Provider Events lifecycle: every observed combination mapped and linked; i
   assert.deepEqual(row('PE-KH001-PAYPAL-HLD1'), ['DISPUTE_HOLD', 'PAY1', 'PT-KH001-PAYPAL-PAY1', -91.98]);
   assert.deepEqual(row('PE-KH001-PAYPAL-WD1'), ['WITHDRAWAL', '', '', -100]);
   assert.deepEqual(row('PE-KH001-PAYPAL-WD2'), ['WITHDRAWAL', '', '', -40], 'User Initiated Withdrawal');
-  assert.deepEqual(row('PE-KH001-PAYPAL-WDR1'), ['WITHDRAWAL_REVERSAL', 'WD1', '', 0]);
+  const ach = ev['PE-KH001-PAYPAL-81502526255606823'];
+  assert.deepEqual([ach.event_type, ach.provider_transaction_id, ach.related_external_transaction_id, ach.balance_effect_amount, ach.gross_amount, ach.net_amount],
+    ['WITHDRAWAL_REVERSAL', '', '', 0, -3341.75, -3341.75], 'production ACH reversal: unlinked, Memo -> no balance movement');
+  assert.ok(!Object.values(ev).some((e) => e.related_external_transaction_id === '81502526255606823'), 'no fake withdrawal link created');
+  assert.deepEqual(row('PE-KH001-PAYPAL-WDR2'), ['WITHDRAWAL_REVERSAL', 'WD1', '', 0], 'a non-blank reference to a verified withdrawal links');
   assert.equal(new Set(js(b.rows).map((e) => e.provider_event_id)).size, b.rows.length, 'unique event ids');
-  // the stored-row verifier accepts the same rows
+  // the stored-row verifier uses the same semantics: blank = unlinked (valid), non-blank must be a stored WITHDRAWAL
   const stored = js(b.rows).map((e) => ({ ...e, event_at: D(e.event_at) }));
   assert.deepEqual(js(H.flattenEventErrors_(H.checkProviderEventRows_(stored, ptIdx(lifecycle())))), []);
+  const tampered = stored.map((e) => (e.external_event_id === '81502526255606823' ? { ...e, related_external_transaction_id: 'WD9' } : e));
+  assert.deepEqual(js(H.checkProviderEventRows_(tampered, ptIdx(lifecycle())).relationship), ['WITHDRAWAL_REVERSAL 81502526255606823 references no stored WITHDRAWAL WD9']);
+  const linkedPt = stored.map((e) => (e.external_event_id === '81502526255606823' ? { ...e, provider_transaction_id: 'PT-KH001-PAYPAL-PAY1' } : e));
+  assert.match(js(H.checkProviderEventRows_(linkedPt, ptIdx(lifecycle())).relationship).join(), /81502526255606823 must not link to a provider transaction/);
 });
 
 test('fail closed: unknown group / type / status, broken links, reuse of an id other than payment + reversal', () => {
@@ -93,9 +105,12 @@ test('fail closed: unknown group / type / status, broken links, reuse of an id o
     [(g) => setCell(g, 11, 'Status', 'Completed'), /"Completed\/Memo" for Rút tiền \/ Reversal of ACH Withdrawal Transaction/],
     [(g) => setCell(g, 6, 'Txn gốc', 'NOPE'), /RFD1.*links to missing Provider Transaction PT-KH001-PAYPAL-NOPE|Reference Txn ID "DCC1" is neither Txn gốc "NOPE"/],
     [(g) => setCell(g, 5, 'Reference Txn ID', 'XYZ'), /Reference Txn ID "XYZ" is neither Txn gốc "PAY1" nor an event of that payment/],
-    [(g) => setCell(g, 11, 'Reference Txn ID', 'WD9'), /WITHDRAWAL_REVERSAL Reference Txn ID "WD9" must be exactly one WITHDRAWAL/],
+    [(g) => setCell(g, 12, 'Reference Txn ID', 'WD9'), /WITHDRAWAL_REVERSAL Reference Txn ID "WD9" must be exactly one WITHDRAWAL/],
+    [(g) => setCell(g, 11, 'Reference Txn ID', 'WD9'), /Row 12 \(81502526255606823\): WITHDRAWAL_REVERSAL Reference Txn ID "WD9" must be exactly one WITHDRAWAL/],
+    [(g) => setCell(g, 11, 'Reference Txn ID', 'RSV1'), /Reference Txn ID "RSV1" must be exactly one WITHDRAWAL/],
+    [(g) => setCell(g, 11, 'Txn gốc', 'WD1'), /WITHDRAWAL_REVERSAL without Reference Txn ID needs Txn gốc = its own Transaction ID \(found "WD1"\)/],
     [(g) => { g.push(raw({ 'Transaction ID': 'PAY1', 'Txn gốc': 'PAY1' })); return g; },
-      /Duplicate payment Transaction ID PAY1 \(rows 2, 13\)|Duplicate event Transaction ID PAY1 .*PAYMENT \+ PAYMENT_REVERSAL \+ PAYMENT/],
+      /Duplicate payment Transaction ID PAY1 \(rows 2, \d+\)|Duplicate event Transaction ID PAY1 .*PAYMENT \+ PAYMENT_REVERSAL \+ PAYMENT/],
     [(g) => { g.splice(1, 1); return g; }, /PAYMENT_REVERSAL PAY1 has no PAYMENT row with the same Transaction ID|links to missing Provider Transaction PT-KH001-PAYPAL-PAY1/],
   ];
   cases.forEach(([mutate, re], i) => {
@@ -261,14 +276,19 @@ test('the same lifecycle typed correctly (after an importer fix): new payment / 
     ppRow({ 'Transaction ID': 'UWD0001', Type: 'User Initiated Withdrawal', 'Nhóm GD': 'Rút tiền', 'Balance Impact': 'Debit', Gross: -20, Fee: 0, Net: -20 }),
     ppRow({ 'Transaction ID': 'WDR0001', 'Reference Txn ID': 'WD0', Type: 'Reversal of ACH Withdrawal Transaction', 'Nhóm GD': 'Rút tiền', Status: 'Denied',
       'Balance Impact': 'Memo', Gross: 1000, Fee: 0, Net: 1000 }),
+    ppRow({ 'Transaction ID': '81502526255606823', 'Reference Txn ID': '', 'Txn gốc': '81502526255606823', Type: 'Reversal of ACH Withdrawal Transaction',
+      'Nhóm GD': 'Rút tiền', Status: 'Denied', 'Balance Impact': 'Memo', Gross: -3341.75, Fee: 0, Net: -3341.75 }),
   ]);
   const p = js(call('runScheduledPaymentPipeline()'));
   assert.equal(p.status, 'SUCCESS', p.error);
   assert.equal(sim.rows('Provider Transactions').length, 170, '+1 Direct Credit Card payment; the reversal is not a payment');
   const ev = sim.rows('Provider Events');
-  assert.equal(ev.length, 343 + 7);
+  assert.equal(ev.length, 343 + 8);
   const types = ev.reduce((a, e) => { a[e.event_type] = (a[e.event_type] || 0) + 1; return a; }, {});
-  assert.deepEqual(types, { PAYMENT: 170, PAYMENT_REVERSAL: 1, REFUND: 1, RESERVE_HOLD: 168, RESERVE_RELEASE: 1, DISPUTE_HOLD: 1, WITHDRAWAL: 7, WITHDRAWAL_REVERSAL: 1 });
+  assert.deepEqual(types, { PAYMENT: 170, PAYMENT_REVERSAL: 1, REFUND: 1, RESERVE_HOLD: 168, RESERVE_RELEASE: 1, DISPUTE_HOLD: 1, WITHDRAWAL: 7, WITHDRAWAL_REVERSAL: 2 });
+  // (the in-memory sheet stores an all-digit id as a number, like an unformatted Sheets cell: match by type + amount)
+  const ach = ev.find((e) => e.event_type === 'WITHDRAWAL_REVERSAL' && e.gross_amount === -3341.75);
+  assert.deepEqual([ach.related_external_transaction_id, ach.provider_transaction_id, ach.balance_effect_amount], ['', '', 0], 'production ACH reversal: unlinked');
   const reversed = sim.rows('Provider Transactions').find((t) => t.external_transaction_id === settled[0]);
   assert.deepEqual([reversed.external_status, reversed.balance_impact], ['Completed', 'Credit'], 'payment economics untouched by its reversal');
   assert.equal(JSON.stringify(sim.rows('Settlements')), settledBefore, 'frozen settlements #1 / #2 not reinterpreted');

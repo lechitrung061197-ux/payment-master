@@ -357,7 +357,7 @@ Source: `Raw KH001 PayPal` only (Provider Transactions is read for referential i
 | Hoàn tiền | REFUND | Payment Refund | Completed/Debit | same as RESERVE_RELEASE |
 | Tạm giữ dispute | DISPUTE_HOLD | General Hold | Completed/Debit | same as RESERVE_RELEASE |
 | Rút tiền | WITHDRAWAL | General Withdrawal, User Initiated Withdrawal | Completed/Debit | none |
-| Rút tiền | WITHDRAWAL_REVERSAL | Reversal of ACH Withdrawal Transaction | Denied/Memo | Reference Txn ID = exactly one WITHDRAWAL |
+| Rút tiền | WITHDRAWAL_REVERSAL | Reversal of ACH Withdrawal Transaction | Denied/Memo | blank Reference Txn ID + Txn gốc = itself → unlinked (as PayPal reports it; nothing inferred); non-blank Reference Txn ID → exactly one WITHDRAWAL, else fail |
 
 - Phase 2Q: payment-linked events (`RESERVE_HOLD`, `RESERVE_RELEASE`, `REFUND`, `DISPUTE_HOLD`, `PAYMENT_REVERSAL`)
   carry the original payment in `related_external_transaction_id` / `provider_transaction_id`. They are captured

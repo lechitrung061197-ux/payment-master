@@ -16,8 +16,10 @@
  *   PE-KH001-PAYPAL-<Transaction ID> (legacy ids unchanged). Any other reuse of a Transaction ID fails.
  * - REFUND / RESERVE_RELEASE / DISPUTE_HOLD link to the original payment: Txn gốc = the payment's Transaction ID
  *   (an existing Provider Transaction); Reference Txn ID = that payment or another event of it (e.g. the reserve
- *   hold). RESERVE_HOLD keeps its rule (Txn gốc = Reference Txn ID = payment). WITHDRAWAL_REVERSAL links to its
- *   WITHDRAWAL event (Reference Txn ID). Events never create a seller-side financial effect.
+ *   hold). RESERVE_HOLD keeps its rule (Txn gốc = Reference Txn ID = payment). WITHDRAWAL_REVERSAL (Denied / Memo, no
+ *   balance movement): blank Reference Txn ID with Txn gốc = itself -> an unlinked event (as PayPal reports it; no
+ *   withdrawal is inferred from amounts, dates or balances); a non-blank Reference Txn ID must resolve to exactly one
+ *   WITHDRAWAL (linked), otherwise it fails. Events never create a seller-side financial effect.
  * - PayPal signed amounts are kept as-is (Fee stays negative): gross + fee = net.
  * - balance_effect_amount follows Balance Impact: Credit/Debit = net, Memo = 0.
  * - PAYMENT / RESERVE_HOLD must link to an existing Provider Transaction; WITHDRAWAL has no link.
@@ -50,7 +52,8 @@ const KH001_PROVIDER_EVENTS = Object.freeze({
    *   REFERENCE   provider_transaction_id = Reference Txn ID;     Txn gốc == Reference Txn ID
    *   ROOT        provider_transaction_id = Txn gốc (original payment); Reference Txn ID = Txn gốc or another
    *               event row of that payment
-   *   WITHDRAWAL  no provider transaction; Reference Txn ID = a WITHDRAWAL event in the same raw
+   *   WITHDRAWAL  no provider transaction; Reference Txn ID blank (Txn gốc == Transaction ID; unlinked) or exactly one
+   *               WITHDRAWAL event in the same raw (linked)
    *   NONE        no provider transaction;                        Txn gốc == Transaction ID
    */
   rules: [
@@ -115,11 +118,6 @@ function computeKh001EventsFingerprint_(paypalChecksum, digestHex) {
   return digest(paypalChecksum + '|' + KH001_PROVIDER_EVENTS.normalizerVersion);
 }
 
-function findKh001EventRule_(group) {
-  const key = normalizeLabel_(group);
-  return KH001_PROVIDER_EVENTS.rules.find(function (r) { return normalizeLabel_(r.group) === key; }) || null;
-}
-
 /**
  * The verified rule for one raw row, or { error } (unmapped group / unverified Type / unverified Status+Balance Impact).
  * Shared by Provider Transactions (which payment rows are payments) and Provider Events.
@@ -178,9 +176,11 @@ function checkEventRelationship_(event, ptIndex) {
       : 'WITHDRAWAL ' + event.external_event_id + ' must not link to a provider transaction';
   }
   if (event.event_type === 'WITHDRAWAL_REVERSAL') {
-    return event.provider_transaction_id === '' && event.related_external_transaction_id !== ''
+    // related_external_transaction_id: '' (unlinked, as PayPal reports it) or the reversed WITHDRAWAL (checked against
+    // the withdrawals by the builder / checkProviderEventRows_). Never a provider transaction.
+    return event.provider_transaction_id === ''
       ? null
-      : 'WITHDRAWAL_REVERSAL ' + event.external_event_id + ' must reference its withdrawal and no provider transaction';
+      : 'WITHDRAWAL_REVERSAL ' + event.external_event_id + ' must not link to a provider transaction';
   }
   const self = event.event_type === 'PAYMENT' || event.event_type === 'PAYMENT_REVERSAL';
   if (event.event_type === 'PAYMENT_REVERSAL' && event.related_external_transaction_id !== event.external_event_id) {
@@ -366,9 +366,16 @@ function buildKh001ProviderEvents_(paypalValues, ptIndex, sourceFingerprint) {
       }
       related = p.root;
       providerTransactionId = kh001ProviderTransactionId_(p.root);
+    } else if (p.reference === '') {
+      // Unlinked reversal (production shape): only valid when Txn gốc is the row itself; nothing is inferred.
+      if (p.root !== p.id) {
+        errors.relationship.push(p.label + ': WITHDRAWAL_REVERSAL without Reference Txn ID needs Txn gốc = its own Transaction ID (found "' + p.root + '")');
+        return;
+      }
+      related = '';
     } else {
       const target = (rawById[p.reference] || []).filter(function (x) { return x.type === 'WITHDRAWAL'; });
-      if (p.reference === '' || target.length !== 1) {
+      if (target.length !== 1) {
         errors.relationship.push(p.label + ': WITHDRAWAL_REVERSAL Reference Txn ID "' + p.reference + '" must be exactly one WITHDRAWAL in Raw KH001 PayPal');
         return;
       }
@@ -443,8 +450,9 @@ function checkProviderEventRows_(rows, ptIndex) {
     const eventId = String(e.provider_event_id);
     counts[eventId] = (counts[eventId] || 0) + 1;
     if (eventId !== kh001ProviderEventId_(id, e.event_type)) errors.mapping.push(eventId + ' is not the deterministic id of ' + id + ' / ' + e.event_type);
-    if (e.event_type === 'WITHDRAWAL_REVERSAL' && !withdrawals[String(e.related_external_transaction_id)]) {
-      errors.relationship.push('WITHDRAWAL_REVERSAL ' + id + ' references no stored WITHDRAWAL ' + e.related_external_transaction_id);
+    const reversed = String(e.related_external_transaction_id === null || e.related_external_transaction_id === undefined ? '' : e.related_external_transaction_id);
+    if (e.event_type === 'WITHDRAWAL_REVERSAL' && reversed !== '' && !withdrawals[reversed]) {
+      errors.relationship.push('WITHDRAWAL_REVERSAL ' + id + ' references no stored WITHDRAWAL ' + reversed); // blank = unlinked, valid
     }
     if (!isFiniteNumber_(e.gross_amount) || !isFiniteNumber_(e.fee_amount) || !isFiniteNumber_(e.net_amount) ||
         !signedInvariantHolds_(e.gross_amount, e.fee_amount, e.net_amount)) {
